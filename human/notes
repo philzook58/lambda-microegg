@@ -1,0 +1,67 @@
+The bitvec sentinel for length trick is good
+The reverse map is interesting.
+subst. 0*x = 0  = 0*x*x*x*x*x ... so we need to remember visited.
+parser
+why is find_mut recursive?
+should be checking we don't try to make more vars than 7
+add extract
+
+How is lambda pattern being returned?
+
+
+lambda x y z, ?r * ?q * ?p * 0  should have 3^3 results
+
+
+lambda x, ?p * 0 =? lambda x, 0
+what should the answer be? Hmm. maybe it should be var10. Ok. That's simple
+
+Try binary application. Faster or slower?
+
+(map f (map g x) = map (comp f g) x
+comp f g = lam x   (subst g.body x)
+comp (lam x N) (lam y M) = lam z (subst N (x (subst M (y z))
+
+Use slotted examples
+
+concrete meet and join examples
+
+
+So patterns needed some conditions around lambda?
+multi lambda binders and multisubstitution
+#subst #+    built-ins with special sigil
+
+Better sigil? Does racket / sceheme have a convention?
+
+
+proof objects. Write only log.
+But then process them into what?
+We don't have to have purely first order proof objects now.
+subst(lam x pos)
+trans()
+
+
+lambda egg
+legg
+lambda egglog?
+
+
+
+
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.128 --locked
+./build-web.sh
+python3 -m http.server
+```
+
+bugsum10
+
+(lam x (lam y (lam z ... (a x y z ...))
+(lam x (lam y (?m x y)) = (lam x (lam y (?m y x))
+sum (lam x (sum (lam y ( ...
+
+
+(@sum i (@sum j (@sum k (* (a i j) (a j k)))
+
+(rewrite (sum i ?a) (* ?a (sum i 1))

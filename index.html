@@ -1,0 +1,60 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lambda MicroEgg</title>
+
+<h1>Lambda MicroEgg</h1>
+
+<label for="demo">Demo:</label>
+<select id="demo">
+  <option value="basics.sexp">Basic rewriting</option>
+  <option value="lambda.sexp">Beta reduction</option>
+  <option value="miller.sexp">Miller matching</option>
+  <option value="summation.sexp">Summation binders</option>
+  <option value="substitution.sexp">Substitution</option>
+</select>
+<button id="run" type="button" disabled>Run</button>
+
+<p><textarea id="program" rows="28" cols="100" spellcheck="false"></textarea></p>
+<p><textarea id="output" rows="18" cols="100" readonly></textarea></p>
+
+<script type="module">
+  import init, { run_wasm } from "./pkg/lambda_microegg.js";
+
+  const demo = document.querySelector("#demo");
+  const run = document.querySelector("#run");
+  const program = document.querySelector("#program");
+  const output = document.querySelector("#output");
+
+  async function loadDemo() {
+    const response = await fetch(`./demos/${demo.value}`);
+    if (!response.ok) throw new Error(`could not load ${demo.value}`);
+    program.value = await response.text();
+    const url = new URL(location.href);
+    url.searchParams.set("demo", demo.value);
+    history.replaceState(null, "", url);
+  }
+
+  const selected = new URLSearchParams(location.search).get("demo");
+  if (selected && [...demo.options].some(option => option.value === selected)) {
+    demo.value = selected;
+  }
+
+  const ready = init();
+  ready.then(() => run.disabled = false).catch(error => output.value = String(error));
+  loadDemo().catch(error => output.value = String(error));
+
+  demo.addEventListener("change", () => {
+    loadDemo().catch(error => output.value = String(error));
+  });
+
+  run.addEventListener("click", async () => {
+    output.value = "";
+    try {
+      await ready;
+      output.value = run_wasm(program.value);
+    } catch (error) {
+      output.value = String(error);
+    }
+  });
+</script>
