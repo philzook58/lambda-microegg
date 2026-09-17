@@ -8,6 +8,8 @@ The starting point of the basic e-graph implementation is Max Willsey's microegg
 
 WASM Demo pages : <www.philipzucker.com/lambda-microegg>
 
+In my opinion "lambda" isn't really lambda. It's a binder
+
 # Running
 
 ```sh
@@ -27,4 +29,4 @@ cargo run --release -- example.sexp
 - `print-egraph`
 
 Binder operators use `(@OP NAME BODY)` syntax. For example,
-`(@sum i (f i))` is represented internally as `(sum (lam i (f i)))`.
+`(@sum i (f i))` is macro expanded as `(sum (lam i (f i)))`.
