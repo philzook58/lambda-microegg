@@ -117,3 +117,8 @@
 
 (reset)
 ;(insert 0 (lam z (lam x (lam y (y z))))
+
+ (insert 0 (lam x (lam z x)))
+; good this does fail
+(fail (rewrite (lam x (lam y (?a x y))) (lam x (foo (?a x)))))
+;(run 10)

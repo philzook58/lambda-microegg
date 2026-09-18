@@ -18,7 +18,9 @@ https://www.lix.polytechnique.fr/Labo/Dale.Miller/lProlog/proghol/extract.html C
  
  `(lam x (?a (+ one x)))` would _not_ be a Miller pattern, and is not supported. 
  
- Miller patterns are basically the least reasonable thing you can do to have bound variables but reaspect scope. They are intrinsically tractable to implement, whereas full higher order matching even outside of the e-graph can encode undecidable problems.
+ Miller patterns are basically the reasonable least thing you can do to have bound variables but reaspect scope. They are intrinsically tractable to implement, whereas full higher order matching even outside of the e-graph can encode undecidable problems.
+
+There is an instrinsic question about how to take patterns that are bound in a different context than the root of the pattern, carry them up to the root, and carry them over to the right hand side of the pattern. Miller patterns are a reasonable language for describing how you want this done. You have to eta expand them on the right hand side or else you don't really know
 
 
 # Running
@@ -45,4 +47,4 @@ Binder operators use `(@OP NAME BODY)` syntax. For example,
 
 # AI disclosure
 
-I am disturbed and depressed by AI. The code in this codebase was produced by giving Max's microegg, my thinning egraph implementation, blog posts and paper to an agent. It required a lot of back and forth.
+The code in this codebase was produced by giving Max's microegg, my thinning egraph implementations, blog posts and paper to an agent. It still has required back and forth.

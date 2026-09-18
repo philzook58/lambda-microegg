@@ -9,67 +9,114 @@ pub enum Sexp {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Token {
-    Left(usize),
-    Right(usize),
-    Atom(String, bool, usize),
+    Left(Location),
+    Right(Location),
+    Atom(String, bool, Location),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Location {
+    line: usize,
+    column: usize,
+}
+
+impl Location {
+    fn error(self, message: impl std::fmt::Display) -> String {
+        format!("line {}:{}: {message}", self.line, self.column)
+    }
 }
 
 fn lex_sexps(input: &str) -> Result<Vec<Token>, String> {
     let mut chars = input.chars().peekable();
     let mut tokens = vec![];
     let mut line = 1;
+    let mut column = 1;
     while let Some(&ch) = chars.peek() {
         match ch {
             ch if ch.is_whitespace() => {
                 chars.next();
-                line += usize::from(ch == '\n');
+                if ch == '\n' {
+                    line += 1;
+                    column = 1;
+                } else {
+                    column += 1;
+                }
             }
             ';' => {
-                if chars.by_ref().find(|&c| c == '\n').is_some() {
-                    line += 1;
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        line += 1;
+                        column = 1;
+                        break;
+                    }
+                    column += 1;
                 }
             }
             '(' => {
                 chars.next();
-                tokens.push(Token::Left(line));
+                tokens.push(Token::Left(Location { line, column }));
+                column += 1;
             }
             ')' => {
                 chars.next();
-                tokens.push(Token::Right(line));
+                tokens.push(Token::Right(Location { line, column }));
+                column += 1;
             }
             '"' => {
-                let start_line = line;
+                let start = Location { line, column };
                 chars.next();
+                column += 1;
                 let mut atom = String::new();
                 let mut closed = false;
                 while let Some(c) = chars.next() {
                     match c {
                         '"' => {
+                            column += 1;
                             closed = true;
                             break;
                         }
-                        '\\' => match chars.next() {
-                            Some('n') => atom.push('\n'),
-                            Some('t') => atom.push('\t'),
-                            Some(c @ ('"' | '\\')) => atom.push(c),
-                            Some(c) => {
-                                return Err(format!("line {line}: unsupported escape \\{c}"));
+                        '\\' => {
+                            let escape = Location { line, column };
+                            column += 1;
+                            match chars.next() {
+                                Some('n') => {
+                                    atom.push('\n');
+                                    column += 1;
+                                }
+                                Some('t') => {
+                                    atom.push('\t');
+                                    column += 1;
+                                }
+                                Some(c @ ('"' | '\\')) => {
+                                    atom.push(c);
+                                    column += 1;
+                                }
+                                Some(c) => {
+                                    return Err(
+                                        escape.error(format_args!("unsupported escape \\{c}"))
+                                    );
+                                }
+                                None => return Err(escape.error("unterminated escape")),
                             }
-                            None => return Err(format!("line {line}: unterminated escape")),
-                        },
+                        }
                         c => {
-                            line += usize::from(c == '\n');
+                            if c == '\n' {
+                                line += 1;
+                                column = 1;
+                            } else {
+                                column += 1;
+                            }
                             atom.push(c);
                         }
                     }
                 }
                 if !closed {
-                    return Err(format!("line {start_line}: unterminated quoted atom"));
+                    return Err(start.error("unterminated quoted atom"));
                 }
-                tokens.push(Token::Atom(atom, true, start_line));
+                tokens.push(Token::Atom(atom, true, start));
             }
             _ => {
-                let start_line = line;
+                let start = Location { line, column };
                 let mut atom = String::new();
                 while let Some(&c) = chars.peek() {
                     if c.is_whitespace() || matches!(c, '(' | ')' | ';') {
@@ -77,15 +124,16 @@ fn lex_sexps(input: &str) -> Result<Vec<Token>, String> {
                     }
                     atom.push(c);
                     chars.next();
+                    column += 1;
                 }
-                tokens.push(Token::Atom(atom, false, start_line));
+                tokens.push(Token::Atom(atom, false, start));
             }
         }
     }
     Ok(tokens)
 }
 
-fn parse_sexps_with_lines(input: &str) -> Result<Vec<(usize, Sexp)>, String> {
+fn parse_sexps_with_locations(input: &str) -> Result<Vec<(Location, Sexp)>, String> {
     fn one(tokens: &[Token], cursor: &mut usize) -> Result<Sexp, String> {
         match tokens.get(*cursor) {
             Some(Token::Atom(atom, quoted, _)) => {
@@ -96,21 +144,21 @@ fn parse_sexps_with_lines(input: &str) -> Result<Vec<(usize, Sexp)>, String> {
                     Sexp::Atom(atom.clone())
                 })
             }
-            Some(Token::Left(line)) => {
-                let line = *line;
+            Some(Token::Left(location)) => {
+                let location = *location;
                 *cursor += 1;
                 let mut items = vec![];
                 while !matches!(tokens.get(*cursor), Some(Token::Right(_))) {
                     if *cursor == tokens.len() {
-                        return Err(format!("line {line}: unclosed '('"));
+                        return Err(location.error("unclosed '('"));
                     }
                     items.push(one(tokens, cursor)?);
                 }
                 *cursor += 1;
                 Ok(Sexp::List(items))
             }
-            Some(Token::Right(line)) => Err(format!("line {line}: unexpected ')'")),
-            None => Err("line 1: unexpected end of input".into()),
+            Some(Token::Right(location)) => Err(location.error("unexpected ')'")),
+            None => Err(Location { line: 1, column: 1 }.error("unexpected end of input")),
         }
     }
 
@@ -118,10 +166,12 @@ fn parse_sexps_with_lines(input: &str) -> Result<Vec<(usize, Sexp)>, String> {
     let mut cursor = 0;
     let mut forms = vec![];
     while cursor < tokens.len() {
-        let line = match &tokens[cursor] {
-            Token::Left(line) | Token::Right(line) | Token::Atom(_, _, line) => *line,
+        let location = match &tokens[cursor] {
+            Token::Left(location) | Token::Right(location) | Token::Atom(_, _, location) => {
+                *location
+            }
         };
-        forms.push((line, one(&tokens, &mut cursor)?));
+        forms.push((location, one(&tokens, &mut cursor)?));
     }
     Ok(forms)
 }
@@ -129,7 +179,7 @@ fn parse_sexps_with_lines(input: &str) -> Result<Vec<(usize, Sexp)>, String> {
 #[cfg(test)]
 #[allow(dead_code)] // Used by the integration-test crate, not the binary's test harness.
 pub fn parse_sexps(input: &str) -> Result<Vec<Sexp>, String> {
-    parse_sexps_with_lines(input).map(|forms| forms.into_iter().map(|(_, form)| form).collect())
+    parse_sexps_with_locations(input).map(|forms| forms.into_iter().map(|(_, form)| form).collect())
 }
 
 fn atom_of(sexp: &Sexp) -> Result<&str, String> {
@@ -452,111 +502,111 @@ fn comment_lines(text: &str) -> String {
         .join("\n")
 }
 
-pub fn run_sexp_script(input: &str) -> Result<Vec<String>, String> {
-    let mut eg = EGraph::new();
-    let mut rules = vec![];
-    let mut output = vec![];
-    for (command_index, (line, form)) in parse_sexps_with_lines(input)?.into_iter().enumerate() {
-        let result = (|| -> Result<(), String> {
-            let Sexp::List(items) = &form else {
-                return Err(format!("command {} must be a list", command_index + 1));
-            };
-            let Some(head) = items.first() else {
-                return Err(format!("command {} is empty", command_index + 1));
-            };
-            let command = atom_of(head)?;
-            let output_start = output.len();
-            match command {
-                "reset" if items.len() == 1 => {
-                    eg = EGraph::new();
-                    rules.clear();
-                    output.push("reset".into());
-                }
-                "insert" if matches!(items.len(), 2 | 3) => {
-                    let (ctx, term) = command_term(items, "insert")?;
-                    let id = add_sexp_term(&mut eg, term, ctx)?;
-                    output.push(format!("inserted {}", id.show()));
-                }
-                "union" if matches!(items.len(), 3 | 4) => {
-                    let (ctx, left, right) = command_terms(items, "union")?;
-                    let left = add_sexp_term(&mut eg, left, ctx)?;
-                    let right = add_sexp_term(&mut eg, right, ctx)?;
-                    let changed = eg.union(&left, &right);
-                    eg.rebuild();
-                    output.push(if changed {
-                        "unioned".into()
+fn run_command(
+    form: &Sexp,
+    command_index: usize,
+    eg: &mut EGraph,
+    rules: &mut Vec<Rewrite>,
+    output: &mut Vec<String>,
+) -> Result<(), String> {
+    let Sexp::List(items) = form else {
+        return Err(format!("command {} must be a list", command_index + 1));
+    };
+    let Some(head) = items.first() else {
+        return Err(format!("command {} is empty", command_index + 1));
+    };
+    let command = atom_of(head)?;
+    let output_start = output.len();
+    match command {
+        "reset" if items.len() == 1 => {
+            *eg = EGraph::new();
+            rules.clear();
+            output.push("reset".into());
+        }
+        "insert" if matches!(items.len(), 2 | 3) => {
+            let (ctx, term) = command_term(items, "insert")?;
+            let id = add_sexp_term(eg, term, ctx)?;
+            output.push(format!("inserted {}", id.show()));
+        }
+        "union" if matches!(items.len(), 3 | 4) => {
+            let (ctx, left, right) = command_terms(items, "union")?;
+            let left = add_sexp_term(eg, left, ctx)?;
+            let right = add_sexp_term(eg, right, ctx)?;
+            let changed = eg.union(&left, &right);
+            eg.rebuild();
+            output.push(if changed {
+                "unioned".into()
+            } else {
+                "already equivalent".into()
+            });
+        }
+        "guard" if matches!(items.len(), 3 | 4) => {
+            let (ctx, left, right) = command_terms(items, "guard")?;
+            let left = add_sexp_term(eg, left, ctx)?;
+            let right = add_sexp_term(eg, right, ctx)?;
+            eg.rebuild();
+            if !eg.equivalent(&left, &right) {
+                let left = eg.extract(&left).map_or_else(
+                    || "<no finite term>".into(),
+                    |term| term.display().to_string(),
+                );
+                let right = eg.extract(&right).map_or_else(
+                    || "<no finite term>".into(),
+                    |term| term.display().to_string(),
+                );
+                return Err(format!("guard failed: {left} != {right}"));
+            }
+            output.push("guard passed".into());
+        }
+        "rewrite" if items.len() == 3 => {
+            rules.push(Rewrite::new(
+                sexp_match_pattern(&items[1])?,
+                sexp_pattern(&items[2])?,
+            )?);
+            output.push(format!("rewrite {} added", rules.len()));
+        }
+        "match" if items.len() == 2 => {
+            let pattern = sexp_match_pattern(&items[1])?;
+            let matches = eg.search(&pattern);
+            if matches.is_empty() {
+                output.push("no matches".into());
+            }
+            for (index, (context, subst)) in matches.into_iter().enumerate() {
+                let bindings: Vec<_> = subst
+                    .bindings()
+                    .map(|(name, binding)| (name.to_owned(), *binding))
+                    .collect();
+                let mut rendered = Vec::with_capacity(bindings.len());
+                for (name, binding) in bindings {
+                    let arity = binding
+                        .ctx()
+                        .checked_sub(context)
+                        .ok_or_else(|| format!("binding {name} has an invalid context"))?;
+                    let term = eg
+                        .extract(&binding)
+                        .ok_or_else(|| format!("binding {name} has no finite extractable term"))?;
+                    let parameters: Vec<_> = (0..arity).map(|index| format!("x{index}")).collect();
+                    let body = term.display_with_root_binders(&parameters).to_string();
+                    let value = if parameters.is_empty() {
+                        body
                     } else {
-                        "already equivalent".into()
-                    });
+                        format!("mlam {} {body}", parameters.join(" "))
+                    };
+                    rendered.push(format!("{name} = {value}"));
                 }
-                "guard" if matches!(items.len(), 3 | 4) => {
-                    let (ctx, left, right) = command_terms(items, "guard")?;
-                    let left = add_sexp_term(&mut eg, left, ctx)?;
-                    let right = add_sexp_term(&mut eg, right, ctx)?;
-                    eg.rebuild();
-                    if !eg.equivalent(&left, &right) {
-                        let left = eg.extract(&left).map_or_else(
-                            || "<no finite term>".into(),
-                            |term| term.display().to_string(),
-                        );
-                        let right = eg.extract(&right).map_or_else(
-                            || "<no finite term>".into(),
-                            |term| term.display().to_string(),
-                        );
-                        return Err(format!("guard failed: {left} != {right}"));
-                    }
-                    output.push("guard passed".into());
-                }
-                "rewrite" if items.len() == 3 => {
-                    rules.push(Rewrite::new(
-                        sexp_match_pattern(&items[1])?,
-                        sexp_pattern(&items[2])?,
-                    )?);
-                    output.push(format!("rewrite {} added", rules.len()));
-                }
-                "match" if items.len() == 2 => {
-                    let pattern = sexp_match_pattern(&items[1])?;
-                    let matches = eg.search(&pattern);
-                    if matches.is_empty() {
-                        output.push("no matches".into());
-                    }
-                    for (index, (context, subst)) in matches.into_iter().enumerate() {
-                        let bindings: Vec<_> = subst
-                            .bindings()
-                            .map(|(name, binding)| (name.to_owned(), *binding))
-                            .collect();
-                        let mut rendered = Vec::with_capacity(bindings.len());
-                        for (name, binding) in bindings {
-                            let arity = binding
-                                .ctx()
-                                .checked_sub(context)
-                                .ok_or_else(|| format!("binding {name} has an invalid context"))?;
-                            let term = eg.extract(&binding).ok_or_else(|| {
-                                format!("binding {name} has no finite extractable term")
-                            })?;
-                            let parameters: Vec<_> =
-                                (0..arity).map(|index| format!("x{index}")).collect();
-                            let body = term.display_with_root_binders(&parameters).to_string();
-                            let value = if parameters.is_empty() {
-                                body
-                            } else {
-                                format!("mlam {} {body}", parameters.join(" "))
-                            };
-                            rendered.push(format!("{name} = {value}"));
-                        }
-                        output.push(format!(
-                            "match {} ctx{context} |-> {{{}}}",
-                            index + 1,
-                            rendered.join(", ")
-                        ));
-                    }
-                }
-                "run" if items.len() == 2 => {
-                    let limit = atom_of(&items[1])?
-                        .parse::<usize>()
-                        .map_err(|_| "run limit must be a nonnegative integer".to_string())?;
-                    let stats = eg.run(&rules, limit);
-                    output.push(format!(
+                output.push(format!(
+                    "match {} ctx{context} |-> {{{}}}",
+                    index + 1,
+                    rendered.join(", ")
+                ));
+            }
+        }
+        "run" if items.len() == 2 => {
+            let limit = atom_of(&items[1])?
+                .parse::<usize>()
+                .map_err(|_| "run limit must be a nonnegative integer".to_string())?;
+            let stats = eg.run(rules, limit);
+            output.push(format!(
                         "ran {} rounds, {} unions: {} classes, {} e-nodes\nmatch {:?}, apply {:?}, rebuild {:?}",
                         stats.rounds,
                         stats.unions,
@@ -566,31 +616,57 @@ pub fn run_sexp_script(input: &str) -> Result<Vec<String>, String> {
                         stats.apply_time,
                         stats.rebuild_time,
                     ));
-                }
-                "echo" if items.len() == 2 => output.push(atom_of(&items[1])?.to_owned()),
-                "print-egraph" if items.len() == 1 => output.push(eg.dump()),
-                "extract" if matches!(items.len(), 2 | 3) => {
-                    let (ctx, term) = command_term(items, "extract")?;
-                    let id = add_sexp_term(&mut eg, term, ctx)?;
-                    let term = eg
-                        .extract(&id)
-                        .ok_or_else(|| "class has no finite extractable term".to_string())?;
-                    output.push(term.display().to_string());
-                }
-                "reset" | "insert" | "union" | "guard" | "rewrite" | "match" | "run" | "echo"
-                | "print-egraph" | "extract" => {
-                    return Err(format!("wrong number of arguments to '{command}'"));
-                }
-                _ => return Err(format!("unknown command '{command}'")),
+        }
+        "echo" if items.len() == 2 => output.push(atom_of(&items[1])?.to_owned()),
+        "fail" if items.len() == 2 => {
+            // Expected failures are transactional: even a command that
+            // mutates before rejecting its input leaves no trace.
+            let mut trial_eg = eg.clone();
+            let mut trial_rules = rules.clone();
+            let mut trial_output = vec![];
+            match run_command(
+                &items[1],
+                command_index,
+                &mut trial_eg,
+                &mut trial_rules,
+                &mut trial_output,
+            ) {
+                Ok(()) => return Err("wrapped command succeeded".into()),
+                Err(error) => output.push(format!("failed as expected: {error}")),
             }
-            if command != "extract" {
-                for item in &mut output[output_start..] {
-                    *item = comment_lines(item);
-                }
-            }
-            Ok(())
-        })();
-        result.map_err(|error| format!("line {line}: {error}"))?;
+        }
+        "print-egraph" if items.len() == 1 => output.push(eg.dump()),
+        "extract" if matches!(items.len(), 2 | 3) => {
+            let (ctx, term) = command_term(items, "extract")?;
+            let id = add_sexp_term(eg, term, ctx)?;
+            let term = eg
+                .extract(&id)
+                .ok_or_else(|| "class has no finite extractable term".to_string())?;
+            output.push(term.display().to_string());
+        }
+        "reset" | "insert" | "union" | "guard" | "rewrite" | "match" | "run" | "echo" | "fail"
+        | "print-egraph" | "extract" => {
+            return Err(format!("wrong number of arguments to '{command}'"));
+        }
+        _ => return Err(format!("unknown command '{command}'")),
+    }
+    if command != "extract" {
+        for item in &mut output[output_start..] {
+            *item = comment_lines(item);
+        }
+    }
+    Ok(())
+}
+
+pub fn run_sexp_script(input: &str) -> Result<Vec<String>, String> {
+    let mut eg = EGraph::new();
+    let mut rules = vec![];
+    let mut output = vec![];
+    for (command_index, (location, form)) in
+        parse_sexps_with_locations(input)?.into_iter().enumerate()
+    {
+        run_command(&form, command_index, &mut eg, &mut rules, &mut output)
+            .map_err(|error| location.error(error))?;
     }
     Ok(output)
 }

@@ -281,7 +281,7 @@ fn sexp_reset_clears_substitution_rewrites() {
 fn sexp_reset_rejects_arguments() {
     assert_eq!(
         run_sexp_script("(reset now)").unwrap_err(),
-        "line 1: wrong number of arguments to 'reset'"
+        "line 1:1: wrong number of arguments to 'reset'"
     );
 }
 #[test]
@@ -343,18 +343,57 @@ fn sexp_guard_supports_an_ambient_context() {
 #[test]
 fn sexp_guard_fails_the_script_for_unequal_terms() {
     let error = run_sexp_script("(guard (f a) b)").unwrap_err();
-    assert_eq!(error, "line 1: guard failed: (f a) != b");
+    assert_eq!(error, "line 1:1: guard failed: (f a) != b");
 }
+
+#[test]
+fn sexp_fail_accepts_a_failing_command() {
+    let output = run_sexp_script("(fail (guard (f a) b))\n(echo continued)").unwrap();
+    assert_eq!(
+        output,
+        [
+            "; failed as expected: guard failed: (f a) != b",
+            "; continued"
+        ]
+    );
+}
+
+#[test]
+fn sexp_fail_rejects_a_successful_command() {
+    let error = run_sexp_script("\n(fail (guard a a))").unwrap_err();
+    assert_eq!(error, "line 2:1: wrapped command succeeded");
+}
+
+#[test]
+fn sexp_fail_discards_the_wrapped_commands_state() {
+    let output = run_sexp_script("(fail (guard (f a) b)) (match ?x)").unwrap();
+    assert_eq!(
+        output,
+        [
+            "; failed as expected: guard failed: (f a) != b",
+            "; no matches"
+        ]
+    );
+}
+
+#[test]
+fn sexp_fail_checks_its_arity() {
+    assert_eq!(
+        run_sexp_script("(fail)").unwrap_err(),
+        "line 1:1: wrong number of arguments to 'fail'"
+    );
+}
+
 #[test]
 fn sexp_errors_report_source_lines() {
     let error = run_sexp_script("(echo ok)\n\n(guard a b)").unwrap_err();
-    assert_eq!(error, "line 3: guard failed: a != b");
+    assert_eq!(error, "line 3:1: guard failed: a != b");
 
     let error = run_sexp_script("(echo ok)\n(insert (f a)").unwrap_err();
-    assert_eq!(error, "line 2: unclosed '('");
+    assert_eq!(error, "line 2:1: unclosed '('");
 
     let error = run_sexp_script("(echo ok)\n)").unwrap_err();
-    assert_eq!(error, "line 2: unexpected ')'");
+    assert_eq!(error, "line 2:1: unexpected ')'");
 }
 #[test]
 fn sexp_match_prints_every_extracted_substitution() {
@@ -409,7 +448,7 @@ fn sexp_match_rejects_permuted_miller_parameters() {
     .unwrap_err();
     assert_eq!(
         error,
-        "line 3: Miller metavariable '?a' arguments are out of order; write (?a x y) on the match left-hand side, then permute its arguments on the rewrite right-hand side if needed"
+        "line 3:13: Miller metavariable '?a' arguments are out of order; write (?a x y) on the match left-hand side, then permute its arguments on the rewrite right-hand side if needed"
     );
 }
 #[test]
@@ -521,7 +560,7 @@ fn sexp_print_egraph_handles_an_empty_graph_and_rejects_arguments() {
     );
     assert_eq!(
         run_sexp_script("(print-egraph extra)").unwrap_err(),
-        "line 1: wrong number of arguments to 'print-egraph'"
+        "line 1:1: wrong number of arguments to 'print-egraph'"
     );
 }
 #[test]
@@ -532,11 +571,11 @@ fn sexp_echo_emits_quoted_strings_and_atoms() {
     );
     assert_eq!(
         run_sexp_script("(echo)").unwrap_err(),
-        "line 1: wrong number of arguments to 'echo'"
+        "line 1:1: wrong number of arguments to 'echo'"
     );
     assert_eq!(
         run_sexp_script("(echo (not an atom))").unwrap_err(),
-        "line 1: expected an atom"
+        "line 1:1: expected an atom"
     );
 }
 #[test]

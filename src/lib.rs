@@ -940,7 +940,7 @@ enum MatchMode {
     Lifted,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct EGraph {
     parent: Vec<Id>,
     memo: IndexMap<Node, RawId, rustc_hash::FxBuildHasher>,
