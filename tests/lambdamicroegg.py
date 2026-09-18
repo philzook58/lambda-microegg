@@ -207,9 +207,7 @@ class EGraph:
         core_positions = tuple(range(len(outer))) + (
             (len(outer),) if uses_bound else ()
         )
-        core_body = FatId(
-            body.raw, Lift(core_positions, len(outer) + 1)
-        )
+        core_body = FatId(body.raw, Lift(core_positions, len(outer) + 1))
         return self._add_node(len(outer), Node(_LAM, (core_body,))).weaken(
             Lift(outer, outer_ctx)
         )
@@ -260,9 +258,7 @@ class EGraph:
             self._link(left.raw, FatId(root.raw, Lift(kept, left.lift.dom)))
             return True
 
-        common = tuple(
-            i for i in left.lift.positions if i in set(right.lift.positions)
-        )
+        common = tuple(i for i in left.lift.positions if i in set(right.lift.positions))
         to_left = Lift(
             tuple(left.lift.positions.index(i) for i in common), left.lift.dom
         )
@@ -287,9 +283,7 @@ class EGraph:
         return self.find(left) == self.find(right)
 
     def is_eq(self, left: Term, right: Term, ctx: int = 0) -> bool:
-        return self._is_eq(
-            self.add_term(left, ctx=ctx), self.add_term(right, ctx=ctx)
-        )
+        return self._is_eq(self.add_term(left, ctx=ctx), self.add_term(right, ctx=ctx))
 
     def nodes_in_class(self, id: FatId) -> list[tuple[Node, Lift]]:
         """Return nodes together with their placement in ``id``'s context."""
@@ -405,9 +399,7 @@ class EGraph:
             self._union(target, self.add_term(rhs, subst, target.ctx))
         self.rebuild()
 
-    def substitute(
-        self, body: FatId, level: int, replacement: FatId
-    ) -> FatId:
+    def substitute(self, body: FatId, level: int, replacement: FatId) -> FatId:
         """Capture-avoiding substitution of one ambient context coordinate."""
         assert body.ctx == replacement.ctx + 1
         assert 0 <= level < body.ctx
@@ -427,6 +419,9 @@ class EGraph:
         projected = body.remove_unused(level)
         if projected is not None:
             return projected
+        # A normalized version could memoize (raw ID, intrinsic slot,
+        # replacement raw ID, dependency overlap), then reapply the result lift.
+        # Using fat IDs here records that overlap directly.
         key = body, level, replacement
         if key in memo:
             return memo[key]
@@ -453,7 +448,9 @@ class EGraph:
                 translated = (
                     replacement
                     if old_level == level
-                    else self.bound(body.ctx - 1, body.ctx - 2 - (old_level - (old_level > level)))
+                    else self.bound(
+                        body.ctx - 1, body.ctx - 2 - (old_level - (old_level > level))
+                    )
                 )
             elif node.f is _LAM:
                 inner = node.args[0].weaken(by.extend(True))

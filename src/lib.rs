@@ -1,9 +1,101 @@
+//! Lambda MicroEgg keeps three coordinate notions separate:
+//! - a de Bruijn index counts outward from the nearest binder;
+//! - a de Bruijn level selects a variable in one chosen ambient context;
+//! - an intrinsic context contains only the variables an e-class depends on.
+//!
+//! During pattern matching, `top_ctx` is the ambient context outside the
+//! pattern and `current_ctx` additionally includes its locally introduced
+//! binders. A lift embeds an intrinsic context into either ambient context;
+//! levels are therefore relative to that chosen context, not globally fixed.
+
 use indexmap::IndexMap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
+use std::time::{Duration, Instant};
 use symbol_table::GlobalSymbol as Symbol;
 
 pub type RawId = u32;
+
+/// A de Bruijn index: zero names the nearest enclosing binder.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct DeBruijnIndex(usize);
+
+impl DeBruijnIndex {
+    pub fn new(index: usize) -> Self {
+        Self(index)
+    }
+    pub fn get(self) -> usize {
+        self.0
+    }
+    pub fn to_level(self, context_len: usize) -> Option<DeBruijnLevel> {
+        Some(DeBruijnLevel(
+            context_len.checked_sub(self.0.checked_add(1)?)?,
+        ))
+    }
+}
+
+impl From<usize> for DeBruijnIndex {
+    fn from(index: usize) -> Self {
+        Self(index)
+    }
+}
+
+/// A de Bruijn level: zero names the outermost variable in a context.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DeBruijnLevel(usize);
+
+impl DeBruijnLevel {
+    pub fn new(level: usize) -> Self {
+        Self(level)
+    }
+    pub fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for DeBruijnLevel {
+    fn from(level: usize) -> Self {
+        Self(level)
+    }
+}
+
+/// Convert distinct pattern-local indices to levels in the current context.
+fn local_indices_to_levels(
+    top_ctx: usize,
+    current_ctx: usize,
+    arguments: &[DeBruijnIndex],
+) -> Option<SmallVec<[DeBruijnLevel; 4]>> {
+    let local_depth = current_ctx.checked_sub(top_ctx)?;
+    if arguments.iter().any(|index| index.get() >= local_depth)
+        || arguments
+            .iter()
+            .enumerate()
+            .any(|(i, index)| arguments[..i].contains(index))
+    {
+        return None;
+    }
+    arguments
+        .iter()
+        .map(|index| index.to_level(current_ctx))
+        .collect()
+}
+
+/// Embed `top context + Miller arguments` into the current context. Match
+/// arguments are required to be written in this outer-to-inner order.
+fn occurrence_lift(
+    top_ctx: usize,
+    current_ctx: usize,
+    arguments: &[DeBruijnIndex],
+) -> Option<Lift> {
+    let levels = local_indices_to_levels(top_ctx, current_ctx, arguments)?;
+    if !levels.windows(2).all(|pair| pair[0] < pair[1]) {
+        return None;
+    }
+    let selected: SmallVec<[usize; 8]> = (0..top_ctx)
+        .chain(levels.iter().map(|level| level.get()))
+        .collect();
+    Some(Lift::selected(current_ctx, &selected))
+}
 
 /// An order-preserving injection from an intrinsic dependency context into
 /// an ambient context. The leading 1 records the codomain length; lower bits
@@ -20,7 +112,7 @@ struct Union {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Pullback {
-    lift: Lift,
+    diagonal: Lift,
     from_left: Lift,
     from_right: Lift,
 }
@@ -101,6 +193,27 @@ impl Lift {
         }
         Self::from_bits(bits, self.cod())
     }
+    /// Factor `target` through this lift. If `self : A -> Γ` and
+    /// `target : B -> Γ`, return the unique ordered lift `B -> A`.
+    fn factor(&self, target: &Self) -> Option<Self> {
+        if self.cod() != target.cod() {
+            return None;
+        }
+        let mut bits = 0;
+        let mut coordinate = 0;
+        for level in 0..self.cod() {
+            if target.get(level) && !self.get(level) {
+                return None;
+            }
+            if self.get(level) {
+                if target.get(level) {
+                    bits |= 1u8 << coordinate;
+                }
+                coordinate += 1;
+            }
+        }
+        Some(Self::from_bits(bits, self.dom()))
+    }
     /// Form the union of two subcontexts of one shared ambient context.
     /// This is their coproduct in the subcontext lattice.
     ///
@@ -156,11 +269,11 @@ impl Lift {
     ///                   ambient Γ
     /// ```
     ///
-    /// `self.compose(from_left) == lift` and
-    /// `other.compose(from_right) == lift`.
+    /// `self.compose(from_left) == diagonal` and
+    /// `other.compose(from_right) == diagonal`.
     fn pullback(&self, other: &Self) -> Pullback {
         assert_eq!(self.cod(), other.cod());
-        let pullback = Self::from_bits(self.selected_bits() & other.selected_bits(), self.cod());
+        let diagonal = Self::from_bits(self.selected_bits() & other.selected_bits(), self.cod());
         let mut left = 0;
         let mut right = 0;
         let mut a = 0;
@@ -180,7 +293,7 @@ impl Lift {
             }
         }
         Pullback {
-            lift: pullback,
+            diagonal,
             from_left: Self::from_bits(left, a),
             from_right: Self::from_bits(right, b),
         }
@@ -265,14 +378,16 @@ enum Node {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Pattern {
-    /// A Miller metavariable allowed to use distinct pattern-local binders.
-    /// The numbers are de Bruijn indices: 0 is the nearest enclosing lambda.
-    /// Top-level coordinates are implicit and always available.
-    Var(Symbol, Vec<usize>),
-    /// An absolute coordinate in the context outside the pattern.
-    Coord(usize),
-    /// A de Bruijn index into the named lambdas introduced by this pattern.
-    Bound(usize),
+    /// A metavariable application. Match patterns restrict its arguments to
+    /// distinct `BVar`s (Miller form); rewrite templates may use arbitrary
+    /// terms, which are simultaneously substituted into the captured body.
+    MetaVar(Symbol, Vec<Pattern>),
+    /// A free variable from the context outside the pattern, stored as a
+    /// de Bruijn level in that ambient context.
+    FVar(DeBruijnLevel),
+    /// A bound variable introduced inside the pattern, stored as a de Bruijn
+    /// index counting outward from the nearest pattern binder.
+    BVar(DeBruijnIndex),
     Atom(Symbol),
     App(Symbol, Vec<Pattern>),
     Lam(Box<Pattern>),
@@ -282,11 +397,17 @@ pub enum Pattern {
 }
 
 impl Pattern {
-    pub fn var(name: &str) -> Self {
-        Self::Var(name.into(), vec![])
+    pub fn meta(name: &str) -> Self {
+        Self::MetaVar(name.into(), vec![])
     }
-    pub fn miller(name: &str, bound: Vec<usize>) -> Self {
-        Self::Var(name.into(), bound)
+    pub fn miller(name: &str, arguments: Vec<usize>) -> Self {
+        Self::MetaVar(
+            name.into(),
+            arguments
+                .into_iter()
+                .map(|index| Self::BVar(index.into()))
+                .collect(),
+        )
     }
     pub fn atom(name: &str) -> Self {
         Self::Atom(name.into())
@@ -295,99 +416,225 @@ impl Pattern {
         Self::App(op.into(), children)
     }
 
-    /// Whether instantiating this pattern may need to traverse an e-class to
-    /// permute Miller arguments. Ordered argument lists remain a packed lift.
-    fn may_permute(&self, depth: usize) -> bool {
+    fn miller_indices(arguments: &[Pattern]) -> Option<SmallVec<[DeBruijnIndex; 4]>> {
+        arguments
+            .iter()
+            .map(|argument| match argument {
+                Pattern::BVar(index) => Some(*index),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether instantiating this template may need to traverse an e-class.
+    /// Ordered bound-variable applications remain a packed lift; permutations
+    /// and general term arguments require simultaneous substitution.
+    fn needs_binding_traversal(&self, depth: usize) -> bool {
         match self {
-            Self::Var(_, bound) => {
-                if bound.iter().any(|&index| index >= depth) {
-                    return false;
-                }
-                bound
-                    .iter()
-                    .map(|index| depth - 1 - index)
-                    .collect::<SmallVec<[usize; 4]>>()
-                    .windows(2)
-                    .any(|pair| pair[0] >= pair[1])
+            Self::MetaVar(_, arguments) => {
+                let Some(indices) = Self::miller_indices(arguments) else {
+                    return true;
+                };
+                occurrence_lift(0, depth, &indices).is_none()
             }
-            Self::App(_, children) => children.iter().any(|child| child.may_permute(depth)),
-            Self::Lam(body) => body.may_permute(depth + 1),
+            Self::App(_, children) => children
+                .iter()
+                .any(|child| child.needs_binding_traversal(depth)),
+            Self::Lam(body) => body.needs_binding_traversal(depth + 1),
             Self::Subst(body, replacement) => {
-                body.may_permute(depth + 1) || replacement.may_permute(depth)
+                body.needs_binding_traversal(depth + 1)
+                    || replacement.needs_binding_traversal(depth)
             }
-            Self::Coord(_) | Self::Bound(_) | Self::Atom(_) => false,
+            Self::FVar(_) | Self::BVar(_) | Self::Atom(_) => false,
         }
     }
 
-    /// Reject nonlinear Miller occurrences that apply the same metavariable
-    /// with different permutations of the surrounding binders. Those would
-    /// require constructing a permuted term merely to decide a match.
-    pub fn validate_match_pattern(&self) -> Result<(), String> {
+    fn validate_arguments(
+        name: Symbol,
+        arguments: &[DeBruijnIndex],
+        depth: usize,
+    ) -> Result<(), String> {
+        if arguments.iter().any(|index| index.get() >= depth) {
+            return Err(format!(
+                "Miller metavariable '{name}' refers outside the pattern binders"
+            ));
+        }
+        if arguments
+            .iter()
+            .enumerate()
+            .any(|(i, index)| arguments[..i].contains(index))
+        {
+            return Err(format!(
+                "Miller metavariable '{name}' repeats a pattern binder"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate a match pattern and return the arity of every metavariable.
+    /// LHS Miller arguments must follow the e-graph's outer-to-inner order.
+    fn match_metavariables(&self) -> Result<HashMap<Symbol, usize>, String> {
         fn go(
             pattern: &Pattern,
             depth: usize,
-            orders: &mut HashMap<Symbol, Vec<usize>>,
+            arities: &mut HashMap<Symbol, usize>,
         ) -> Result<(), String> {
             match pattern {
-                Pattern::Var(name, bound) => {
-                    if bound.iter().any(|&index| index >= depth) {
+                Pattern::MetaVar(name, arguments) => {
+                    let Some(indices) = Pattern::miller_indices(arguments) else {
                         return Err(format!(
-                            "Miller metavariable '{name}' refers outside the pattern binders"
+                            "match metavariable '{name}' may only be applied to bound variables"
+                        ));
+                    };
+                    Pattern::validate_arguments(*name, &indices, depth)?;
+                    if occurrence_lift(0, depth, &indices).is_none() {
+                        let mut correct = indices.to_vec();
+                        correct.sort_unstable_by_key(|index| std::cmp::Reverse(index.get()));
+                        let correct = correct
+                            .iter()
+                            .map(|index| format!("#{}", index.get()))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        return Err(format!(
+                            "Miller metavariable '{name}' arguments are out of order; write ({name} {correct}) on the match left-hand side, then permute its arguments on the rewrite right-hand side if needed"
                         ));
                     }
-                    if bound
-                        .iter()
-                        .enumerate()
-                        .any(|(i, index)| bound[..i].contains(index))
-                    {
-                        return Err(format!(
-                            "Miller metavariable '{name}' repeats a pattern binder"
-                        ));
-                    }
-
-                    // The e-graph context is ordered. Record the order in
-                    // which the written formal arguments occur in that
-                    // context, independent of their particular binder names.
-                    let mut order: Vec<_> = (0..bound.len()).collect();
-                    order.sort_unstable_by_key(|&formal| depth - 1 - bound[formal]);
-                    if let Some(previous) = orders.get(name) {
-                        if previous.len() != order.len() {
+                    if let Some(previous) = arities.get(name) {
+                        if *previous != indices.len() {
                             return Err(format!(
                                 "Miller metavariable '{name}' has inconsistent arity in match pattern"
                             ));
                         }
-                        if previous != &order {
-                            return Err(format!(
-                                "twisted nonlinear Miller metavariable '{name}' uses different binder orders"
-                            ));
-                        }
                     } else {
-                        orders.insert(*name, order);
+                        arities.insert(*name, indices.len());
                     }
                     Ok(())
                 }
                 Pattern::App(_, children) => {
                     for child in children {
-                        go(child, depth, orders)?;
+                        go(child, depth, arities)?;
                     }
                     Ok(())
                 }
-                Pattern::Lam(body) => go(body, depth + 1, orders),
-                Pattern::Subst(body, replacement) => {
-                    go(body, depth + 1, orders)?;
-                    go(replacement, depth, orders)
+                Pattern::Lam(body) => go(body, depth + 1, arities),
+                Pattern::Subst(_, _) => {
+                    Err("#subst is only allowed on a rewrite right-hand side".into())
                 }
-                Pattern::Coord(_) | Pattern::Bound(_) | Pattern::Atom(_) => Ok(()),
+                Pattern::BVar(index) if index.get() >= depth => {
+                    Err("bound variable refers outside the pattern binders".into())
+                }
+                Pattern::FVar(_) | Pattern::BVar(_) | Pattern::Atom(_) => Ok(()),
             }
         }
 
-        go(self, 0, &mut HashMap::default())
+        let mut arities = HashMap::default();
+        go(self, 0, &mut arities)?;
+        Ok(arities)
+    }
+
+    /// Reject malformed or out-of-order Miller applications and constructs
+    /// such as `#subst` that cannot be observed during matching.
+    pub fn validate_match_pattern(&self) -> Result<(), String> {
+        self.match_metavariables().map(|_| ())
+    }
+
+    fn validate_template(&self, metavariables: &HashMap<Symbol, usize>) -> Result<(), String> {
+        fn go(
+            pattern: &Pattern,
+            depth: usize,
+            metavariables: &HashMap<Symbol, usize>,
+        ) -> Result<(), String> {
+            match pattern {
+                Pattern::MetaVar(name, arguments) => {
+                    let Some(&arity) = metavariables.get(name) else {
+                        return Err(format!(
+                            "rewrite right-hand side uses unbound metavariable '{name}'"
+                        ));
+                    };
+                    if arguments.len() != arity {
+                        return Err(format!(
+                            "Miller metavariable '{name}' has arity {} on the left and {} on the right",
+                            arity,
+                            arguments.len()
+                        ));
+                    }
+                    for argument in arguments {
+                        go(argument, depth, metavariables)?;
+                    }
+                    Ok(())
+                }
+                Pattern::App(_, children) => {
+                    for child in children {
+                        go(child, depth, metavariables)?;
+                    }
+                    Ok(())
+                }
+                Pattern::Lam(body) => go(body, depth + 1, metavariables),
+                Pattern::Subst(body, replacement) => {
+                    go(body, depth + 1, metavariables)?;
+                    go(replacement, depth, metavariables)
+                }
+                Pattern::BVar(index) if index.get() >= depth => {
+                    Err("bound variable refers outside the pattern binders".into())
+                }
+                Pattern::FVar(_) | Pattern::BVar(_) | Pattern::Atom(_) => Ok(()),
+            }
+        }
+
+        go(self, 0, metavariables)
+    }
+}
+
+/// A statically checked rewrite. Validation guarantees that the left-hand
+/// side is observable and every right-hand metavariable has a compatible
+/// binding. The traversal flag is cached for the application phase.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Rewrite {
+    lhs: Pattern,
+    rhs: Pattern,
+    rhs_needs_traversal: bool,
+}
+
+impl Rewrite {
+    pub fn new(lhs: Pattern, rhs: Pattern) -> Result<Self, String> {
+        let metavariables = lhs.match_metavariables()?;
+        rhs.validate_template(&metavariables)?;
+        let rhs_needs_traversal = rhs.needs_binding_traversal(0);
+        Ok(Self {
+            lhs,
+            rhs,
+            rhs_needs_traversal,
+        })
+    }
+    pub fn lhs(&self) -> &Pattern {
+        &self.lhs
+    }
+    pub fn rhs(&self) -> &Pattern {
+        &self.rhs
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RunStats {
+    /// Rounds that changed the e-graph. A final no-change check is not counted.
+    pub rounds: usize,
+    /// Successful unions requested directly by rewrite applications.
+    pub unions: usize,
+    pub match_time: Duration,
+    pub apply_time: Duration,
+    pub rebuild_time: Duration,
+}
+
+impl RunStats {
+    pub fn total_time(&self) -> Duration {
+        self.match_time + self.apply_time + self.rebuild_time
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Term {
-    Var(usize),
+    FVar(DeBruijnLevel),
+    BVar(DeBruijnIndex),
     Atom(Symbol),
     App(Symbol, Vec<Term>),
     Lam(Box<Term>),
@@ -396,7 +643,7 @@ pub enum Term {
 impl Term {
     pub fn size(&self) -> usize {
         match self {
-            Self::Var(_) | Self::Atom(_) => 1,
+            Self::FVar(_) | Self::BVar(_) | Self::Atom(_) => 1,
             Self::App(_, children) => 1 + children.iter().map(Self::size).sum::<usize>(),
             Self::Lam(body) => 1 + body.size(),
         }
@@ -426,7 +673,8 @@ impl std::fmt::Display for Term {
             f.write_str("\"")
         }
         match self {
-            Self::Var(index) => write!(f, "${index}"),
+            Self::FVar(level) => write!(f, "${}", level.get()),
+            Self::BVar(index) => write!(f, "#{}", index.get()),
             Self::Atom(name) => atom(f, name.as_str()),
             Self::App(op, children) => {
                 f.write_str("(")?;
@@ -441,9 +689,43 @@ impl std::fmt::Display for Term {
     }
 }
 
+/// An extracted term together with the size of its free-variable context.
+/// `FVar` levels refer to this scope; `BVar` indices refer to enclosing `Lam`s.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TermCtx {
+    pub scope: usize,
+    pub t: Term,
+}
+
+impl TermCtx {
+    pub fn size(&self) -> usize {
+        self.t.size()
+    }
+
+    /// Render with generated names for binders and `$n` for free variables.
+    pub fn display(&self) -> NamedTerm<'_> {
+        self.display_with_root_binders(&[])
+    }
+
+    /// Name the final free variables as Miller formal parameters. Variables
+    /// before them remain `$n` references to the outer context.
+    pub fn display_with_root_binders<'a>(&'a self, root_binders: &'a [String]) -> NamedTerm<'a> {
+        assert!(root_binders.len() <= self.scope);
+        NamedTerm {
+            term: self,
+            root_binders,
+        }
+    }
+}
+
+impl std::fmt::Display for TermCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.t.fmt(f)
+    }
+}
+
 pub struct NamedTerm<'a> {
-    term: &'a Term,
-    outer_ctx: usize,
+    term: &'a TermCtx,
     root_binders: &'a [String],
 }
 
@@ -493,13 +775,20 @@ impl std::fmt::Display for NamedTerm<'_> {
         ) -> std::fmt::Result {
             let root_ctx = outer_ctx + root_binders.len();
             match term {
-                Term::Var(level) if *level < outer_ctx => write!(f, "${level}"),
-                Term::Var(level) if *level < root_ctx => {
-                    f.write_str(&root_binders[level - outer_ctx])
+                Term::FVar(level) if level.get() < outer_ctx => {
+                    write!(f, "${}", level.get())
                 }
-                Term::Var(level) => match binders.get(level - root_ctx) {
+                Term::FVar(level) if level.get() < root_ctx => {
+                    f.write_str(&root_binders[level.get() - outer_ctx])
+                }
+                Term::FVar(level) => write!(f, "${}", level.get()),
+                Term::BVar(index) => match binders
+                    .len()
+                    .checked_sub(index.get() + 1)
+                    .and_then(|slot| binders.get(slot))
+                {
                     Some(name) => f.write_str(name),
-                    None => write!(f, "${level}"),
+                    None => write!(f, "#{}", index.get()),
                 },
                 Term::Atom(name) => atom(
                     f,
@@ -525,87 +814,26 @@ impl std::fmt::Display for NamedTerm<'_> {
                 }
             }
         }
-        go(self.term, f, self.outer_ctx, self.root_binders, &mut vec![])
+        let outer_ctx = self.term.scope - self.root_binders.len();
+        go(&self.term.t, f, outer_ctx, self.root_binders, &mut vec![])
     }
 }
 
-impl Term {
-    /// Render a term using generated names for binders. Variables in the
-    /// context outside the term remain `$0`, `$1`, and so on.
-    pub fn display_in(&self, outer_ctx: usize) -> NamedTerm<'_> {
-        self.display_with_root_binders(outer_ctx, &[])
-    }
-
-    /// As above, but the final root coordinates are named formal parameters.
-    /// This is used to render Miller substitutions without exposing levels.
-    pub fn display_with_root_binders<'a>(
-        &'a self,
-        outer_ctx: usize,
-        root_binders: &'a [String],
-    ) -> NamedTerm<'a> {
-        NamedTerm {
-            term: self,
-            outer_ctx,
-            root_binders,
-        }
-    }
-}
-
-/// A matcher-level abstraction. `body` uses the pattern's top context followed
-/// by the parameters it actually mentions, in the e-graph's ordered context.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MLam {
-    body: Id,
-    /// Three bits each for the kept count, arity, and up to seven formal
-    /// indices. This is the only match-dependent data beyond `body`: it says
-    /// which permitted Miller arguments the matched term actually used.
-    shape: u32,
-}
-
-impl MLam {
-    fn new(top_ctx: usize, arity: usize, kept: &[usize], body: Id) -> Self {
-        debug_assert!(arity <= 7 && kept.len() <= 7);
-        debug_assert!(kept.iter().all(|&formal| formal < arity));
-        debug_assert_eq!(body.ctx(), top_ctx + kept.len());
-        let mut shape = kept.len() as u32 | (arity as u32) << 3;
-        for (index, &formal) in kept.iter().enumerate() {
-            shape |= (formal as u32) << (6 + 3 * index);
-        }
-        Self { body, shape }
-    }
-    fn kept_len(&self) -> usize {
-        (self.shape & 0b111) as usize
-    }
-    fn kept_indices(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.kept_len()).map(|index| ((self.shape >> (6 + 3 * index)) & 0b111) as usize)
-    }
-    pub fn top_ctx(&self) -> usize {
-        self.body.ctx() - self.kept_len()
-    }
-    pub fn arity(&self) -> usize {
-        ((self.shape >> 3) & 0b111) as usize
-    }
-    pub fn kept(&self) -> SmallVec<[usize; 4]> {
-        self.kept_indices().collect()
-    }
-    pub fn body(&self) -> Id {
-        self.body
-    }
-}
-
+/// Match results contain only fat IDs. A binding for an n-ary metavariable
+/// lives in `top_ctx + n`; its lift records unused top variables and formals.
 #[derive(Clone, Default)]
-pub struct Subst(SmallVec<[(Symbol, MLam); 4]>);
+pub struct Subst(SmallVec<[(Symbol, Id); 4]>);
 
 impl Subst {
-    fn get(&self, name: &Symbol) -> Option<&MLam> {
+    fn get(&self, name: &Symbol) -> Option<&Id> {
         self.0
             .iter()
             .find_map(|(key, binding)| (*key == *name).then_some(binding))
     }
-    fn insert(&mut self, name: Symbol, binding: MLam) {
+    fn insert(&mut self, name: Symbol, binding: Id) {
         self.0.push((name, binding));
     }
-    pub fn bindings(&self) -> impl Iterator<Item = (&str, &MLam)> + '_ {
+    pub fn bindings(&self) -> impl Iterator<Item = (&str, &Id)> + '_ {
         self.0
             .iter()
             .map(|(name, binding)| (name.as_str(), binding))
@@ -613,8 +841,8 @@ impl Subst {
 }
 
 impl std::ops::Index<&str> for Subst {
-    type Output = MLam;
-    fn index(&self, name: &str) -> &MLam {
+    type Output = Id;
+    fn index(&self, name: &str) -> &Id {
         self.get(&name.into()).expect("unbound pattern variable")
     }
 }
@@ -677,6 +905,7 @@ pub struct EGraph {
     /// when a constructive Miller permutation needs class-local traversal.
     rev_tracked: bool,
     rev_valid: bool,
+    rebuild_time_total: Duration,
 }
 
 impl EGraph {
@@ -821,7 +1050,7 @@ impl EGraph {
             return true;
         }
         let Pullback {
-            lift: common,
+            diagonal: common,
             from_left: to_a,
             from_right: to_b,
         } = a.lift().pullback(&b.lift());
@@ -884,21 +1113,8 @@ impl EGraph {
         assert_eq!(target.ctx(), replacement.ctx() + 1);
         assert!(variable < target.ctx());
         self.rebuild();
-        let mut memo = HashMap::default();
-        let result = self.substitute_rec(target, variable, replacement, &mut memo);
-        self.rebuild();
-        self.find_mut(&result)
-    }
-    fn substitute_rec(
-        &mut self,
-        target: &Id,
-        variable: usize,
-        replacement: &Id,
-        memo: &mut HashMap<(Id, usize, Id), Id>,
-    ) -> Id {
         let target = self.find_mut(target);
         let replacement = self.find_mut(replacement);
-        assert_eq!(target.ctx(), replacement.ctx() + 1);
 
         // The lift is an exact dependency mask. If this coordinate is
         // absent, substitution is just deletion of an unused input and no
@@ -906,82 +1122,30 @@ impl EGraph {
         if let Some(projected) = target.remove_coord(variable) {
             return projected;
         }
-
-        let key = (target, variable, replacement);
-        if let Some(result) = memo.get(&key) {
-            return *result;
-        }
-        // Binder traversal can revisit the same raw cycle with extra unused
-        // trailing coordinates. Reuse the earlier placeholder after changing
-        // only its ambient context, rather than missing the cycle because the
-        // full fat IDs differ.
-        for ((old_target, old_variable, old_replacement), old_result) in memo.iter() {
-            if *old_variable == variable
-                && old_target.raw() == target.raw()
-                && old_replacement.raw() == replacement.raw()
-                && old_target.in_context(target.ctx()) == Some(target)
-                && old_replacement.in_context(replacement.ctx()) == Some(replacement)
-                && let Some(result) = old_result.in_context(target.ctx() - 1)
-            {
-                return result;
-            }
-        }
-
-        // Install the result before following children. An e-class can be
-        // cyclic (for example after x = f(x)), so recursive visits must see
-        // a result to tie the translated cycle back to.
-        let result = self.make_set(target.ctx() - 1);
-        memo.insert(key, result);
-        let nodes: Vec<_> = self
-            .nodes_in_class(&target, MatchMode::Lifted)
-            .into_iter()
-            .map(|(node, by)| (node.clone(), by))
+        let output_ctx = replacement.ctx();
+        let replacements: SmallVec<[Id; 8]> = (0..target.ctx())
+            .map(|level| {
+                if level == variable {
+                    replacement
+                } else {
+                    let shifted = level - usize::from(level > variable);
+                    self.var(output_ctx, shifted)
+                }
+            })
             .collect();
-
-        for (node, by) in nodes {
-            let translated = match node {
-                Node::Var => {
-                    debug_assert_eq!(by.dom(), 1);
-                    let old_index = (0..by.cod()).find(|&i| by.get(i)).unwrap();
-                    if old_index == variable {
-                        replacement
-                    } else {
-                        let new_index = old_index - usize::from(old_index > variable);
-                        self.var(target.ctx() - 1, new_index)
-                    }
-                }
-                Node::Atom(name) => self.atom(name.as_str(), target.ctx() - 1),
-                Node::App(op, children) => {
-                    let children = children
-                        .into_iter()
-                        .map(|child| {
-                            let child = child.weaken(&by);
-                            self.substitute_rec(&child, variable, &replacement, memo)
-                        })
-                        .collect();
-                    self.app(op.as_str(), children)
-                }
-                Node::Lam(body) => {
-                    let body = body.weaken(&by.append(true));
-                    let replacement_under_binder = replacement.in_context(target.ctx()).unwrap();
-                    let body =
-                        self.substitute_rec(&body, variable, &replacement_under_binder, memo);
-                    self.lam(body)
-                }
-            };
-            self.union(&result, &translated);
-        }
+        let result = self.substitute_many(&target, output_ctx, &replacements);
+        self.rebuild();
         self.find_mut(&result)
     }
-    /// Rename all coordinates of `target` at once. Ordered injections stay a
-    /// single lift; permutations fall back to a memoized e-graph traversal.
-    fn remap_variables(&mut self, target: &Id, output_ctx: usize, coordinates: &[usize]) -> Id {
-        assert_eq!(target.ctx(), coordinates.len());
-        assert!(coordinates.iter().all(|&index| index < output_ctx));
-        if coordinates.windows(2).all(|pair| pair[0] < pair[1]) {
-            return target.weaken(&Lift::selected(output_ctx, coordinates));
-        }
-
+    /// Simultaneously replace every input coordinate of `target` with an
+    /// arbitrary term in `output_ctx`. Results are memoized to tie cycles.
+    fn substitute_many(&mut self, target: &Id, output_ctx: usize, replacements: &[Id]) -> Id {
+        assert_eq!(target.ctx(), replacements.len());
+        assert!(
+            replacements
+                .iter()
+                .all(|replacement| replacement.ctx() == output_ctx)
+        );
         // A standalone caller may arrive outside a tracked rewrite batch.
         // Establish a clean index once, then keep it live for the traversal.
         if !self.rev_valid && !self.rev_tracked {
@@ -989,18 +1153,11 @@ impl EGraph {
         }
         self.rev_tracked = true;
 
-        // Rebuilding is amortized over the surrounding rewrite round. The
-        // reverse class index is maintained across these unions, so recursive
-        // construction can still inspect only the source e-class.
-        let replacements: SmallVec<[Id; 8]> = coordinates
-            .iter()
-            .map(|&index| self.var(output_ctx, index))
-            .collect();
         let mut memo = HashMap::default();
-        let result = self.remap_variables_rec(target, output_ctx, &replacements, &mut memo);
+        let result = self.substitute_many_rec(target, output_ctx, replacements, &mut memo);
         self.find_mut(&result)
     }
-    fn remap_variables_rec(
+    fn substitute_many_rec(
         &mut self,
         target: &Id,
         output_ctx: usize,
@@ -1057,7 +1214,7 @@ impl EGraph {
                         .into_iter()
                         .map(|child| {
                             let child = child.weaken(&by);
-                            self.remap_variables_rec(&child, output_ctx, &replacements, memo)
+                            self.substitute_many_rec(&child, output_ctx, &replacements, memo)
                         })
                         .collect();
                     self.app(op.as_str(), children)
@@ -1069,7 +1226,7 @@ impl EGraph {
                         .map(|replacement| replacement.in_context(output_ctx + 1).unwrap())
                         .collect();
                     under.push(self.var(output_ctx + 1, output_ctx));
-                    let body = self.remap_variables_rec(&body, output_ctx + 1, &under, memo);
+                    let body = self.substitute_many_rec(&body, output_ctx + 1, &under, memo);
                     self.lam(body)
                 }
             };
@@ -1077,24 +1234,29 @@ impl EGraph {
         }
         self.find_mut(&result)
     }
-    pub fn extract(&mut self, target: &Id) -> Option<Term> {
+    pub fn extract(&mut self, target: &Id) -> Option<TermCtx> {
         self.extract_with(target, Term::size)
     }
     /// Extract with a constructor-monotone cost function. The top-down cycle
     /// breaker is sound for costs such as tree size, where wrapping a term
     /// cannot make it cheaper.
-    pub fn extract_with(&mut self, target: &Id, cost: impl Fn(&Term) -> usize) -> Option<Term> {
+    pub fn extract_with(&mut self, target: &Id, cost: impl Fn(&Term) -> usize) -> Option<TermCtx> {
         self.rebuild();
-        self.extract_rec(
-            target,
+        let target = self.find(target);
+        let scope = target.ctx();
+        let t = self.extract_rec(
+            &target,
+            scope,
             &mut HashMap::default(),
             &mut HashSet::default(),
             &cost,
-        )
+        )?;
+        Some(TermCtx { scope, t })
     }
     fn extract_rec(
         &self,
         target: &Id,
+        root_scope: usize,
         memo: &mut HashMap<Id, Option<Term>>,
         active_raw: &mut HashSet<RawId>,
         cost: &impl Fn(&Term) -> usize,
@@ -1124,7 +1286,12 @@ impl EGraph {
                     let Some(index) = (0..by.cod()).find(|&i| by.get(i)) else {
                         continue;
                     };
-                    Term::Var(index)
+                    if index < root_scope {
+                        Term::FVar(index.into())
+                    } else {
+                        let binder = target.ctx().checked_sub(index + 1)?;
+                        Term::BVar(binder.into())
+                    }
                 }
                 Node::Atom(name) => Term::Atom(*name),
                 Node::App(op, children) => {
@@ -1132,7 +1299,9 @@ impl EGraph {
                     let mut cyclic = false;
                     for child in children {
                         let child = child.weaken(&by);
-                        let Some(term) = self.extract_rec(&child, memo, active_raw, cost) else {
+                        let Some(term) =
+                            self.extract_rec(&child, root_scope, memo, active_raw, cost)
+                        else {
                             cyclic = true;
                             break;
                         };
@@ -1145,7 +1314,8 @@ impl EGraph {
                 }
                 Node::Lam(body) => {
                     let body = body.weaken(&by.append(true));
-                    let Some(body) = self.extract_rec(&body, memo, active_raw, cost) else {
+                    let Some(body) = self.extract_rec(&body, root_scope, memo, active_raw, cost)
+                    else {
                         continue;
                     };
                     Term::Lam(Box::new(body))
@@ -1178,113 +1348,27 @@ impl EGraph {
         self.rev_tracked = true;
         self.rev_valid = true;
     }
-    /// Convert the temporarily named Miller arguments, in their written
-    /// order, to absolute coordinates in the e-graph's ordered context.
-    fn miller_arguments(
-        top_ctx: usize,
-        current_ctx: usize,
-        bound: &[usize],
-    ) -> Option<SmallVec<[usize; 4]>> {
-        let depth = current_ctx.checked_sub(top_ctx)?;
-        if bound.iter().any(|&index| index >= depth) {
-            return None;
-        }
-        if bound
-            .iter()
-            .enumerate()
-            .any(|(i, index)| bound[..i].contains(index))
-        {
-            return None;
-        }
-        Some(bound.iter().map(|&index| current_ctx - 1 - index).collect())
-    }
-    /// Abstract pattern-local coordinates into a matcher-level closure. The
-    /// body keeps e-graph coordinates ordered; `kept` remembers which
-    /// temporary Miller parameter occupied each retained coordinate.
-    fn miller_abstract(&self, target: &Id, top_ctx: usize, bound: &[usize]) -> Option<MLam> {
-        let mut body = self.find(target);
-        let arguments = Self::miller_arguments(top_ctx, body.ctx(), bound)?;
-        if (top_ctx..body.ctx())
-            .any(|coordinate| body.lift().get(coordinate) && !arguments.contains(&coordinate))
-        {
-            return None;
-        }
-        let mut kept: SmallVec<[(usize, usize); 4]> = arguments
-            .iter()
-            .enumerate()
-            .filter_map(|(formal, &coordinate)| {
-                body.lift().get(coordinate).then_some((coordinate, formal))
-            })
-            .collect();
-        kept.sort_unstable_by_key(|&(coordinate, _)| coordinate);
-        let kept: SmallVec<[usize; 4]> = kept.into_iter().map(|(_, formal)| formal).collect();
-
-        // Delete unused pattern-local coordinates from right to left. Used
-        // coordinates remain ordered exactly as the e-graph requires.
-        for coordinate in (top_ctx..body.ctx()).rev() {
-            if !body.lift().get(coordinate) {
-                body = body.remove_coord(coordinate).unwrap();
-            }
-        }
-        debug_assert_eq!(body.ctx(), top_ctx + kept.len());
-        Some(MLam::new(top_ctx, bound.len(), &kept, body))
-    }
-    fn miller_application_coordinates(
-        binding: &MLam,
-        top_ctx: usize,
-        current_ctx: usize,
-        bound: &[usize],
-    ) -> Option<SmallVec<[usize; 8]>> {
-        if binding.top_ctx() != top_ctx || binding.arity() != bound.len() {
-            return None;
-        }
-        let arguments = Self::miller_arguments(top_ctx, current_ctx, bound)?;
-        Some(
-            (0..top_ctx)
-                .chain(binding.kept_indices().map(|formal| arguments[formal]))
-                .collect(),
-        )
-    }
-    /// Matching is observational: a repeated metavariable is checked only
-    /// when its application remains an ordered lift. Twisted nonlinear
-    /// occurrences would require constructing a permuted term, so they fail.
-    fn miller_apply_ordered(
-        binding: &MLam,
-        top_ctx: usize,
-        current_ctx: usize,
-        bound: &[usize],
-    ) -> Option<Id> {
-        if bound.is_empty() {
-            return (binding.arity() == 0 && binding.top_ctx() == top_ctx)
-                .then(|| binding.body.in_context(current_ctx))?;
-        }
-        let coordinates =
-            Self::miller_application_coordinates(binding, top_ctx, current_ctx, bound)?;
-        coordinates
-            .windows(2)
-            .all(|pair| pair[0] < pair[1])
-            .then(|| {
-                binding
-                    .body
-                    .weaken(&Lift::selected(current_ctx, &coordinates))
-            })
-    }
-    /// RHS application may construct a term. Ordered applications are still
-    /// a single lift; only actual permutations traverse the e-class.
-    fn miller_apply(
+    /// Instantiate a binding stored in `top context + canonical formals`.
+    /// Its fat-ID lift records which formal arguments it actually uses.
+    fn instantiate_binding(
         &mut self,
-        binding: &MLam,
+        binding: &Id,
         top_ctx: usize,
         current_ctx: usize,
-        bound: &[usize],
+        arguments: &[Id],
     ) -> Option<Id> {
-        if bound.is_empty() {
-            return (binding.arity() == 0 && binding.top_ctx() == top_ctx)
-                .then(|| binding.body.in_context(current_ctx))?;
+        if binding.ctx() != top_ctx + arguments.len()
+            || arguments
+                .iter()
+                .any(|argument| argument.ctx() != current_ctx)
+        {
+            return None;
         }
-        let coordinates =
-            Self::miller_application_coordinates(binding, top_ctx, current_ctx, bound)?;
-        Some(self.remap_variables(&binding.body, current_ctx, &coordinates))
+        let mut replacements: SmallVec<[Id; 8]> = (0..top_ctx)
+            .map(|level| self.var(current_ctx, level))
+            .collect();
+        replacements.extend(arguments.iter().copied());
+        Some(self.substitute_many(binding, current_ctx, &replacements))
     }
     fn ematch_rec(
         &self,
@@ -1295,41 +1379,47 @@ impl EGraph {
         top_ctx: usize,
     ) -> Vec<Subst> {
         match pattern {
-            Pattern::Var(name, bound) => match subst.get(name).cloned() {
-                Some(previous)
-                    if Self::miller_apply_ordered(&previous, top_ctx, target.ctx(), bound)
-                        .is_some_and(|applied| self.equivalent(&applied, target)) =>
-                {
-                    vec![subst]
+            Pattern::MetaVar(name, arguments) => {
+                let Some(indices) = Pattern::miller_indices(arguments) else {
+                    return vec![];
+                };
+                let Some(occurrence) = occurrence_lift(top_ctx, target.ctx(), &indices) else {
+                    return vec![];
+                };
+                match subst.get(name).cloned() {
+                    Some(previous) if self.equivalent(&previous.weaken(&occurrence), target) => {
+                        vec![subst]
+                    }
+                    Some(_) => vec![],
+                    None => {
+                        let target = self.find(target);
+                        let Some(binding_lift) = occurrence.factor(&target.lift()) else {
+                            return vec![];
+                        };
+                        let mut next = subst;
+                        next.insert(*name, Id::new(binding_lift, target.raw()));
+                        vec![next]
+                    }
                 }
-                Some(_) => vec![],
-                None => {
-                    let Some(binding) = self.miller_abstract(target, top_ctx, bound) else {
-                        return vec![];
-                    };
-                    let mut next = subst;
-                    next.insert(*name, binding);
-                    vec![next]
-                }
-            },
-            Pattern::Coord(index) => self
+            }
+            Pattern::FVar(index) => self
                 .nodes_in_class(target, mode)
                 .into_iter()
                 .filter(|(node, by)| {
                     matches!(node, Node::Var)
-                        && *index < top_ctx
-                        && *by == Lift::select(target.ctx(), *index)
+                        && index.get() < top_ctx
+                        && *by == Lift::select(target.ctx(), index.get())
                 })
                 .map(|_| subst.clone())
                 .collect(),
-            Pattern::Bound(index) => self
+            Pattern::BVar(index) => self
                 .nodes_in_class(target, mode)
                 .into_iter()
                 .filter(|(node, by)| {
                     let depth = target.ctx() - top_ctx;
                     matches!(node, Node::Var)
-                        && *index < depth
-                        && *by == Lift::select(target.ctx(), target.ctx() - 1 - *index)
+                        && index.get() < depth
+                        && *by == Lift::select(target.ctx(), target.ctx() - 1 - index.get())
                 })
                 .map(|_| subst.clone())
                 .collect(),
@@ -1391,32 +1481,32 @@ impl EGraph {
         }
     }
     pub fn ematch(&self, pattern: &Pattern, target: &Id) -> Vec<Subst> {
-        self.ematch_rec(
-            pattern,
-            target,
-            Subst::default(),
-            MatchMode::Canonical,
-            target.ctx(),
-        )
+        if pattern.match_metavariables().is_err() {
+            return vec![];
+        }
+        self.ematch_with(pattern, target, MatchMode::Canonical)
+    }
+    fn ematch_with(&self, pattern: &Pattern, target: &Id, mode: MatchMode) -> Vec<Subst> {
+        self.ematch_rec(pattern, target, Subst::default(), mode, target.ctx())
     }
     pub fn ematch_lifted(&self, pattern: &Pattern, target: &Id) -> Vec<Subst> {
-        self.ematch_rec(
-            pattern,
-            target,
-            Subst::default(),
-            MatchMode::Lifted,
-            target.ctx(),
-        )
+        if pattern.match_metavariables().is_err() {
+            return vec![];
+        }
+        self.ematch_with(pattern, target, MatchMode::Lifted)
     }
     /// Match a pattern against every canonical e-class placement.
     pub fn search(&mut self, pattern: &Pattern) -> Vec<(usize, Subst)> {
         self.rebuild();
+        if pattern.match_metavariables().is_err() {
+            return vec![];
+        }
         let targets = self.canonical_targets();
         let mut matches = vec![];
         for target in targets {
             let context = target.ctx();
             matches.extend(
-                self.ematch(pattern, &target)
+                self.ematch_with(pattern, &target, MatchMode::Canonical)
                     .into_iter()
                     .map(|subst| (context, subst)),
             );
@@ -1434,14 +1524,23 @@ impl EGraph {
         subst: &Subst,
     ) -> Option<Id> {
         match pattern {
-            Pattern::Var(name, bound) => {
-                let binding = subst.get(name)?.clone();
-                self.miller_apply(&binding, top_ctx, ctx, bound)
+            Pattern::MetaVar(name, arguments) => {
+                let binding = *subst.get(name)?;
+                if let Some(indices) = Pattern::miller_indices(arguments)
+                    && let Some(occurrence) = occurrence_lift(top_ctx, ctx, &indices)
+                {
+                    return Some(binding.weaken(&occurrence));
+                }
+                let arguments: Option<Vec<_>> = arguments
+                    .iter()
+                    .map(|argument| self.try_instantiate_rec(argument, ctx, top_ctx, subst))
+                    .collect();
+                self.instantiate_binding(&binding, top_ctx, ctx, &arguments?)
             }
-            Pattern::Coord(index) => (*index < top_ctx).then(|| self.var(ctx, *index)),
-            Pattern::Bound(index) => {
+            Pattern::FVar(index) => (index.get() < top_ctx).then(|| self.var(ctx, index.get())),
+            Pattern::BVar(index) => {
                 let depth = ctx.checked_sub(top_ctx)?;
-                (*index < depth).then(|| self.var(ctx, ctx - 1 - *index))
+                (index.get() < depth).then(|| self.var(ctx, ctx - 1 - index.get()))
             }
             Pattern::Atom(name) => Some(self.atom(name.as_str(), ctx)),
             Pattern::App(op, children) => {
@@ -1462,32 +1561,6 @@ impl EGraph {
             }
         }
     }
-    /// Search every stored node in its own context, then apply a rewrite.
-    pub fn rewrite_once(&mut self, lhs: &Pattern, rhs: &Pattern) -> usize {
-        self.rebuild();
-        let mut matches = vec![];
-        let raws: Vec<_> = self.memo.values().copied().collect();
-        for raw in raws {
-            let target = Id::new(Lift::identity(self.scope[raw as usize]), raw);
-            for subst in self.ematch(lhs, &target) {
-                matches.push((target, subst));
-            }
-        }
-        self.rev_tracked = rhs.may_permute(0);
-        let mut applied = 0;
-        for (target, subst) in matches {
-            let Some(replacement) = self.try_instantiate(rhs, target.ctx(), &subst) else {
-                continue;
-            };
-            if self.union(&target, &replacement) {
-                applied += 1;
-            }
-        }
-        if applied > 0 || !self.rev_valid {
-            self.rebuild();
-        }
-        applied
-    }
     fn canonical_targets(&self) -> Vec<Id> {
         let mut targets = HashSet::default();
         for &raw in self.memo.values() {
@@ -1497,80 +1570,58 @@ impl EGraph {
         targets.sort_by_key(|id| (id.raw(), id.lift().cod(), id.lift().selected_bits()));
         targets
     }
-    pub fn saturate(&mut self, rules: &[(Pattern, Pattern)]) -> usize {
-        self.saturate_limit(rules, usize::MAX)
+    pub fn saturate(&mut self, rules: &[Rewrite]) -> RunStats {
+        self.run(rules, usize::MAX)
     }
-    pub fn saturate_limit(&mut self, rules: &[(Pattern, Pattern)], limit: usize) -> usize {
+    pub fn run(&mut self, rules: &[Rewrite], limit: usize) -> RunStats {
+        let mut stats = RunStats::default();
+        let rebuild_before = self.rebuild_time_total;
         self.rebuild();
-        let mut rounds = 0;
-        while rounds < limit {
+        stats.rebuild_time += self.rebuild_time_total - rebuild_before;
+        while stats.rounds < limit {
+            let before_nodes = self.memo.len();
+
+            let start = Instant::now();
             let targets = self.canonical_targets();
             let mut matches = vec![];
-            for (rule, (lhs, _)) in rules.iter().enumerate() {
+            for (rule_index, rule) in rules.iter().enumerate() {
                 for target in &targets {
-                    for subst in self.ematch(lhs, target) {
-                        matches.push((rule, *target, subst));
+                    for subst in self.ematch_with(&rule.lhs, target, MatchMode::Canonical) {
+                        matches.push((rule_index, *target, subst));
                     }
                 }
             }
-            self.rev_tracked = rules.iter().any(|(_, rhs)| rhs.may_permute(0));
-            let mut changed = false;
-            for (rule, target, subst) in matches {
-                if let Some(replacement) =
-                    self.try_instantiate(&rules[rule].1, target.ctx(), &subst)
-                {
-                    changed |= self.union(&target, &replacement);
-                }
-            }
-            changed |= self.rebuild();
-            if !changed {
-                return rounds;
-            }
-            rounds += 1;
-        }
-        rounds
-    }
-    pub fn saturate_beta(&mut self) -> usize {
-        self.saturate_beta_limit(usize::MAX)
-    }
-    pub fn saturate_beta_limit(&mut self, limit: usize) -> usize {
-        self.rebuild();
-        let lhs = Pattern::app(
-            "app",
-            vec![
-                Pattern::Lam(Box::new(Pattern::Var("?body".into(), vec![0]))),
-                Pattern::Var("?arg".into(), vec![]),
-            ],
-        );
-        let rhs = Pattern::Subst(
-            Box::new(Pattern::Var("?body".into(), vec![0])),
-            Box::new(Pattern::Var("?arg".into(), vec![])),
-        );
-        let mut rounds = 0;
-        while rounds < limit {
-            let before_nodes = self.memo.len();
-            let targets = self.canonical_targets();
+            stats.match_time += start.elapsed();
 
-            let mut matches = vec![];
-            for target in targets {
-                for subst in self.ematch(&lhs, &target) {
-                    matches.push((target, subst));
-                }
-            }
+            let start = Instant::now();
+            let rebuild_before = self.rebuild_time_total;
+            self.rev_tracked = rules.iter().any(|rule| rule.rhs_needs_traversal);
             let mut changed = false;
-            for (redex, subst) in matches {
-                if let Some(reduced) = self.try_instantiate(&rhs, redex.ctx(), &subst) {
-                    changed |= self.union(&redex, &reduced);
+            for (rule_index, target, subst) in matches {
+                if let Some(replacement) =
+                    self.try_instantiate(&rules[rule_index].rhs, target.ctx(), &subst)
+                {
+                    let unioned = self.union(&target, &replacement);
+                    stats.unions += usize::from(unioned);
+                    changed |= unioned;
                 }
             }
-            changed |= self.rebuild();
+            let elapsed = start.elapsed();
+            let nested_rebuild = self.rebuild_time_total - rebuild_before;
+            stats.rebuild_time += nested_rebuild;
+            stats.apply_time += elapsed.saturating_sub(nested_rebuild);
+
+            let rebuild_before = self.rebuild_time_total;
+            let rebuilt = self.rebuild();
+            stats.rebuild_time += self.rebuild_time_total - rebuild_before;
+            changed |= rebuilt;
             changed |= before_nodes != self.memo.len();
             if !changed {
-                return rounds;
+                return stats;
             }
-            rounds += 1;
+            stats.rounds += 1;
         }
-        rounds
+        stats
     }
     pub fn class_count(&self) -> usize {
         (0..self.parent.len() as RawId)
@@ -1619,10 +1670,9 @@ impl EGraph {
         )];
         for (raw, ctx, nodes) in classes {
             let id = Id::new(Lift::identity(ctx), raw);
-            let representative = self.extract(&id).map_or_else(
-                || "<recursive>".into(),
-                |term| term.display_in(ctx).to_string(),
-            );
+            let representative = self
+                .extract(&id)
+                .map_or_else(|| "<recursive>".into(), |term| term.display().to_string());
             lines.push(format!("e{raw} = ctx{ctx} |-> {representative}"));
             for (node, lift) in nodes {
                 lines.push(format!(
@@ -1635,6 +1685,12 @@ impl EGraph {
         lines.join("\n")
     }
     pub fn rebuild(&mut self) -> bool {
+        let start = Instant::now();
+        let changed = self.rebuild_inner();
+        self.rebuild_time_total += start.elapsed();
+        changed
+    }
+    fn rebuild_inner(&mut self) -> bool {
         if self.rev_valid {
             return false;
         }

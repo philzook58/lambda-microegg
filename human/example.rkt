@@ -86,13 +86,13 @@
 (reset)
 (insert 0 (lam y (lam x x)))
 (match (lam x (lam y (?a x y))))
-(match (lam x (lam y (?a y x))))
+(match (lam x (lam y (?a x y))))
 
 
 (reset)
 (insert 0 (lam y (lam x y)))
 (match (lam x (lam y (?a x y))))
-(match (lam x (lam y (?a y x))))
+(match (lam x (lam y (?a x y))))
 (print-egraph)
 
 
@@ -107,3 +107,13 @@
   (sum (lam x (sum (lam y (?m y x))))))
 
   
+(reset)
+
+(insert 0 (lam x x))
+(rewrite  (lam x (?a x)) (?a (foo biz)))
+(run 1)
+(print-egraph)
+
+
+(reset)
+;(insert 0 (lam z (lam x (lam y (y z))))

@@ -65,3 +65,30 @@ sum (lam x (sum (lam y ( ...
 (@sum i (@sum j (@sum k (* (a i j) (a j k)))
 
 (rewrite (sum i ?a) (* ?a (sum i 1))
+
+In substitute, why memoize by fatid. Shouldn't we memoize by rawid?
+
+
+multiterm
+ephemeral enodes
+python bindings?
+
+explore binary application?
+Hmm. but miller patterns are kind of not binary. Well there's implicit currying usually.
+
+Subst doesn't need to contain the symbol
+And I think we could cache the permutation the permutation needed in the rewrite somewhere and avoid mlam
+
+Why should be bother linking_root in rev? Is there an instance where we aren't rebuilding it anyway? 
+
+substitute should do simulateous substitution?
+
+Term and Pattern are kind of duplicated no?
+
+Subst being in an arena would probably help. Don't return vec![], insert into arena
+Predetermining the variable order would save space. and determine how much to bump allocate
+
+((lam x (?a)) f)
+
+
+Is it worth having both substtitute and substitute_many?
