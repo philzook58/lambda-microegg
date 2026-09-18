@@ -57,7 +57,7 @@ fn main() {
          Debugging:\n  (print-egraph)\n\n\
          Named binders:\n  (lam x BODY), x is the nearest binder named x, x@1 is the next outer x\n  $0, $1, ... name variables in the explicit outer context\n\n\
          Miller patterns:\n  ?a excludes pattern-local binders; LHS arguments are written outer-to-inner: (?a x y)\n  On a rewrite RHS, arguments may be permuted or replaced by terms: (?a y x), (?a (foo x))\n\n\
-         Built-ins:\n  (#subst BODY x REPLACEMENT) substitutes REPLACEMENT for x in BODY\n  A local coordinate may also be named directly: (#subst $0 $0 fred)"
+         Built-ins:\n  (#subst BODY x REPLACEMENT) substitutes REPLACEMENT for x in BODY\n  A free variable may also be named directly: (#subst $0 $0 fred)"
     );
 }
 

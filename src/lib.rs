@@ -85,11 +85,18 @@ fn local_indices_to_levels(
 
 /// Bring down `top context + Miller arguments` into the current context. Match
 /// arguments are required to be written in this outer-to-inner order.
+#[inline(always)]
 fn occurrence_lift(
     top_ctx: usize,
     current_ctx: usize,
     arguments: &[DeBruijnIndex],
 ) -> Option<Lift> {
+    // First-order metavariables are overwhelmingly common. They keep the
+    // whole top context and none of the binders introduced inside the rule.
+    if arguments.is_empty() {
+        current_ctx.checked_sub(top_ctx)?;
+        return Some(Lift::from_bits(Lift::mask(top_ctx), current_ctx));
+    }
     let levels = local_indices_to_levels(top_ctx, current_ctx, arguments)?;
     if !levels.windows(2).all(|pair| pair[0] < pair[1]) {
         return None;
@@ -98,6 +105,20 @@ fn occurrence_lift(
         .chain(levels.iter().map(|level| level.get()))
         .collect();
     Some(Lift::selected(current_ctx, &selected))
+}
+
+#[inline(always)]
+fn pattern_occurrence_lift(
+    top_ctx: usize,
+    current_ctx: usize,
+    arguments: &[Pattern],
+) -> Option<Lift> {
+    if arguments.is_empty() {
+        occurrence_lift(top_ctx, current_ctx, &[])
+    } else {
+        let indices = Pattern::miller_indices(arguments)?;
+        occurrence_lift(top_ctx, current_ctx, &indices)
+    }
 }
 
 /// An order-preserving injection into an
@@ -204,16 +225,16 @@ impl Lift {
             return None;
         }
         let mut bits = 0;
-        let mut coordinate = 0;
+        let mut position = 0;
         for level in 0..self.cod() {
             if target.get(level) && !self.get(level) {
                 return None;
             }
             if self.get(level) {
                 if target.get(level) {
-                    bits |= 1u8 << coordinate;
+                    bits |= 1u8 << position;
                 }
-                coordinate += 1;
+                position += 1;
             }
         }
         Some(Self::from_bits(bits, self.dom()))
@@ -303,7 +324,7 @@ impl Lift {
         }
     }
     /// Largest subcontext of their shared domain on which the two lifts agree
-    /// coordinate by coordinate.
+    /// context variable by context variable.
     fn equalizer(&self, other: &Self) -> Self {
         assert_eq!(self.cod(), other.cod());
         assert_eq!(self.dom(), other.dom());
@@ -328,6 +349,14 @@ impl Lift {
 /// Upper 8 bits encode the lift; lower 24 bits hold Max's raw ID.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Id(u32);
+
+// These packed values are intentionally smaller than a machine register.
+// Widening Lift (and therefore Id) should make us reconsider the inline
+// capacities and layouts below rather than silently changing every hot type.
+const _: () = {
+    assert!(std::mem::size_of::<Lift>() == 1);
+    assert!(std::mem::size_of::<Id>() == 4);
+};
 
 impl Id {
     const RAW_MASK: u32 = (1 << 24) - 1;
@@ -360,7 +389,7 @@ impl Id {
             self.raw(),
         ))
     }
-    fn remove_coord(&self, index: usize) -> Option<Self> {
+    fn remove_context_variable(&self, index: usize) -> Option<Self> {
         Some(Self::new(self.lift().remove(index)?, self.raw()))
     }
     pub fn show(&self) -> String {
@@ -376,9 +405,14 @@ impl Id {
 enum Node {
     Var,
     Atom(Symbol),
-    App(Symbol, Vec<Id>),
+    App(Symbol, SmallVec<[Id; 2]>),
     Lam(Id),
 }
+
+// On 64-bit hosts, Node occupies one 32-byte chunk. This keeps two nodes in a
+// typical 64-byte cache line and is why binary children are stored inline.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Node>() == 32);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Pattern {
@@ -826,7 +860,14 @@ impl std::fmt::Display for NamedTerm<'_> {
 /// Match results contain only fat IDs. A binding for an n-ary metavariable
 /// lives in `top_ctx + n`; its lift records unused top variables and formals.
 #[derive(Clone, Default)]
-pub struct Subst(SmallVec<[(Symbol, Id); 4]>);
+pub struct Subst(SmallVec<[(Symbol, Id); 3]>);
+
+// Three common bindings fit in one 32-byte value on 64-bit hosts. Treat a
+// change here as a prompt to remeasure matcher allocation and cache behavior.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Subst>() == 32);
+
+type MatchResults = SmallVec<[Subst; 1]>;
 
 impl Subst {
     fn get(&self, name: &Symbol) -> Option<&Id> {
@@ -853,20 +894,20 @@ impl std::ops::Index<&str> for Subst {
 
 /// Find all W such that W.compose(edge) = target. A redundant edge may
 /// admit several W, corresponding to different variables in the target.
-fn factor_lifts(target: &Lift, edge: &Lift) -> Vec<Lift> {
+fn factor_lifts(target: &Lift, edge: &Lift) -> SmallVec<[Lift; 2]> {
     if target.dom() != edge.dom() || edge.cod() > target.cod() {
-        return vec![];
+        return SmallVec::new();
     }
     if edge.is_identity() {
-        return vec![*target];
+        return smallvec::smallvec![*target];
     }
     fn visit(
         target: &Lift,
         edge: &Lift,
         source: usize,
         next: usize,
-        chosen: &mut Vec<usize>,
-        out: &mut Vec<Lift>,
+        chosen: &mut SmallVec<[usize; 8]>,
+        out: &mut SmallVec<[Lift; 2]>,
     ) {
         if source == edge.cod() {
             let by = Lift::selected(target.cod(), chosen);
@@ -884,8 +925,8 @@ fn factor_lifts(target: &Lift, edge: &Lift) -> Vec<Lift> {
             }
         }
     }
-    let mut out = vec![];
-    visit(target, edge, 0, 0, &mut vec![], &mut out);
+    let mut out = SmallVec::new();
+    visit(target, edge, 0, 0, &mut SmallVec::new(), &mut out);
     out
 }
 
@@ -902,9 +943,12 @@ enum MatchMode {
 #[derive(Default)]
 pub struct EGraph {
     parent: Vec<Id>,
-    scope: Vec<usize>,
     memo: IndexMap<Node, RawId, rustc_hash::FxBuildHasher>,
     rev: IndexMap<RawId, Vec<(Node, Lift)>, rustc_hash::FxBuildHasher>,
+    // Possible next performance experiments, deliberately not implemented:
+    // cache canonical targets and root-operator buckets while rebuilding, or
+    // give each Rewrite fixed metavariable slots to shrink retained matches.
+    // Incremental rebuild and semi-naive matching are larger design changes.
     /// Keep `rev` usable between construction and the batch's final rebuild
     /// when a constructive Miller permutation needs class-local traversal.
     rev_tracked: bool,
@@ -925,7 +969,6 @@ impl EGraph {
         let raw = self.parent.len() as RawId;
         let id = Id::new(Lift::identity(scope), raw);
         self.parent.push(id);
-        self.scope.push(scope);
         id
     }
     pub fn find(&self, id: &Id) -> Id {
@@ -944,6 +987,9 @@ impl EGraph {
             return *id;
         }
         let root = self.find_mut(&edge);
+        // Path compression stores an edge in the raw class's intrinsic
+        // context. `id` itself may be placed in a larger ambient context.
+        debug_assert_eq!(root.ctx(), edge.ctx());
         self.parent[id.raw() as usize] = root;
         Id::new(id.lift().compose(&root.lift()), root.raw())
     }
@@ -966,18 +1012,24 @@ impl EGraph {
         base.weaken(&Lift::select(ctx, index))
     }
     pub fn atom(&mut self, name: &str, ctx: usize) -> Id {
-        let base = self.intern(0, Node::Atom(name.into()));
+        self.atom_symbol(name.into(), ctx)
+    }
+    fn atom_symbol(&mut self, name: Symbol, ctx: usize) -> Id {
+        let base = self.intern(0, Node::Atom(name));
         base.weaken(&Lift::unused(ctx))
     }
     pub fn app(&mut self, op: &str, children: Vec<Id>) -> Id {
+        self.app_symbol(op.into(), children.into())
+    }
+    fn app_symbol(&mut self, op: Symbol, children: SmallVec<[Id; 2]>) -> Id {
         assert!(!children.is_empty());
         let ctx = children[0].ctx();
         assert!(children.iter().all(|c| c.ctx() == ctx));
-        let (common, node) = self.canonical_node(&Node::App(op.into(), children));
+        let (common, node) = self.canonical_node(&Node::App(op, children));
         let base = self.intern(common.dom(), node);
         base.weaken(&common)
     }
-    /// The bound variable is the final coordinate of the body's context.
+    /// The bound variable is the final variable in the body's context.
     pub fn lam(&mut self, body: Id) -> Id {
         assert!(body.ctx() > 0);
         let (outer, node) = self.canonical_node(&Node::Lam(body));
@@ -990,7 +1042,8 @@ impl EGraph {
             Node::Var => (Lift::identity(1), Node::Var),
             Node::Atom(s) => (Lift::identity(0), Node::Atom(*s)),
             Node::App(op, children) => {
-                let children: Vec<_> = children.iter().map(|c| self.find_mut(c)).collect();
+                let children: SmallVec<[_; 2]> =
+                    children.iter().map(|c| self.find_mut(c)).collect();
                 if children.iter().all(|c| c.lift().is_identity()) {
                     return (Lift::identity(children[0].ctx()), Node::App(*op, children));
                 }
@@ -1024,6 +1077,7 @@ impl EGraph {
     fn link_root(&mut self, child: RawId, parent: Id) {
         debug_assert_eq!(self.parent[child as usize].raw(), child);
         debug_assert_ne!(child, parent.raw());
+        debug_assert_eq!(self.parent[child as usize].ctx(), parent.ctx());
         self.parent[child as usize] = parent;
         if self.rev_tracked
             && let Some(nodes) = self.rev.swap_remove(&child)
@@ -1045,7 +1099,7 @@ impl EGraph {
         self.rev_valid = false;
         if a.raw() == b.raw() {
             // Equating two placements of one class restricts that class to
-            // the coordinates on which the placements agree. For example,
+            // the context variables on which the placements agree. For example,
             // f(x) = f(y) turns the result of f into a context-independent
             // value rather than treating x and y themselves as equal.
             let dependency = a.lift().equalizer(&b.lift());
@@ -1072,9 +1126,9 @@ impl EGraph {
     pub fn equivalent(&self, a: &Id, b: &Id) -> bool {
         self.find(a) == self.find(b)
     }
-    fn nodes_in_class(&self, target: &Id, mode: MatchMode) -> Vec<(&Node, Lift)> {
+    fn nodes_in_class(&self, target: &Id, mode: MatchMode) -> SmallVec<[(&Node, Lift); 4]> {
         let target = self.find(target);
-        let mut out = vec![];
+        let mut out = SmallVec::new();
         if self.rev_valid || self.rev_tracked {
             for (node, edge) in self.rev.get(&target.raw()).into_iter().flatten() {
                 let factors = factor_lifts(&target.lift(), edge);
@@ -1092,7 +1146,7 @@ impl EGraph {
             // uncommon API path pays for a full scan rather than making every
             // ordinary union maintain the live reverse index.
             for (node, &raw) in &self.memo {
-                let origin = Id::new(Lift::identity(self.scope[raw as usize]), raw);
+                let origin = Id::new(Lift::identity(self.parent[raw as usize].ctx()), raw);
                 let edge = self.find(&origin);
                 if edge.raw() != target.raw() {
                     continue;
@@ -1110,9 +1164,9 @@ impl EGraph {
         }
         out
     }
-    /// Substitute one ambient coordinate. `target` lives in an n-variable
+    /// Substitute one ambient context variable. `target` lives in an n-variable
     /// context, while `replacement` and the result live in an (n-1)-variable
-    /// context. Coordinates after `variable` shift down by one.
+    /// context. Variables after `variable` shift down by one.
     pub fn substitute(&mut self, target: &Id, variable: usize, replacement: &Id) -> Id {
         assert_eq!(target.ctx(), replacement.ctx() + 1);
         assert!(variable < target.ctx());
@@ -1120,10 +1174,10 @@ impl EGraph {
         let target = self.find_mut(target);
         let replacement = self.find_mut(replacement);
 
-        // The lift is an exact dependency mask. If this coordinate is
-        // absent, substitution is just deletion of an unused input and no
+        // The lift is an exact dependency mask. If this context variable is
+        // absent, substitution just deletes an unused context variable and no
         // e-class traversal is necessary.
-        if let Some(projected) = target.remove_coord(variable) {
+        if let Some(projected) = target.remove_context_variable(variable) {
             return projected;
         }
         let output_ctx = replacement.ctx();
@@ -1141,7 +1195,7 @@ impl EGraph {
         self.rebuild();
         self.find_mut(&result)
     }
-    /// Simultaneously replace every input coordinate of `target` with an
+    /// Simultaneously replace every context variable of `target` with an
     /// arbitrary term in `output_ctx`. Results are memoized to tie cycles.
     fn substitute_many(&mut self, target: &Id, output_ctx: usize, replacements: &[Id]) -> Id {
         assert_eq!(target.ctx(), replacements.len());
@@ -1212,7 +1266,7 @@ impl EGraph {
                     let old_index = (0..by.cod()).find(|&index| by.get(index)).unwrap();
                     replacements[old_index]
                 }
-                Node::Atom(name) => self.atom(name.as_str(), output_ctx),
+                Node::Atom(name) => self.atom_symbol(name, output_ctx),
                 Node::App(op, children) => {
                     let children = children
                         .into_iter()
@@ -1221,7 +1275,7 @@ impl EGraph {
                             self.substitute_many_rec(&child, output_ctx, &replacements, memo)
                         })
                         .collect();
-                    self.app(op.as_str(), children)
+                    self.app_symbol(op, children)
                 }
                 Node::Lam(body) => {
                     let body = body.weaken(&by.append(true));
@@ -1341,7 +1395,7 @@ impl EGraph {
     fn reindex(&mut self) {
         self.rev.clear();
         for (node, &raw) in &self.memo {
-            let origin = Id::new(Lift::identity(self.scope[raw as usize]), raw);
+            let origin = Id::new(Lift::identity(self.parent[raw as usize].ctx()), raw);
             let edge = self.find(&origin);
             self.rev
                 .entry(edge.raw())
@@ -1381,107 +1435,91 @@ impl EGraph {
         subst: Subst,
         mode: MatchMode,
         top_ctx: usize,
-    ) -> Vec<Subst> {
+        out: &mut MatchResults,
+    ) {
         match pattern {
             Pattern::MetaVar(name, arguments) => {
-                let Some(indices) = Pattern::miller_indices(arguments) else {
-                    return vec![];
-                };
-                let Some(occurrence) = occurrence_lift(top_ctx, target.ctx(), &indices) else {
-                    return vec![];
+                let Some(occurrence) = pattern_occurrence_lift(top_ctx, target.ctx(), arguments)
+                else {
+                    return;
                 };
                 match subst.get(name).cloned() {
                     Some(previous) if self.equivalent(&previous.weaken(&occurrence), target) => {
-                        vec![subst]
+                        out.push(subst);
                     }
-                    Some(_) => vec![],
+                    Some(_) => {}
                     None => {
                         let target = self.find(target);
                         let Some(binding_lift) = occurrence.factor(&target.lift()) else {
-                            return vec![];
+                            return;
                         };
                         let mut next = subst;
                         next.insert(*name, Id::new(binding_lift, target.raw()));
-                        vec![next]
+                        out.push(next);
                     }
                 }
             }
-            Pattern::FVar(index) => self
-                .nodes_in_class(target, mode)
-                .into_iter()
-                .filter(|(node, by)| {
-                    matches!(node, Node::Var)
+            Pattern::FVar(index) => {
+                for (node, by) in self.nodes_in_class(target, mode) {
+                    if matches!(node, Node::Var)
                         && index.get() < top_ctx
-                        && *by == Lift::select(target.ctx(), index.get())
-                })
-                .map(|_| subst.clone())
-                .collect(),
-            Pattern::BVar(index) => self
-                .nodes_in_class(target, mode)
-                .into_iter()
-                .filter(|(node, by)| {
+                        && by == Lift::select(target.ctx(), index.get())
+                    {
+                        out.push(subst.clone());
+                    }
+                }
+            }
+            Pattern::BVar(index) => {
+                for (node, by) in self.nodes_in_class(target, mode) {
                     let depth = target.ctx() - top_ctx;
-                    matches!(node, Node::Var)
+                    if matches!(node, Node::Var)
                         && index.get() < depth
-                        && *by == Lift::select(target.ctx(), target.ctx() - 1 - index.get())
-                })
-                .map(|_| subst.clone())
-                .collect(),
-            Pattern::Atom(name) => self
-                .nodes_in_class(target, mode)
-                .into_iter()
-                .filter(|(node, _)| matches!(node, Node::Atom(s) if s == name))
-                .map(|_| subst.clone())
-                .collect(),
+                        && by == Lift::select(target.ctx(), target.ctx() - 1 - index.get())
+                    {
+                        out.push(subst.clone());
+                    }
+                }
+            }
+            Pattern::Atom(name) => {
+                for (node, _) in self.nodes_in_class(target, mode) {
+                    if matches!(node, Node::Atom(symbol) if symbol == name) {
+                        out.push(subst.clone());
+                    }
+                }
+            }
             Pattern::App(op, args) => {
-                let mut out = vec![];
-                let nodes: Vec<_> = self
-                    .nodes_in_class(target, mode)
-                    .into_iter()
-                    .map(|(node, by)| (node.clone(), by))
-                    .collect();
-                for (node, by) in nodes {
+                for (node, by) in self.nodes_in_class(target, mode) {
                     let Node::App(head, children) = node else {
                         continue;
                     };
-                    if &head != op || children.len() != args.len() {
+                    if head != op || children.len() != args.len() {
                         continue;
                     }
-                    let mut partial = vec![subst.clone()];
+                    let mut partial: MatchResults = smallvec::smallvec![subst.clone()];
                     for (arg, child) in args.iter().zip(children) {
                         let lifted = child.weaken(&by);
-                        partial = partial
-                            .into_iter()
-                            .flat_map(|s| self.ematch_rec(arg, &lifted, s, mode, top_ctx))
-                            .collect();
+                        let mut next = MatchResults::new();
+                        for partial_subst in partial {
+                            self.ematch_rec(arg, &lifted, partial_subst, mode, top_ctx, &mut next);
+                        }
+                        partial = next;
+                        if partial.is_empty() {
+                            break;
+                        }
                     }
                     out.extend(partial);
                 }
-                out
             }
             Pattern::Lam(body_pattern) => {
-                let mut out = vec![];
-                let nodes: Vec<_> = self
-                    .nodes_in_class(target, mode)
-                    .into_iter()
-                    .map(|(node, by)| (node.clone(), by))
-                    .collect();
-                for (node, by) in nodes {
+                for (node, by) in self.nodes_in_class(target, mode) {
                     let Node::Lam(body) = node else { continue };
                     let lifted = body.weaken(&by.append(true));
-                    out.extend(self.ematch_rec(
-                        body_pattern,
-                        &lifted,
-                        subst.clone(),
-                        mode,
-                        top_ctx,
-                    ));
+                    self.ematch_rec(body_pattern, &lifted, subst.clone(), mode, top_ctx, out);
                 }
-                out
             }
             // `#subst` computes a term during RHS instantiation; it is not an
             // e-node and therefore cannot match anything on a left-hand side.
-            Pattern::Subst(_, _) => vec![],
+            Pattern::Subst(_, _) => {}
         }
     }
     pub fn ematch(&self, pattern: &Pattern, target: &Id) -> Vec<Subst> {
@@ -1489,15 +1527,26 @@ impl EGraph {
             return vec![];
         }
         self.ematch_with(pattern, target, MatchMode::Canonical)
+            .into_vec()
     }
-    fn ematch_with(&self, pattern: &Pattern, target: &Id, mode: MatchMode) -> Vec<Subst> {
-        self.ematch_rec(pattern, target, Subst::default(), mode, target.ctx())
+    fn ematch_with(&self, pattern: &Pattern, target: &Id, mode: MatchMode) -> MatchResults {
+        let mut matches = MatchResults::new();
+        self.ematch_rec(
+            pattern,
+            target,
+            Subst::default(),
+            mode,
+            target.ctx(),
+            &mut matches,
+        );
+        matches
     }
     pub fn ematch_lifted(&self, pattern: &Pattern, target: &Id) -> Vec<Subst> {
         if pattern.match_metavariables().is_err() {
             return vec![];
         }
         self.ematch_with(pattern, target, MatchMode::Lifted)
+            .into_vec()
     }
     /// Match a pattern against every canonical e-class placement.
     pub fn search(&mut self, pattern: &Pattern) -> Vec<(usize, Subst)> {
@@ -1530,12 +1579,10 @@ impl EGraph {
         match pattern {
             Pattern::MetaVar(name, arguments) => {
                 let binding = *subst.get(name)?;
-                if let Some(indices) = Pattern::miller_indices(arguments)
-                    && let Some(occurrence) = occurrence_lift(top_ctx, ctx, &indices)
-                {
+                if let Some(occurrence) = pattern_occurrence_lift(top_ctx, ctx, arguments) {
                     return Some(binding.weaken(&occurrence));
                 }
-                let arguments: Option<Vec<_>> = arguments
+                let arguments: Option<SmallVec<[Id; 2]>> = arguments
                     .iter()
                     .map(|argument| self.try_instantiate_rec(argument, ctx, top_ctx, subst))
                     .collect();
@@ -1546,13 +1593,13 @@ impl EGraph {
                 let depth = ctx.checked_sub(top_ctx)?;
                 (index.get() < depth).then(|| self.var(ctx, ctx - 1 - index.get()))
             }
-            Pattern::Atom(name) => Some(self.atom(name.as_str(), ctx)),
+            Pattern::Atom(name) => Some(self.atom_symbol(*name, ctx)),
             Pattern::App(op, children) => {
-                let children: Option<Vec<_>> = children
+                let children: Option<SmallVec<[Id; 2]>> = children
                     .iter()
                     .map(|p| self.try_instantiate_rec(p, ctx, top_ctx, subst))
                     .collect();
-                Some(self.app(op.as_str(), children?))
+                Some(self.app_symbol(*op, children?))
             }
             Pattern::Lam(body) => {
                 let body = self.try_instantiate_rec(body, ctx + 1, top_ctx, subst)?;
@@ -1568,7 +1615,10 @@ impl EGraph {
     fn canonical_targets(&self) -> Vec<Id> {
         let mut targets = HashSet::default();
         for &raw in self.memo.values() {
-            targets.insert(self.find(&Id::new(Lift::identity(self.scope[raw as usize]), raw)));
+            targets.insert(self.find(&Id::new(
+                Lift::identity(self.parent[raw as usize].ctx()),
+                raw,
+            )));
         }
         let mut targets: Vec<_> = targets.into_iter().collect();
         targets.sort_by_key(|id| (id.raw(), id.lift().cod(), id.lift().selected_bits()));
@@ -1582,32 +1632,36 @@ impl EGraph {
         let rebuild_before = self.rebuild_time_total;
         self.rebuild();
         stats.rebuild_time += self.rebuild_time_total - rebuild_before;
+        // Saturation usually grows the match set, so retain each rule's
+        // allocation across rounds while preserving search-then-apply.
+        let mut matches_by_rule: Vec<Vec<(Id, Subst)>> =
+            (0..rules.len()).map(|_| Vec::new()).collect();
         while stats.rounds < limit {
             let before_nodes = self.memo.len();
 
             let start = Instant::now();
             let targets = self.canonical_targets();
-            let mut matches = vec![];
-            for (rule_index, rule) in rules.iter().enumerate() {
+            for (rule, matches) in rules.iter().zip(&mut matches_by_rule) {
+                matches.clear();
                 for target in &targets {
                     for subst in self.ematch_with(&rule.lhs, target, MatchMode::Canonical) {
-                        matches.push((rule_index, *target, subst));
+                        matches.push((*target, subst));
                     }
                 }
             }
             stats.match_time += start.elapsed();
-
             let start = Instant::now();
             let rebuild_before = self.rebuild_time_total;
             self.rev_tracked = rules.iter().any(|rule| rule.rhs_needs_traversal);
             let mut changed = false;
-            for (rule_index, target, subst) in matches {
-                if let Some(replacement) =
-                    self.try_instantiate(&rules[rule_index].rhs, target.ctx(), &subst)
-                {
-                    let unioned = self.union(&target, &replacement);
-                    stats.unions += usize::from(unioned);
-                    changed |= unioned;
+            for (rule, matches) in rules.iter().zip(&mut matches_by_rule) {
+                for (target, subst) in matches.drain(..) {
+                    if let Some(replacement) = self.try_instantiate(&rule.rhs, target.ctx(), &subst)
+                    {
+                        let unioned = self.union(&target, &replacement);
+                        stats.unions += usize::from(unioned);
+                        changed |= unioned;
+                    }
                 }
             }
             let elapsed = start.elapsed();
@@ -1662,7 +1716,7 @@ impl EGraph {
             .map(|raw| {
                 (
                     raw,
-                    self.scope[raw as usize],
+                    self.parent[raw as usize].ctx(),
                     self.rev.get(&raw).cloned().unwrap_or_default(),
                 )
             })
@@ -1703,14 +1757,15 @@ impl EGraph {
             let nodes = std::mem::take(&mut self.memo);
             let mut changed = false;
             for (node, raw) in nodes {
-                let old = Id::new(Lift::identity(self.scope[raw as usize]), raw);
+                let raw_scope = self.parent[raw as usize].ctx();
+                let old = Id::new(Lift::identity(raw_scope), raw);
                 let (lift, canonical) = self.canonical_node(&node);
-                if lift != Lift::identity(self.scope[raw as usize]) || canonical != node {
+                if lift != Lift::identity(raw_scope) || canonical != node {
                     any_changed = true;
                 }
                 let base = if let Some(&existing) = self.memo.get(&canonical) {
                     self.find_mut(&Id::new(Lift::identity(lift.dom()), existing))
-                } else if lift == Lift::identity(self.scope[raw as usize]) {
+                } else if lift == Lift::identity(raw_scope) {
                     self.memo.insert(canonical, raw);
                     old
                 } else {

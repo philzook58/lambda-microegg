@@ -822,7 +822,7 @@ fn redundant_binding_matches_through_an_equivalent_constant() {
     assert!(matches.iter().all(|s| eg.equivalent(&s["?x"], &x)));
 }
 #[test]
-fn substitute_an_arbitrary_context_coordinate() {
+fn substitute_an_arbitrary_context_variable() {
     let mut eg = EGraph::new();
     let x = eg.var(3, 0);
     let y = eg.var(3, 1);
@@ -1063,7 +1063,7 @@ fn extract_accepts_a_custom_monotone_cost() {
 fn beta_avoids_capture_when_the_argument_is_free() {
     let mut eg = EGraph::new();
     // In y |- (λx. λy'. x) y, the argument y must remain the outer
-    // coordinate rather than becoming captured by y'.
+    // context variable rather than becoming captured by y'.
     let outer_x = eg.var(3, 1);
     let inner_lambda = eg.lam(outer_x);
     let function = eg.lam(inner_lambda);
@@ -1319,7 +1319,7 @@ fn rebuild_reports_a_count_neutral_canonical_change() {
     assert_eq!(eg.class_count(), classes_before);
 }
 #[test]
-fn concrete_coordinates_in_patterns_respect_binders() {
+fn concrete_context_variables_in_patterns_respect_binders() {
     let output = run_sexp_script(
         "(insert (lam x (f x))) (rewrite (lam x (f x)) (lam x x)) (run 4) (extract (lam x (f x)))",
     )

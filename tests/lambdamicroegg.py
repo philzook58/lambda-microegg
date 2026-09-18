@@ -62,7 +62,7 @@ class FatId:
         return FatId(self.raw, Lift(self.lift.positions, ctx))
 
     def remove_unused(self, level: int) -> "FatId | None":
-        """Delete an ambient coordinate, if this ID does not depend on it."""
+        """Delete an ambient context variable if this ID does not depend on it."""
         assert 0 <= level < self.ctx
         if level in self.lift.positions:
             return None
@@ -400,7 +400,7 @@ class EGraph:
         self.rebuild()
 
     def substitute(self, body: FatId, level: int, replacement: FatId) -> FatId:
-        """Capture-avoiding substitution of one ambient context coordinate."""
+        """Capture-avoiding substitution of one ambient context variable."""
         assert body.ctx == replacement.ctx + 1
         assert 0 <= level < body.ctx
         self.rebuild()
@@ -426,7 +426,7 @@ class EGraph:
         if key in memo:
             return memo[key]
         # Beneath a lambda, the same cycle can return with one more unused
-        # trailing coordinate.  Reuse the earlier placeholder in that larger
+        # trailing context variable. Reuse the earlier placeholder in that larger
         # context instead of missing the cycle because the fat IDs differ.
         for (old_body, old_level, old_replacement), old_result in memo.items():
             if (

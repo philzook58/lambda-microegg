@@ -109,5 +109,89 @@ fn bench_lambda_under(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_ac, bench_lambda_under);
+fn ternary_add_case(nodes: usize) -> (EGraph, [Rewrite; 2]) {
+    let mut eg = EGraph::new();
+    let atoms: Vec<_> = (0..(2 * nodes + 1))
+        .map(|i| eg.atom(&format!("x{i}"), 0))
+        .collect();
+    let mut term = eg.app("+3", atoms[..3].to_vec());
+    for pair in atoms[3..].as_chunks::<2>().0 {
+        term = eg.app("+3", vec![term, pair[0], pair[1]]);
+    }
+    black_box(term);
+
+    let var = Pattern::meta;
+    let add = |a, b, c| Pattern::app("+3", vec![a, b, c]);
+    let rules = [
+        rewrite(
+            add(var("?a"), var("?b"), var("?c")),
+            add(var("?b"), var("?c"), var("?a")),
+        ),
+        rewrite(
+            add(add(var("?a"), var("?b"), var("?c")), var("?d"), var("?e")),
+            add(var("?a"), var("?b"), add(var("?c"), var("?d"), var("?e"))),
+        ),
+    ];
+    (eg, rules)
+}
+
+fn sum_swap_case(binders: usize) -> (EGraph, Id, Id, [Rewrite; 1]) {
+    let mut eg = EGraph::new();
+    let variables: Vec<_> = (0..binders).map(|level| eg.var(binders, level)).collect();
+    let mut term = eg.app("a", variables.clone());
+    for _ in 0..binders {
+        term = eg.lam(term);
+        term = eg.app("sum", vec![term]);
+    }
+    let mut goal = eg.app("a", variables.into_iter().rev().collect());
+    for _ in 0..binders {
+        goal = eg.lam(goal);
+        goal = eg.app("sum", vec![goal]);
+    }
+
+    let sum = |body| Pattern::app("sum", vec![Pattern::Lam(Box::new(body))]);
+    let rule = rewrite(
+        sum(sum(Pattern::miller("?body", vec![1, 0]))),
+        sum(sum(Pattern::miller("?body", vec![0, 1]))),
+    );
+    (eg, term, goal, [rule])
+}
+
+fn bench_shape_and_binders(c: &mut Criterion) {
+    let mut group = c.benchmark_group("shape-and-binders");
+    group
+        .sample_size(10)
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(10))
+        .sampling_mode(SamplingMode::Flat);
+
+    group.bench_function("ternary-add-10-nodes-3-rounds", |b| {
+        b.iter_batched(
+            || ternary_add_case(10),
+            // This case exercises three-child nodes without letting the AC
+            // closure dwarf the representation choice being measured.
+            |(mut eg, rules)| black_box(eg.run(&rules, 3)),
+            BatchSize::PerIteration,
+        )
+    });
+    group.bench_function("sum-swap-6-binders", |b| {
+        b.iter_batched(
+            || sum_swap_case(6),
+            |(mut eg, term, goal, rules)| {
+                let stats = eg.saturate(&rules);
+                assert!(eg.equivalent(&term, &goal));
+                black_box(stats)
+            },
+            BatchSize::PerIteration,
+        )
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_ac,
+    bench_lambda_under,
+    bench_shape_and_binders
+);
 criterion_main!(benches);
