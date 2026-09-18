@@ -92,3 +92,6 @@ Predetermining the variable order would save space. and determine how much to bu
 
 
 Is it worth having both substtitute and substitute_many?
+
+
+Do the query string based sharing thing?

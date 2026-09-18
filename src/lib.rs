@@ -1,12 +1,15 @@
-//! Lambda MicroEgg keeps three coordinate notions separate:
 //! - a de Bruijn index counts outward from the nearest binder;
-//! - a de Bruijn level selects a variable in one chosen ambient context;
-//! - an intrinsic context contains only the variables an e-class depends on.
+//! - a de Bruijn level counts a varialble coming down from an ambient context;
 //!
-//! During pattern matching, `top_ctx` is the ambient context outside the
-//! pattern and `current_ctx` additionally includes its locally introduced
-//! binders. A lift embeds an intrinsic context into either ambient context;
-//! levels are therefore relative to that chosen context, not globally fixed.
+//!
+//! During pattern matching, `top_ctx` is the ambient context at the top of the
+
+//! pattern and `current_ctx` additionally includes locally introduced variables from binders at the end
+//! pattern variables need to be carried up to the context at the top of the pattern to be carried over to the right hand side
+
+//! The Miller patterns give a description of how you want this carrying to work and which variables you want to allow in the pattern variable
+
+//! A lift embeds an context into another by adding unused variables into the context
 
 use indexmap::IndexMap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -62,7 +65,7 @@ impl From<usize> for DeBruijnLevel {
 /// Convert distinct pattern-local indices to levels in the current context.
 fn local_indices_to_levels(
     top_ctx: usize,
-    current_ctx: usize,
+    current_ctx: usize, // == top context + # of bound variables
     arguments: &[DeBruijnIndex],
 ) -> Option<SmallVec<[DeBruijnLevel; 4]>> {
     let local_depth = current_ctx.checked_sub(top_ctx)?;
@@ -80,7 +83,7 @@ fn local_indices_to_levels(
         .collect()
 }
 
-/// Embed `top context + Miller arguments` into the current context. Match
+/// Bring down `top context + Miller arguments` into the current context. Match
 /// arguments are required to be written in this outer-to-inner order.
 fn occurrence_lift(
     top_ctx: usize,
@@ -97,7 +100,7 @@ fn occurrence_lift(
     Some(Lift::selected(current_ctx, &selected))
 }
 
-/// An order-preserving injection from an intrinsic dependency context into
+/// An order-preserving injection into an
 /// an ambient context. The leading 1 records the codomain length; lower bits
 /// select where each domain variable occurs in that codomain.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -110,6 +113,7 @@ struct Union {
     right: Lift,
 }
 
+// Yeaaa, I dunno that Pullback is that useful of a framing, but it is evocative of the right square
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Pullback {
     diagonal: Lift,
