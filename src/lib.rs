@@ -686,6 +686,24 @@ impl Term {
             Self::Lam(body) => 1 + body.size(),
         }
     }
+
+    pub fn binder_count(&self) -> usize {
+        match self {
+            Self::FVar(_) | Self::BVar(_) | Self::Atom(_) => 0,
+            Self::App(_, children) => children.iter().map(Self::binder_count).sum(),
+            Self::Lam(body) => 1 + body.binder_count(),
+        }
+    }
+
+    pub fn depth(&self) -> usize {
+        match self {
+            Self::FVar(_) | Self::BVar(_) | Self::Atom(_) => 1,
+            Self::App(_, children) => {
+                1 + children.iter().map(Self::depth).max().unwrap_or_default()
+            }
+            Self::Lam(body) => 1 + body.depth(),
+        }
+    }
 }
 
 impl std::fmt::Display for Term {
@@ -1293,12 +1311,20 @@ impl EGraph {
         self.find_mut(&result)
     }
     pub fn extract(&mut self, target: &Id) -> Option<TermCtx> {
-        self.extract_with(target, Term::size)
+        // Size remains the primary objective. Among equally sized terms,
+        // prefer fewer binders and then a shallower tree.
+        self.extract_with(target, |term| {
+            (term.size(), term.binder_count(), term.depth())
+        })
     }
-    /// Extract with a constructor-monotone cost function. The top-down cycle
-    /// breaker is sound for costs such as tree size, where wrapping a term
-    /// cannot make it cheaper.
-    pub fn extract_with(&mut self, target: &Id, cost: impl Fn(&Term) -> usize) -> Option<TermCtx> {
+    /// Extract with an ordered, constructor-monotone cost. The top-down cycle
+    /// breaker is sound for costs such as tree size or lexicographic tuples of
+    /// structural measures, where wrapping a term cannot make it cheaper.
+    pub fn extract_with<C: Ord>(
+        &mut self,
+        target: &Id,
+        cost: impl Fn(&Term) -> C,
+    ) -> Option<TermCtx> {
         self.rebuild();
         let target = self.find(target);
         let scope = target.ctx();
@@ -1311,13 +1337,13 @@ impl EGraph {
         )?;
         Some(TermCtx { scope, t })
     }
-    fn extract_rec(
+    fn extract_rec<C: Ord>(
         &self,
         target: &Id,
         root_scope: usize,
         memo: &mut HashMap<Id, Option<Term>>,
         active_raw: &mut HashSet<RawId>,
-        cost: &impl Fn(&Term) -> usize,
+        cost: &impl Fn(&Term) -> C,
     ) -> Option<Term> {
         let target = self.find(target);
         if let Some(result) = memo.get(&target) {
@@ -1334,7 +1360,7 @@ impl EGraph {
         // Mark this fat ID as being visited. Recursive enodes that return to
         // it are skipped, while other finite representatives remain usable.
         memo.insert(target, None);
-        let mut best: Option<(usize, Term)> = None;
+        let mut best: Option<(C, Term)> = None;
         for (node, by) in self.nodes_in_class(&target, MatchMode::Lifted) {
             let candidate = match node {
                 Node::Var => {
@@ -1382,7 +1408,7 @@ impl EGraph {
             let candidate_cost = cost(&candidate);
             if best
                 .as_ref()
-                .is_none_or(|(best_cost, _)| candidate_cost < *best_cost)
+                .is_none_or(|(best_cost, _)| &candidate_cost < best_cost)
             {
                 best = Some((candidate_cost, candidate));
             }

@@ -494,6 +494,23 @@ fn a_bare_metavariable_can_leave_a_generic_binder() {
     .unwrap();
     assert_eq!(output.last().unwrap(), "; guard passed");
 }
+
+#[test]
+fn default_extract_prefers_factored_sums_on_size_ties() {
+    let output = run_sexp_script(
+        r#"
+            (insert (@sum x (@sum y (* 2 y))))
+            (rewrite (@sum x (* ?a (?b x))) (* ?a (@sum x (?b x))))
+            (rewrite (@sum x ?a) (* ?a N))
+            (rewrite (* ?a ?b) (* ?b ?a))
+            (run 10)
+            (extract (@sum x (@sum y (* 2 y))))
+        "#,
+    )
+    .unwrap();
+    assert_eq!(output.last().unwrap(), "(* (sum (lam x0 x0)) (* 2 N))");
+}
+
 #[test]
 fn sexp_match_extracts_the_best_equivalent_binding() {
     let output = run_sexp_script(
@@ -1097,6 +1114,24 @@ fn extract_accepts_a_custom_monotone_cost() {
             .to_string(),
         "(wrap cheap)"
     );
+}
+
+#[test]
+fn default_extract_tie_breaks_by_binders_then_depth() {
+    let mut eg = EGraph::new();
+
+    let under_binder = eg.atom("a", 1);
+    let binder = eg.lam(under_binder);
+    let a = eg.atom("a", 0);
+    let no_binder = eg.app("f", vec![a]);
+    eg.union(&binder, &no_binder);
+    assert_eq!(eg.extract(&binder).unwrap().to_string(), "(f a)");
+
+    let b = eg.atom("b", 0);
+    let deep = eg.app("g", vec![no_binder]);
+    let shallow = eg.app("h", vec![a, b]);
+    eg.union(&deep, &shallow);
+    assert_eq!(eg.extract(&deep).unwrap().to_string(), "(h a b)");
 }
 #[test]
 fn beta_avoids_capture_when_the_argument_is_free() {
