@@ -11,8 +11,8 @@
 use indexmap::IndexMap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
-use std::time::{Duration, Instant};
 use symbol_table::GlobalSymbol as Symbol;
+use web_time::{Duration, Instant};
 
 pub type RawId = u32;
 
