@@ -342,24 +342,19 @@ pub fn add_syntax_term(eg: &mut EGraph, syntax: &Syntax, ctx: usize) -> Result<I
             SyntaxKind::Atom {
                 text: atom,
                 quoted: false,
-            } if resolve_binder(atom, binders).is_some() => {
-                let (_, slot) = resolve_binder(atom, binders).unwrap();
+            } if let Some((_, slot)) = resolve_binder(atom, binders) => {
                 Ok(eg.var(ctx, outer_ctx + slot))
             }
             SyntaxKind::Atom {
                 text: atom,
                 quoted: false,
-            } if atom.starts_with('$') => {
-                let index = atom[1..]
-                    .parse::<usize>()
-                    .map_err(|_| format!("invalid outer-context variable '{atom}'"))?;
-                if index >= outer_ctx {
-                    return Err(format!(
-                        "{atom} is out of scope in outer context {outer_ctx}"
-                    ));
+            } if atom.starts_with('$') => match atom[1..].parse::<usize>() {
+                Err(_) => Err(format!("invalid outer-context variable '{atom}'")),
+                Ok(index) if index >= outer_ctx => {
+                    Err(format!("{atom} is out of scope in outer context {outer_ctx}"))
                 }
-                Ok(eg.var(ctx, index))
-            }
+                Ok(index) => Ok(eg.var(ctx, index)),
+            },
             SyntaxKind::Atom {
                 text: atom,
                 quoted: false,
@@ -372,65 +367,81 @@ pub fn add_syntax_term(eg: &mut EGraph, syntax: &Syntax, ctx: usize) -> Result<I
             SyntaxKind::Group {
                 delimiter: Delimiter::Bracket,
                 items,
-            } => {
-                if items.len() < 2 {
-                    return Err(
-                        "higher-order application '[FUNCTION ARGUMENT ...]' needs an argument"
-                            .into(),
-                    );
-                }
-                let mut terms = items.iter();
-                let mut application = go(eg, terms.next().unwrap(), outer_ctx, binders)?;
-                for argument in terms {
-                    let argument = go(eg, argument, outer_ctx, binders)?;
-                    application = eg.ho_app(application, argument);
-                }
-                Ok(application)
-            }
+            } => bracket(eg, items, outer_ctx, binders),
             SyntaxKind::Group {
                 delimiter: Delimiter::Paren,
                 items,
-            } => {
-                let Some(head) = items.first() else {
-                    return Err("empty term list".into());
-                };
-                let op = atom_of(head)?;
-                if let Some(op) = op.strip_prefix('@') {
-                    if op.is_empty() || items.len() != 3 {
-                        return Err("(@OP NAME BODY) takes a binder name and body".into());
-                    }
-                    let name = binder_name(&items[1])?.to_owned();
-                    binders.push(name);
-                    let body = go(eg, &items[2], outer_ctx, binders);
-                    binders.pop();
-                    return Ok(eg.binder(op, body?));
-                }
-                if op == "#subst" {
-                    if items.len() != 4 {
-                        return Err(
-                            "(#subst BODY NAME REPLACEMENT) takes a body, binder, and replacement"
-                                .into(),
-                        );
-                    }
-                    let name = subst_binder_name(&items[2])?.to_owned();
-                    binders.push(name);
-                    let body = go(eg, &items[1], outer_ctx, binders);
-                    binders.pop();
-                    let body = body?;
-                    let replacement = go(eg, &items[3], outer_ctx, binders)?;
-                    return Ok(eg.substitute(&body, ctx, &replacement));
-                }
-                if items.len() < 2 {
-                    return Err(format!("application '({op} ...)' needs an argument"));
-                }
-                let children = items[1..]
-                    .iter()
-                    .map(|item| go(eg, item, outer_ctx, binders))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(eg.fo_app(op, children))
-            }
+            } => paren(eg, items, outer_ctx, binders),
         };
         result.map_err(|error| syntax.locate(error))
+    }
+
+    /// `[FUNCTION ARGUMENT ...]`. Errors are returned unlocated so that the
+    /// caller attaches this group's own position rather than the command's.
+    fn bracket(
+        eg: &mut EGraph,
+        items: &[Syntax],
+        outer_ctx: usize,
+        binders: &mut Vec<String>,
+    ) -> Result<Id, String> {
+        if items.len() < 2 {
+            return Err(
+                "higher-order application '[FUNCTION ARGUMENT ...]' needs an argument".into(),
+            );
+        }
+        let (function, arguments) = items.split_first().unwrap();
+        let mut application = go(eg, function, outer_ctx, binders)?;
+        for argument in arguments {
+            let argument = go(eg, argument, outer_ctx, binders)?;
+            application = eg.ho_app(application, argument);
+        }
+        Ok(application)
+    }
+
+    /// `(OP ...)`, `(@OP NAME BODY)`, or `(#subst BODY NAME REPLACEMENT)`.
+    fn paren(
+        eg: &mut EGraph,
+        items: &[Syntax],
+        outer_ctx: usize,
+        binders: &mut Vec<String>,
+    ) -> Result<Id, String> {
+        let ctx = outer_ctx + binders.len();
+        let Some(head) = items.first() else {
+            return Err("empty term list".into());
+        };
+        let op = atom_of(head)?;
+        if let Some(op) = op.strip_prefix('@') {
+            if op.is_empty() || items.len() != 3 {
+                return Err("(@OP NAME BODY) takes a binder name and body".into());
+            }
+            let name = binder_name(&items[1])?.to_owned();
+            binders.push(name);
+            let body = go(eg, &items[2], outer_ctx, binders);
+            binders.pop();
+            return Ok(eg.binder(op, body?));
+        }
+        if op == "#subst" {
+            if items.len() != 4 {
+                return Err(
+                    "(#subst BODY NAME REPLACEMENT) takes a body, binder, and replacement".into(),
+                );
+            }
+            let name = subst_binder_name(&items[2])?.to_owned();
+            binders.push(name);
+            let body = go(eg, &items[1], outer_ctx, binders);
+            binders.pop();
+            let body = body?;
+            let replacement = go(eg, &items[3], outer_ctx, binders)?;
+            return Ok(eg.substitute(&body, ctx, &replacement));
+        }
+        if items.len() < 2 {
+            return Err(format!("application '({op} ...)' needs an argument"));
+        }
+        let children = items[1..]
+            .iter()
+            .map(|item| go(eg, item, outer_ctx, binders))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(eg.fo_app(op, children))
     }
 
     if ctx > 7 {
@@ -462,8 +473,7 @@ fn parse_pattern(syntax: &Syntax, mode: PatternMode) -> Result<Pattern, String> 
             SyntaxKind::Atom {
                 text: atom,
                 quoted: false,
-            } if resolve_binder(atom, binders).is_some() => {
-                let (index, _) = resolve_binder(atom, binders).unwrap();
+            } if let Some((index, _)) = resolve_binder(atom, binders) => {
                 Ok(Pattern::BVar(index.into()))
             }
             SyntaxKind::Atom {
@@ -619,47 +629,48 @@ pub fn syntax_match_pattern(syntax: &Syntax) -> Result<Pattern, String> {
     Ok(pattern)
 }
 
-fn command_term<'a>(items: &'a [Syntax], command: &str) -> Result<(usize, &'a Syntax), String> {
-    match items {
-        [_, term] => Ok((0, term)),
-        [_, context, term] => {
-            let context = atom_of(context)?.parse::<usize>().map_err(|_| {
-                context
-                    .location
-                    .error(format!("{command} context must be a nonnegative integer"))
-            })?;
-            if context > 7 {
-                return Err(items[1]
-                    .location
-                    .error("packed IDs support at most 7 context variables"));
-            }
-            Ok((context, term))
-        }
-        _ => Err(format!("wrong number of arguments to '{command}'")),
+/// Split `(COMMAND [CONTEXT] ARG..)` into its ambient context, which defaults
+/// to 0 when omitted, and exactly `arity` remaining argument forms.
+fn command_context<'a>(
+    items: &'a [Syntax],
+    command: &str,
+    arity: usize,
+) -> Result<(usize, &'a [Syntax]), String> {
+    let arguments = &items[1..];
+    if arguments.len() == arity {
+        return Ok((0, arguments));
     }
+    let [context, arguments @ ..] = arguments else {
+        return Err(format!("wrong number of arguments to '{command}'"));
+    };
+    if arguments.len() != arity {
+        return Err(format!("wrong number of arguments to '{command}'"));
+    }
+    let location = context.location;
+    let context = atom_of(context)?.parse::<usize>().map_err(|_| {
+        location.error(format!("{command} context must be a nonnegative integer"))
+    })?;
+    if context > 7 {
+        return Err(location.error("packed IDs support at most 7 context variables"));
+    }
+    Ok((context, arguments))
+}
+
+fn command_term<'a>(items: &'a [Syntax], command: &str) -> Result<(usize, &'a Syntax), String> {
+    let (context, [term]) = command_context(items, command, 1)? else {
+        unreachable!("command_context returned the requested arity")
+    };
+    Ok((context, term))
 }
 
 fn command_terms<'a>(
     items: &'a [Syntax],
     command: &str,
 ) -> Result<(usize, &'a Syntax, &'a Syntax), String> {
-    match items {
-        [_, left, right] => Ok((0, left, right)),
-        [_, context, left, right] => {
-            let context = atom_of(context)?.parse::<usize>().map_err(|_| {
-                context
-                    .location
-                    .error(format!("{command} context must be a nonnegative integer"))
-            })?;
-            if context > 7 {
-                return Err(items[1]
-                    .location
-                    .error("packed IDs support at most 7 context variables"));
-            }
-            Ok((context, left, right))
-        }
-        _ => Err(format!("wrong number of arguments to '{command}'")),
-    }
+    let (context, [left, right]) = command_context(items, command, 2)? else {
+        unreachable!("command_context returned the requested arity")
+    };
+    Ok((context, left, right))
 }
 
 fn comment_lines(text: &str) -> String {

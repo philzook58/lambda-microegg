@@ -206,6 +206,74 @@ fn sum_swap_case(binders: usize) -> (EGraph, Id, Id, [Rewrite; 1]) {
     (eg, term, goal, [rule])
 }
 
+/// A deep chain of distinct e-classes beneath one context variable. Each link
+/// is its own e-class, so this isolates traversal cost over many classes from
+/// the combinatorial blowup the AC cases measure.
+fn chain_case(depth: usize) -> (EGraph, Id, Id) {
+    let mut eg = EGraph::new();
+    let mut body = eg.var(1, 0);
+    for i in 0..depth {
+        // Alternate the operator so no two links hash-cons together.
+        body = eg.fo_app(if i % 2 == 0 { "f" } else { "g" }, vec![body]);
+    }
+    let replacement = eg.atom("c", 0);
+    (eg, body, replacement)
+}
+
+/// Already-substituted chain of the given depth, ready to extract.
+fn extraction_chain_case(depth: usize) -> (EGraph, Id) {
+    let (mut eg, body, replacement) = chain_case(depth);
+    let result = eg.substitute(&body, 0, &replacement);
+    (eg, result)
+}
+
+fn bench_substitution(c: &mut Criterion) {
+    let mut group = c.benchmark_group("substitution");
+    group
+        .sample_size(10)
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(10))
+        .sampling_mode(SamplingMode::Flat);
+
+    // Deliberately no extraction inside the timed region: extraction of a
+    // chain this deep costs an order of magnitude more than the substitution
+    // and would be all this measured. Correctness is covered by the tests.
+    for depth in [200, 800] {
+        group.bench_function(format!("chain-{depth}"), |b| {
+            b.iter_batched(
+                || chain_case(depth),
+                |(mut eg, body, replacement)| black_box(eg.substitute(&body, 0, &replacement)),
+                BatchSize::PerIteration,
+            )
+        });
+    }
+    group.finish();
+}
+
+fn bench_extraction(c: &mut Criterion) {
+    let mut group = c.benchmark_group("extraction");
+    group
+        .sample_size(10)
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(10))
+        .sampling_mode(SamplingMode::Flat);
+
+    for depth in [200, 400, 800] {
+        group.bench_function(format!("chain-{depth}"), |b| {
+            b.iter_batched(
+                || extraction_chain_case(depth),
+                |(mut eg, result)| {
+                    let term = eg.extract(&result).unwrap();
+                    assert_eq!(term.size(), depth + 1);
+                    black_box(term)
+                },
+                BatchSize::PerIteration,
+            )
+        });
+    }
+    group.finish();
+}
+
 fn bench_shape_and_binders(c: &mut Criterion) {
     let mut group = c.benchmark_group("shape-and-binders");
     group
@@ -241,6 +309,8 @@ criterion_group!(
     benches,
     bench_ac,
     bench_lambda_under,
+    bench_substitution,
+    bench_extraction,
     bench_shape_and_binders
 );
 criterion_main!(benches);

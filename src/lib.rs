@@ -1,15 +1,16 @@
-//! - a de Bruijn index counts outward from the nearest binder;
-//! - a de Bruijn level counts a varialble coming down from an ambient context;
+//! Two ways of naming a variable:
 //!
+//! - a de Bruijn index counts outward from the nearest binder;
+//! - a de Bruijn level counts a variable coming down from an ambient context.
 //!
 //! During pattern matching, `top_ctx` is the ambient context at the top of the
-
-//! pattern and `current_ctx` additionally includes locally introduced variables from binders at the end
-//! pattern variables need to be carried up to the context at the top of the pattern to be carried over to the right hand side
-
-//! The Miller patterns give a description of how you want this carrying to work and which variables you want to allow in the pattern variable
-
-//! A lift embeds an context into another by adding unused variables into the context
+//! pattern, and `current_ctx` additionally includes the variables introduced
+//! locally by binders inside the pattern. A pattern variable has to be carried
+//! up to the context at the top of the pattern in order to be carried over to
+//! the right-hand side. Miller patterns describe how you want that carrying to
+//! work, and which variables you want to allow in the pattern variable.
+//!
+//! A lift embeds one context into another by adding unused variables.
 
 use indexmap::IndexMap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -331,14 +332,13 @@ impl Lift {
     fn equalizer(&self, other: &Self) -> Self {
         assert_eq!(self.cod(), other.cod());
         assert_eq!(self.dom(), other.dom());
-        let left: Vec<_> = (0..self.cod()).filter(|&i| self.get(i)).collect();
-        let right: Vec<_> = (0..other.cod()).filter(|&i| other.get(i)).collect();
+        let left = (0..self.cod()).filter(|&i| self.get(i));
+        let right = (0..other.cod()).filter(|&i| other.get(i));
         let bits = left
-            .iter()
             .zip(right)
             .enumerate()
             .fold(0, |bits, (i, (left, right))| {
-                bits | (u8::from(*left == right) << i)
+                bits | (u8::from(left == right) << i)
             });
         Self::from_bits(bits, self.dom())
     }
@@ -419,6 +419,46 @@ enum Node {
 // typical 64-byte cache line and is why binary children are stored inline.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Node>() == 32);
+
+/// An e-node's head, without its children, as passed to an extraction weight
+/// function. Weights cannot depend on children: the extractor sums node
+/// weights, so a subterm's cost never depends on where it is used.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Head {
+    Var,
+    Atom(Symbol),
+    /// Operator and number of children.
+    FOApp(Symbol, usize),
+    HOApp,
+    Binder(Symbol),
+}
+
+/// The variable a `Node::Var` placement denotes, or `None` when the placement
+/// does not select exactly one ambient variable.
+fn var_term(by: &Lift, ctx: usize, root_scope: usize) -> Option<Term> {
+    if by.dom() != 1 {
+        return None;
+    }
+    let index = (0..by.cod()).find(|&i| by.get(i))?;
+    if index < root_scope {
+        Some(Term::FVar(index.into()))
+    } else {
+        Some(Term::BVar(ctx.checked_sub(index + 1)?.into()))
+    }
+}
+
+/// An e-node's children, lifted into the placement `by`. A binder's body
+/// lives one context deeper, so its lift gains the bound variable.
+fn node_children(node: &Node, by: &Lift) -> impl Iterator<Item = Id> {
+    let (children, under_binder): (SmallVec<[Id; 2]>, bool) = match node {
+        Node::Var | Node::Atom(_) => (SmallVec::new(), false),
+        Node::FOApp(_, children) => (children.clone(), false),
+        Node::HOApp(function, argument) => (smallvec::smallvec![*function, *argument], false),
+        Node::Binder(_, body) => (smallvec::smallvec![*body], true),
+    };
+    let by = if under_binder { by.append(true) } else { *by };
+    children.into_iter().map(move |child| child.weaken(&by))
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RunStats {
@@ -550,6 +590,11 @@ impl EGraph {
         let id = Id::new(Lift::identity(scope), raw);
         self.parent.push(id);
         id
+    }
+    /// The identity placement of a raw class in its own intrinsic context.
+    #[inline(always)]
+    fn origin(&self, raw: RawId) -> Id {
+        Id::new(Lift::identity(self.parent[raw as usize].ctx()), raw)
     }
     pub fn find(&self, id: &Id) -> Id {
         let mut out = *id;
@@ -735,6 +780,9 @@ impl EGraph {
     fn nodes_in_class(&self, target: &Id, mode: MatchMode) -> SmallVec<[(&Node, Lift); 4]> {
         let target = self.find(target);
         let mut out = SmallVec::new();
+        // The factor/limit tail below is deliberately written out in both
+        // branches. Hoisting it into a shared closure measured ~2.5% slower on
+        // AC10-hoapp and lambda-under; this is the hottest function here.
         if self.rev_valid || self.rev_tracked {
             for (node, edge) in self.rev.get(&target.raw()).into_iter().flatten() {
                 let factors = factor_lifts(&target.lift(), edge);
@@ -752,8 +800,7 @@ impl EGraph {
             // uncommon API path pays for a full scan rather than making every
             // ordinary union maintain the live reverse index.
             for (node, &raw) in &self.memo {
-                let origin = Id::new(Lift::identity(self.parent[raw as usize].ctx()), raw);
-                let edge = self.find(&origin);
+                let edge = self.find(&self.origin(raw));
                 if edge.raw() != target.raw() {
                     continue;
                 }
@@ -907,44 +954,52 @@ impl EGraph {
         }
         self.find_mut(&result)
     }
+    /// Extract a smallest term, counting every node as 1.
     pub fn extract(&mut self, target: &Id) -> Option<TermCtx> {
-        // Size remains the primary objective. Among equally sized terms,
-        // prefer fewer binders and then a shallower tree.
-        self.extract_with(target, |term| {
-            (term.size(), term.binder_count(), term.depth())
-        })
+        self.extract_with(target, |_| 1)
     }
-    /// Extract with an ordered, constructor-monotone cost. The top-down cycle
-    /// breaker is sound for costs such as tree size or lexicographic tuples of
-    /// structural measures, where wrapping a term cannot make it cheaper.
-    pub fn extract_with<C: Ord>(
+    /// Extract the term of least total weight, where a term's weight is the
+    /// sum of `weight` over its nodes.
+    ///
+    /// A per-node weight rather than a whole-term cost is what keeps this
+    /// linear: each e-class is costed once, instead of re-walking every
+    /// candidate subtree at every level. It also makes the cost monotone by
+    /// construction, since wrapping a term only adds a node.
+    pub fn extract_with(
         &mut self,
         target: &Id,
-        cost: impl Fn(&Term) -> C,
+        weight: impl Fn(Head) -> u64,
     ) -> Option<TermCtx> {
         self.rebuild();
         let target = self.find(target);
         let scope = target.ctx();
-        let t = self.extract_rec(
+        let mut choices = HashMap::default();
+        self.choose(
             &target,
             scope,
-            &mut HashMap::default(),
+            &mut choices,
             &mut HashSet::default(),
-            &cost,
+            &weight,
         )?;
-        Some(TermCtx { scope, t })
+        Some(TermCtx {
+            scope,
+            t: self.build(&target, scope, &choices),
+        })
     }
-    fn extract_rec<C: Ord>(
+    /// Pick the cheapest e-node for `target` and, recursively, for every class
+    /// it reaches; record the winner and its total weight. Returns `None` for
+    /// a class with no finite term.
+    fn choose(
         &self,
         target: &Id,
         root_scope: usize,
-        memo: &mut HashMap<Id, Option<Term>>,
+        choices: &mut HashMap<Id, Option<(u64, Node, Lift)>>,
         active_raw: &mut HashSet<RawId>,
-        cost: &impl Fn(&Term) -> C,
-    ) -> Option<Term> {
+        weight: &impl Fn(Head) -> u64,
+    ) -> Option<u64> {
         let target = self.find(target);
-        if let Some(result) = memo.get(&target) {
-            return result.clone();
+        if let Some(choice) = choices.get(&target) {
+            return choice.as_ref().map(|(cost, _, _)| *cost);
         }
         // A recursive class can return at a different lifted placement on
         // every trip through a binder. The fat IDs then differ even though
@@ -956,85 +1011,71 @@ impl EGraph {
 
         // Mark this fat ID as being visited. Recursive enodes that return to
         // it are skipped, while other finite representatives remain usable.
-        memo.insert(target, None);
-        let mut best: Option<(C, Term)> = None;
+        choices.insert(target, None);
+        let mut best: Option<(u64, Node, Lift)> = None;
         for (node, by) in self.nodes_in_class(&target, MatchMode::Lifted) {
-            let candidate = match node {
+            let mut total = match node {
                 Node::Var => {
-                    if by.dom() != 1 {
+                    if var_term(&by, target.ctx(), root_scope).is_none() {
                         continue;
                     }
-                    let Some(index) = (0..by.cod()).find(|&i| by.get(i)) else {
-                        continue;
-                    };
-                    if index < root_scope {
-                        Term::FVar(index.into())
-                    } else {
-                        let binder = target.ctx().checked_sub(index + 1)?;
-                        Term::BVar(binder.into())
-                    }
+                    weight(Head::Var)
                 }
-                Node::Atom(name) => Term::Atom(*name),
-                Node::FOApp(op, children) => {
-                    let mut terms = Vec::with_capacity(children.len());
-                    let mut cyclic = false;
-                    for child in children {
-                        let child = child.weaken(&by);
-                        let Some(term) =
-                            self.extract_rec(&child, root_scope, memo, active_raw, cost)
-                        else {
-                            cyclic = true;
-                            break;
-                        };
-                        terms.push(term);
-                    }
-                    if cyclic {
-                        continue;
-                    }
-                    Term::FOApp(*op, terms)
-                }
-                Node::HOApp(function, argument) => {
-                    let function = function.weaken(&by);
-                    let argument = argument.weaken(&by);
-                    let Some(function) =
-                        self.extract_rec(&function, root_scope, memo, active_raw, cost)
-                    else {
-                        continue;
-                    };
-                    let Some(argument) =
-                        self.extract_rec(&argument, root_scope, memo, active_raw, cost)
-                    else {
-                        continue;
-                    };
-                    Term::HOApp(Box::new(function), Box::new(argument))
-                }
-                Node::Binder(op, body) => {
-                    let body = body.weaken(&by.append(true));
-                    let Some(body) = self.extract_rec(&body, root_scope, memo, active_raw, cost)
-                    else {
-                        continue;
-                    };
-                    Term::Binder(*op, Box::new(body))
-                }
+                Node::Atom(name) => weight(Head::Atom(*name)),
+                Node::FOApp(op, children) => weight(Head::FOApp(*op, children.len())),
+                Node::HOApp(_, _) => weight(Head::HOApp),
+                Node::Binder(op, _) => weight(Head::Binder(*op)),
             };
-            let candidate_cost = cost(&candidate);
-            if best
-                .as_ref()
-                .is_none_or(|(best_cost, _)| &candidate_cost < best_cost)
-            {
-                best = Some((candidate_cost, candidate));
+            let mut finite = true;
+            for child in node_children(node, &by) {
+                let Some(cost) = self.choose(&child, root_scope, choices, active_raw, weight)
+                else {
+                    finite = false;
+                    break;
+                };
+                total = total.saturating_add(cost);
+            }
+            if finite && best.as_ref().is_none_or(|(best, _, _)| total < *best) {
+                best = Some((total, node.clone(), by));
             }
         }
-        let result = best.map(|(_, term)| term);
         active_raw.remove(&target.raw());
-        memo.insert(target, result.clone());
-        result
+        let cost = best.as_ref().map(|(cost, _, _)| *cost);
+        choices.insert(target, best);
+        cost
+    }
+    /// Materialize the term from the winners `choose` recorded. The chosen
+    /// nodes form a DAG, so this costs one step per node of the output.
+    fn build(
+        &self,
+        target: &Id,
+        root_scope: usize,
+        choices: &HashMap<Id, Option<(u64, Node, Lift)>>,
+    ) -> Term {
+        let target = self.find(target);
+        let (_, node, by) = choices
+            .get(&target)
+            .and_then(Option::as_ref)
+            .expect("choose recorded a finite winner for every reachable class");
+        let mut children = node_children(node, by).map(|child| self.build(&child, root_scope, choices));
+        match node {
+            Node::Var => var_term(by, target.ctx(), root_scope).expect("checked by choose"),
+            Node::Atom(name) => Term::Atom(*name),
+            Node::FOApp(op, _) => Term::FOApp(*op, children.collect()),
+            Node::HOApp(_, _) => {
+                let function = children.next().expect("HOApp has two children");
+                let argument = children.next().expect("HOApp has two children");
+                Term::HOApp(Box::new(function), Box::new(argument))
+            }
+            Node::Binder(op, _) => {
+                Term::Binder(*op, Box::new(children.next().expect("Binder has a body")))
+            }
+        }
     }
     fn reindex(&mut self) {
         self.rev.clear();
         for (node, &raw) in &self.memo {
-            let origin = Id::new(Lift::identity(self.parent[raw as usize].ctx()), raw);
-            let edge = self.find(&origin);
+            let edge = self.find(&self.origin(raw));
             self.rev
                 .entry(edge.raw())
                 .or_default()
@@ -1291,10 +1332,7 @@ impl EGraph {
     fn canonical_targets(&self) -> Vec<Id> {
         let mut targets = HashSet::default();
         for &raw in self.memo.values() {
-            targets.insert(self.find(&Id::new(
-                Lift::identity(self.parent[raw as usize].ctx()),
-                raw,
-            )));
+            targets.insert(self.find(&self.origin(raw)));
         }
         let mut targets: Vec<_> = targets.into_iter().collect();
         targets.sort_by_key(|id| (id.raw(), id.lift().cod(), id.lift().selected_bits()));
@@ -1310,8 +1348,7 @@ impl EGraph {
         stats.rebuild_time += self.rebuild_time_total - rebuild_before;
         // Saturation usually grows the match set, so retain each rule's
         // allocation across rounds while preserving search-then-apply.
-        let mut matches_by_rule: Vec<Vec<(Id, Subst)>> =
-            (0..rules.len()).map(|_| Vec::new()).collect();
+        let mut matches_by_rule: Vec<Vec<(Id, Subst)>> = vec![Vec::new(); rules.len()];
         while stats.rounds < limit {
             let before_nodes = self.memo.len();
 

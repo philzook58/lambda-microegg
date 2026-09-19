@@ -283,48 +283,45 @@ impl Term {
         }
     }
 
-    pub fn binder_count(&self) -> usize {
-        match self {
-            Self::FVar(_) | Self::BVar(_) | Self::Atom(_) => 0,
-            Self::FOApp(_, children) => children.iter().map(Self::binder_count).sum(),
-            Self::HOApp(function, argument) => function.binder_count() + argument.binder_count(),
-            Self::Binder(_, body) => 1 + body.binder_count(),
-        }
-    }
+}
 
-    pub fn depth(&self) -> usize {
-        match self {
-            Self::FVar(_) | Self::BVar(_) | Self::Atom(_) => 1,
-            Self::FOApp(_, children) => {
-                1 + children.iter().map(Self::depth).max().unwrap_or_default()
-            }
-            Self::HOApp(function, argument) => 1 + function.depth().max(argument.depth()),
-            Self::Binder(_, body) => 1 + body.depth(),
+/// Whether an atom must be printed quoted. The delimiter set mirrors the
+/// frontend lexer's, so that printed output re-reads as the same atom.
+fn needs_quoting(text: &str) -> bool {
+    text.is_empty()
+        || text.starts_with(['?', '$'])
+        || text.chars().any(|c| {
+            c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ';' | '"')
+        })
+}
+
+/// Write an atom, quoting and escaping it when it cannot be written bare.
+/// `force_quote` additionally quotes a name that would otherwise capture a
+/// binder in scope.
+fn write_atom(
+    f: &mut std::fmt::Formatter<'_>,
+    text: &str,
+    force_quote: bool,
+) -> std::fmt::Result {
+    if !force_quote && !needs_quoting(text) {
+        return f.write_str(text);
+    }
+    f.write_str("\"")?;
+    for c in text.chars() {
+        match c {
+            '\n' => f.write_str("\\n")?,
+            '\t' => f.write_str("\\t")?,
+            '"' | '\\' => write!(f, "\\{c}")?,
+            c => write!(f, "{c}")?,
         }
     }
+    f.write_str("\"")
 }
 
 impl std::fmt::Display for Term {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         fn atom(f: &mut std::fmt::Formatter<'_>, text: &str) -> std::fmt::Result {
-            let bare = !text.is_empty()
-                && !text.starts_with(['?', '$'])
-                && !text.chars().any(|c| {
-                    c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ';' | '"')
-                });
-            if bare {
-                return f.write_str(text);
-            }
-            f.write_str("\"")?;
-            for c in text.chars() {
-                match c {
-                    '\n' => f.write_str("\\n")?,
-                    '\t' => f.write_str("\\t")?,
-                    '"' | '\\' => write!(f, "\\{c}")?,
-                    c => write!(f, "{c}")?,
-                }
-            }
-            f.write_str("\"")
+            write_atom(f, text, false)
         }
         fn bin_head(term: &Term, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             if let Term::HOApp(function, argument) = term {
@@ -398,31 +395,7 @@ pub struct NamedTerm<'a> {
 
 impl std::fmt::Display for NamedTerm<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fn atom(
-            f: &mut std::fmt::Formatter<'_>,
-            text: &str,
-            force_quote: bool,
-        ) -> std::fmt::Result {
-            let bare = !force_quote
-                && !text.is_empty()
-                && !text.starts_with(['?', '$'])
-                && !text.chars().any(|c| {
-                    c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ';' | '"')
-                });
-            if bare {
-                return f.write_str(text);
-            }
-            f.write_str("\"")?;
-            for c in text.chars() {
-                match c {
-                    '\n' => f.write_str("\\n")?,
-                    '\t' => f.write_str("\\t")?,
-                    '"' | '\\' => write!(f, "\\{c}")?,
-                    c => write!(f, "{c}")?,
-                }
-            }
-            f.write_str("\"")
-        }
+        use write_atom as atom;
         fn collides(text: &str, root_binders: &[String], binders: &[String]) -> bool {
             let base = text
                 .rsplit_once('@')
