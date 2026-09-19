@@ -191,3 +191,7 @@ enum {
 Or another kind of bracket? <sum x body>
 
 Maybe the haskell one hsould just be entirely using []
+
+
+I'd inline instatiiate_bindings
+and I'd panic rather than Option out for stuff that really shouldn't happen.
