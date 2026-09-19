@@ -102,3 +102,92 @@ AC10 example
 integration
 differentiation
 Sadly I'd grown to kind of like my d(x) exteriori derivative versoin.
+
+
+(extract t :depth :size :bindernum (:weight foo 2) (:weight frog 7))  extract by lex ordering of depth, size, bindernum, # of foo occurence
+(weight foo 2)  ; give foo weight 2
+
+Try some dag extraction techniques from extraction gym?
+ASP or linear alg extract?
+
+I guess I could use egglog parser as dependency and add egglog parsing mode?
+
+TPTP problems + logic rules
+
+Compare with zipperposition? duper? Just like lean automation?
+Mechanical mathematicians https://dl.acm.org/doi/pdf/10.1145/3557998
+
+(true
+(@forall x ?a) -> ?a ; don't use x
+(@exists (and ?a ?b) = (and (exusts ) (exists))
+(exists (or a b)) = (exists a) 
+
+forall x exists y body x y ->  exists y (forall x  (?body x (y x)))
+
+
+Why have Atom and App? It's a reasonable optimization I guess. And it's one step towards
+
+
+; map f (map g xs) = map (f . g) xs
+; Writing composition as a lambda exercises capture-avoiding substitution.
+;(rewrite
+;  (map ?f (map ?g ?xs))
+;  (map (lam z (app ?f (app ?g z))) ?xs))
+
+; but app isn't anything special?
+
+(rewrite 
+  (map (lam x (?body x)) (map (lam y (?f y)) ?xs))
+  (map (lam z (?body (?f z))))
+)
+
+; why do I have to keep
+(rewrite (comp ?f ?g) (lam z (f )))
+
+
+(rewrite (comp ?f ?g) (lam x (?f (?g ?x))))
+(rewrite ((comp ?f ?g) x) (?f (?g ?x))
+(rewrite (lam (#bind x ))
+(rewrite ((@lam x (?body x) e) (?body e))
+
+
+Is multibiders important?
+Should binder auto collapse into multibinders? How would I implement it? Nah.
+enum Bind(Symbol, u8, Id)
+
+Bind
+
+App(Id, vec![]) rather than
+Or steal a bit to distinguish between Id and Symbol?
+
+subst enough to kill free variables (a x y k l) and the rest go in an app.
+Have both binary app and
+HOApp(Id, Vec![])
+(f a b)
+((f) a b)
+
+(?a i j) is ambigous if it's a miller pattern or otherwise... Hmm.
+((?a) a b) for ho
+
+(?a @i @j)  ?
+
+[?a i j]
+vs
+(?a ?x)
+(f (a) (b)) Is this accepted?
+
+[a i j]
+
+[a i j] as macro for curried (app a i j)
+
+
+proof storage.
+enum {
+
+
+}
+
+(@sum x body) and [@sum x body] should be the same thing?
+Or another kind of bracket? <sum x body>
+
+Maybe the haskell one hsould just be entirely using []

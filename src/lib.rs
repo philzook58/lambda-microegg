@@ -405,8 +405,11 @@ impl Id {
 enum Node {
     Var,
     Atom(Symbol),
-    App(Symbol, SmallVec<[Id; 2]>),
-    Lam(Id),
+    /// A first-order operator with all of its children in one e-node.
+    FOApp(Symbol, SmallVec<[Id; 2]>),
+    /// One step of higher-order, curried application.
+    HOApp(Id, Id),
+    Binder(Symbol, Id),
 }
 
 // On 64-bit hosts, Node occupies one 32-byte chunk. This keeps two nodes in a
@@ -427,8 +430,11 @@ pub enum Pattern {
     /// index counting outward from the nearest pattern binder.
     BVar(DeBruijnIndex),
     Atom(Symbol),
-    App(Symbol, Vec<Pattern>),
-    Lam(Box<Pattern>),
+    /// Parenthesized, n-ary first-order application.
+    FOApp(Symbol, Vec<Pattern>),
+    /// Bracketed, curried higher-order application.
+    HOApp(Box<Pattern>, Box<Pattern>),
+    Binder(Symbol, Box<Pattern>),
     /// Built-in capture-avoiding substitution. Its body is parsed beneath
     /// one additional binder and the result lives outside that binder.
     Subst(Box<Pattern>, Box<Pattern>),
@@ -450,8 +456,14 @@ impl Pattern {
     pub fn atom(name: &str) -> Self {
         Self::Atom(name.into())
     }
-    pub fn app(op: &str, children: Vec<Self>) -> Self {
-        Self::App(op.into(), children)
+    pub fn fo_app(op: &str, children: Vec<Self>) -> Self {
+        Self::FOApp(op.into(), children)
+    }
+    pub fn ho_app(function: Self, argument: Self) -> Self {
+        Self::HOApp(Box::new(function), Box::new(argument))
+    }
+    pub fn binder(op: &str, body: Self) -> Self {
+        Self::Binder(op.into(), Box::new(body))
     }
 
     fn miller_indices(arguments: &[Pattern]) -> Option<SmallVec<[DeBruijnIndex; 4]>> {
@@ -475,10 +487,13 @@ impl Pattern {
                 };
                 occurrence_lift(0, depth, &indices).is_none()
             }
-            Self::App(_, children) => children
+            Self::FOApp(_, children) => children
                 .iter()
                 .any(|child| child.needs_binding_traversal(depth)),
-            Self::Lam(body) => body.needs_binding_traversal(depth + 1),
+            Self::HOApp(function, argument) => {
+                function.needs_binding_traversal(depth) || argument.needs_binding_traversal(depth)
+            }
+            Self::Binder(_, body) => body.needs_binding_traversal(depth + 1),
             Self::Subst(body, replacement) => {
                 body.needs_binding_traversal(depth + 1)
                     || replacement.needs_binding_traversal(depth)
@@ -534,7 +549,7 @@ impl Pattern {
                             .collect::<Vec<_>>()
                             .join(" ");
                         return Err(format!(
-                            "Miller metavariable '{name}' arguments are out of order; write ({name} {correct}) on the match left-hand side, then permute its arguments on the rewrite right-hand side if needed"
+                            "Miller metavariable '{name}' arguments are out of order; write {{{name} {correct}}} on the match left-hand side, then permute its arguments on the rewrite right-hand side if needed"
                         ));
                     }
                     if let Some(previous) = arities.get(name) {
@@ -548,13 +563,17 @@ impl Pattern {
                     }
                     Ok(())
                 }
-                Pattern::App(_, children) => {
+                Pattern::FOApp(_, children) => {
                     for child in children {
                         go(child, depth, arities)?;
                     }
                     Ok(())
                 }
-                Pattern::Lam(body) => go(body, depth + 1, arities),
+                Pattern::HOApp(function, argument) => {
+                    go(function, depth, arities)?;
+                    go(argument, depth, arities)
+                }
+                Pattern::Binder(_, body) => go(body, depth + 1, arities),
                 Pattern::Subst(_, _) => {
                     Err("#subst is only allowed on a rewrite right-hand side".into())
                 }
@@ -601,13 +620,17 @@ impl Pattern {
                     }
                     Ok(())
                 }
-                Pattern::App(_, children) => {
+                Pattern::FOApp(_, children) => {
                     for child in children {
                         go(child, depth, metavariables)?;
                     }
                     Ok(())
                 }
-                Pattern::Lam(body) => go(body, depth + 1, metavariables),
+                Pattern::HOApp(function, argument) => {
+                    go(function, depth, metavariables)?;
+                    go(argument, depth, metavariables)
+                }
+                Pattern::Binder(_, body) => go(body, depth + 1, metavariables),
                 Pattern::Subst(body, replacement) => {
                     go(body, depth + 1, metavariables)?;
                     go(replacement, depth, metavariables)
@@ -674,34 +697,40 @@ pub enum Term {
     FVar(DeBruijnLevel),
     BVar(DeBruijnIndex),
     Atom(Symbol),
-    App(Symbol, Vec<Term>),
-    Lam(Box<Term>),
+    /// Parenthesized, n-ary first-order application.
+    FOApp(Symbol, Vec<Term>),
+    /// Bracketed, curried higher-order application.
+    HOApp(Box<Term>, Box<Term>),
+    Binder(Symbol, Box<Term>),
 }
 
 impl Term {
     pub fn size(&self) -> usize {
         match self {
             Self::FVar(_) | Self::BVar(_) | Self::Atom(_) => 1,
-            Self::App(_, children) => 1 + children.iter().map(Self::size).sum::<usize>(),
-            Self::Lam(body) => 1 + body.size(),
+            Self::FOApp(_, children) => 1 + children.iter().map(Self::size).sum::<usize>(),
+            Self::HOApp(function, argument) => 1 + function.size() + argument.size(),
+            Self::Binder(_, body) => 1 + body.size(),
         }
     }
 
     pub fn binder_count(&self) -> usize {
         match self {
             Self::FVar(_) | Self::BVar(_) | Self::Atom(_) => 0,
-            Self::App(_, children) => children.iter().map(Self::binder_count).sum(),
-            Self::Lam(body) => 1 + body.binder_count(),
+            Self::FOApp(_, children) => children.iter().map(Self::binder_count).sum(),
+            Self::HOApp(function, argument) => function.binder_count() + argument.binder_count(),
+            Self::Binder(_, body) => 1 + body.binder_count(),
         }
     }
 
     pub fn depth(&self) -> usize {
         match self {
             Self::FVar(_) | Self::BVar(_) | Self::Atom(_) => 1,
-            Self::App(_, children) => {
+            Self::FOApp(_, children) => {
                 1 + children.iter().map(Self::depth).max().unwrap_or_default()
             }
-            Self::Lam(body) => 1 + body.depth(),
+            Self::HOApp(function, argument) => 1 + function.depth().max(argument.depth()),
+            Self::Binder(_, body) => 1 + body.depth(),
         }
     }
 }
@@ -711,9 +740,9 @@ impl std::fmt::Display for Term {
         fn atom(f: &mut std::fmt::Formatter<'_>, text: &str) -> std::fmt::Result {
             let bare = !text.is_empty()
                 && !text.starts_with(['?', '$'])
-                && !text
-                    .chars()
-                    .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | ';' | '"'));
+                && !text.chars().any(|c| {
+                    c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ';' | '"')
+                });
             if bare {
                 return f.write_str(text);
             }
@@ -728,11 +757,19 @@ impl std::fmt::Display for Term {
             }
             f.write_str("\"")
         }
+        fn bin_head(term: &Term, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if let Term::HOApp(function, argument) = term {
+                bin_head(function, f)?;
+                write!(f, " {argument}")
+            } else {
+                write!(f, "{term}")
+            }
+        }
         match self {
             Self::FVar(level) => write!(f, "${}", level.get()),
             Self::BVar(index) => write!(f, "#{}", index.get()),
             Self::Atom(name) => atom(f, name.as_str()),
-            Self::App(op, children) => {
+            Self::FOApp(op, children) => {
                 f.write_str("(")?;
                 atom(f, op.as_str())?;
                 for child in children {
@@ -740,13 +777,18 @@ impl std::fmt::Display for Term {
                 }
                 f.write_str(")")
             }
-            Self::Lam(body) => write!(f, "(lam {body})"),
+            Self::HOApp(function, argument) => {
+                f.write_str("[")?;
+                bin_head(function, f)?;
+                write!(f, " {argument}]")
+            }
+            Self::Binder(op, body) => write!(f, "(@{op} {body})"),
         }
     }
 }
 
 /// An extracted term together with the size of its free-variable context.
-/// `FVar` levels refer to this scope; `BVar` indices refer to enclosing `Lam`s.
+/// `FVar` levels refer to this scope; `BVar` indices refer to enclosing binders.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TermCtx {
     pub scope: usize,
@@ -795,9 +837,9 @@ impl std::fmt::Display for NamedTerm<'_> {
             let bare = !force_quote
                 && !text.is_empty()
                 && !text.starts_with(['?', '$'])
-                && !text
-                    .chars()
-                    .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | ';' | '"'));
+                && !text.chars().any(|c| {
+                    c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ';' | '"')
+                });
             if bare {
                 return f.write_str(text);
             }
@@ -851,7 +893,7 @@ impl std::fmt::Display for NamedTerm<'_> {
                     name.as_str(),
                     collides(name.as_str(), root_binders, binders),
                 ),
-                Term::App(op, children) => {
+                Term::FOApp(op, children) => {
                     f.write_str("(")?;
                     atom(f, op.as_str(), false)?;
                     for child in children {
@@ -860,9 +902,31 @@ impl std::fmt::Display for NamedTerm<'_> {
                     }
                     f.write_str(")")
                 }
-                Term::Lam(body) => {
+                Term::HOApp(function, argument) => {
+                    fn head(
+                        term: &Term,
+                        f: &mut std::fmt::Formatter<'_>,
+                        outer_ctx: usize,
+                        root_binders: &[String],
+                        binders: &mut Vec<String>,
+                    ) -> std::fmt::Result {
+                        if let Term::HOApp(function, argument) = term {
+                            head(function, f, outer_ctx, root_binders, binders)?;
+                            f.write_str(" ")?;
+                            go(argument, f, outer_ctx, root_binders, binders)
+                        } else {
+                            go(term, f, outer_ctx, root_binders, binders)
+                        }
+                    }
+                    f.write_str("[")?;
+                    head(function, f, outer_ctx, root_binders, binders)?;
+                    f.write_str(" ")?;
+                    go(argument, f, outer_ctx, root_binders, binders)?;
+                    f.write_str("]")
+                }
+                Term::Binder(op, body) => {
                     let name = format!("x{}", root_binders.len() + binders.len());
-                    write!(f, "(lam {name} ")?;
+                    write!(f, "(@{op} {name} ")?;
                     binders.push(name);
                     go(body, f, outer_ctx, root_binders, binders)?;
                     binders.pop();
@@ -1036,21 +1100,30 @@ impl EGraph {
         let base = self.intern(0, Node::Atom(name));
         base.weaken(&Lift::unused(ctx))
     }
-    pub fn app(&mut self, op: &str, children: Vec<Id>) -> Id {
-        self.app_symbol(op.into(), children.into())
+    pub fn fo_app(&mut self, op: &str, children: Vec<Id>) -> Id {
+        self.fo_app_symbol(op.into(), children.into())
     }
-    fn app_symbol(&mut self, op: Symbol, children: SmallVec<[Id; 2]>) -> Id {
+    fn fo_app_symbol(&mut self, op: Symbol, children: SmallVec<[Id; 2]>) -> Id {
         assert!(!children.is_empty());
         let ctx = children[0].ctx();
         assert!(children.iter().all(|c| c.ctx() == ctx));
-        let (common, node) = self.canonical_node(&Node::App(op, children));
+        let (common, node) = self.canonical_node(&Node::FOApp(op, children));
+        let base = self.intern(common.dom(), node);
+        base.weaken(&common)
+    }
+    pub fn ho_app(&mut self, function: Id, argument: Id) -> Id {
+        assert_eq!(function.ctx(), argument.ctx());
+        let (common, node) = self.canonical_node(&Node::HOApp(function, argument));
         let base = self.intern(common.dom(), node);
         base.weaken(&common)
     }
     /// The bound variable is the final variable in the body's context.
-    pub fn lam(&mut self, body: Id) -> Id {
+    pub fn binder(&mut self, op: &str, body: Id) -> Id {
+        self.binder_symbol(op.into(), body)
+    }
+    fn binder_symbol(&mut self, op: Symbol, body: Id) -> Id {
         assert!(body.ctx() > 0);
-        let (outer, node) = self.canonical_node(&Node::Lam(body));
+        let (outer, node) = self.canonical_node(&Node::Binder(op, body));
         let base = self.intern(outer.dom(), node);
         base.weaken(&outer)
     }
@@ -1059,11 +1132,14 @@ impl EGraph {
         match node {
             Node::Var => (Lift::identity(1), Node::Var),
             Node::Atom(s) => (Lift::identity(0), Node::Atom(*s)),
-            Node::App(op, children) => {
+            Node::FOApp(op, children) => {
                 let children: SmallVec<[_; 2]> =
                     children.iter().map(|c| self.find_mut(c)).collect();
                 if children.iter().all(|c| c.lift().is_identity()) {
-                    return (Lift::identity(children[0].ctx()), Node::App(*op, children));
+                    return (
+                        Lift::identity(children[0].ctx()),
+                        Node::FOApp(*op, children),
+                    );
                 }
                 let common = children
                     .iter()
@@ -1076,16 +1152,30 @@ impl EGraph {
                         Id::new(projection, c.raw())
                     })
                     .collect();
-                (common, Node::App(*op, narrowed))
+                (common, Node::FOApp(*op, narrowed))
             }
-            Node::Lam(body) => {
+            Node::HOApp(function, argument) => {
+                let function = self.find_mut(function);
+                let argument = self.find_mut(argument);
+                if function.lift().is_identity() && argument.lift().is_identity() {
+                    return (
+                        Lift::identity(function.ctx()),
+                        Node::HOApp(function, argument),
+                    );
+                }
+                let common = function.lift().union(&argument.lift()).lift;
+                let function = Id::new(common.union(&function.lift()).right, function.raw());
+                let argument = Id::new(common.union(&argument.lift()).right, argument.raw());
+                (common, Node::HOApp(function, argument))
+            }
+            Node::Binder(op, body) => {
                 let body = self.find_mut(body);
                 let outer = body.lift().prefix(body.ctx() - 1);
                 let core_body = Id::new(
                     Lift::identity(outer.dom()).append(body.lift().get(body.ctx() - 1)),
                     body.raw(),
                 );
-                (outer, Node::Lam(core_body))
+                (outer, Node::Binder(*op, core_body))
             }
         }
     }
@@ -1285,7 +1375,7 @@ impl EGraph {
                     replacements[old_index]
                 }
                 Node::Atom(name) => self.atom_symbol(name, output_ctx),
-                Node::App(op, children) => {
+                Node::FOApp(op, children) => {
                     let children = children
                         .into_iter()
                         .map(|child| {
@@ -1293,9 +1383,18 @@ impl EGraph {
                             self.substitute_many_rec(&child, output_ctx, &replacements, memo)
                         })
                         .collect();
-                    self.app_symbol(op, children)
+                    self.fo_app_symbol(op, children)
                 }
-                Node::Lam(body) => {
+                Node::HOApp(function, argument) => {
+                    let function = function.weaken(&by);
+                    let argument = argument.weaken(&by);
+                    let function =
+                        self.substitute_many_rec(&function, output_ctx, &replacements, memo);
+                    let argument =
+                        self.substitute_many_rec(&argument, output_ctx, &replacements, memo);
+                    self.ho_app(function, argument)
+                }
+                Node::Binder(op, body) => {
                     let body = body.weaken(&by.append(true));
                     let mut under: SmallVec<[Id; 8]> = replacements
                         .iter()
@@ -1303,7 +1402,7 @@ impl EGraph {
                         .collect();
                     under.push(self.var(output_ctx + 1, output_ctx));
                     let body = self.substitute_many_rec(&body, output_ctx + 1, &under, memo);
-                    self.lam(body)
+                    self.binder_symbol(op, body)
                 }
             };
             self.union(&result, &translated);
@@ -1378,7 +1477,7 @@ impl EGraph {
                     }
                 }
                 Node::Atom(name) => Term::Atom(*name),
-                Node::App(op, children) => {
+                Node::FOApp(op, children) => {
                     let mut terms = Vec::with_capacity(children.len());
                     let mut cyclic = false;
                     for child in children {
@@ -1394,15 +1493,30 @@ impl EGraph {
                     if cyclic {
                         continue;
                     }
-                    Term::App(*op, terms)
+                    Term::FOApp(*op, terms)
                 }
-                Node::Lam(body) => {
+                Node::HOApp(function, argument) => {
+                    let function = function.weaken(&by);
+                    let argument = argument.weaken(&by);
+                    let Some(function) =
+                        self.extract_rec(&function, root_scope, memo, active_raw, cost)
+                    else {
+                        continue;
+                    };
+                    let Some(argument) =
+                        self.extract_rec(&argument, root_scope, memo, active_raw, cost)
+                    else {
+                        continue;
+                    };
+                    Term::HOApp(Box::new(function), Box::new(argument))
+                }
+                Node::Binder(op, body) => {
                     let body = body.weaken(&by.append(true));
                     let Some(body) = self.extract_rec(&body, root_scope, memo, active_raw, cost)
                     else {
                         continue;
                     };
-                    Term::Lam(Box::new(body))
+                    Term::Binder(*op, Box::new(body))
                 }
             };
             let candidate_cost = cost(&candidate);
@@ -1513,9 +1627,9 @@ impl EGraph {
                     }
                 }
             }
-            Pattern::App(op, args) => {
+            Pattern::FOApp(op, args) => {
                 for (node, by) in self.nodes_in_class(target, mode) {
-                    let Node::App(head, children) = node else {
+                    let Node::FOApp(head, children) = node else {
                         continue;
                     };
                     if head != op || children.len() != args.len() {
@@ -1536,9 +1650,42 @@ impl EGraph {
                     out.extend(partial);
                 }
             }
-            Pattern::Lam(body_pattern) => {
+            Pattern::HOApp(function_pattern, argument_pattern) => {
                 for (node, by) in self.nodes_in_class(target, mode) {
-                    let Node::Lam(body) = node else { continue };
+                    let Node::HOApp(function, argument) = node else {
+                        continue;
+                    };
+                    let function = function.weaken(&by);
+                    let argument = argument.weaken(&by);
+                    let mut functions = MatchResults::new();
+                    self.ematch_rec(
+                        function_pattern,
+                        &function,
+                        subst.clone(),
+                        mode,
+                        top_ctx,
+                        &mut functions,
+                    );
+                    for function_subst in functions {
+                        self.ematch_rec(
+                            argument_pattern,
+                            &argument,
+                            function_subst,
+                            mode,
+                            top_ctx,
+                            out,
+                        );
+                    }
+                }
+            }
+            Pattern::Binder(op, body_pattern) => {
+                for (node, by) in self.nodes_in_class(target, mode) {
+                    let Node::Binder(node_op, body) = node else {
+                        continue;
+                    };
+                    if node_op != op {
+                        continue;
+                    }
                     let lifted = body.weaken(&by.append(true));
                     self.ematch_rec(body_pattern, &lifted, subst.clone(), mode, top_ctx, out);
                 }
@@ -1620,16 +1767,21 @@ impl EGraph {
                 (index.get() < depth).then(|| self.var(ctx, ctx - 1 - index.get()))
             }
             Pattern::Atom(name) => Some(self.atom_symbol(*name, ctx)),
-            Pattern::App(op, children) => {
+            Pattern::FOApp(op, children) => {
                 let children: Option<SmallVec<[Id; 2]>> = children
                     .iter()
                     .map(|p| self.try_instantiate_rec(p, ctx, top_ctx, subst))
                     .collect();
-                Some(self.app_symbol(*op, children?))
+                Some(self.fo_app_symbol(*op, children?))
             }
-            Pattern::Lam(body) => {
+            Pattern::HOApp(function, argument) => {
+                let function = self.try_instantiate_rec(function, ctx, top_ctx, subst)?;
+                let argument = self.try_instantiate_rec(argument, ctx, top_ctx, subst)?;
+                Some(self.ho_app(function, argument))
+            }
+            Pattern::Binder(op, body) => {
                 let body = self.try_instantiate_rec(body, ctx + 1, top_ctx, subst)?;
-                Some(self.lam(body))
+                Some(self.binder_symbol(*op, body))
             }
             Pattern::Subst(body, replacement) => {
                 let body = self.try_instantiate_rec(body, ctx + 1, top_ctx, subst)?;
@@ -1728,11 +1880,14 @@ impl EGraph {
             match node {
                 Node::Var => "var".into(),
                 Node::Atom(name) => symbol_text(*name),
-                Node::App(op, children) => {
+                Node::FOApp(op, children) => {
                     let children = children.iter().map(Id::show).collect::<Vec<_>>().join(" ");
                     format!("({} {children})", symbol_text(*op))
                 }
-                Node::Lam(body) => format!("(lam {})", body.show()),
+                Node::HOApp(function, argument) => {
+                    format!("[{} {}]", function.show(), argument.show())
+                }
+                Node::Binder(op, body) => format!("(@{} {})", symbol_text(*op), body.show()),
             }
         }
 

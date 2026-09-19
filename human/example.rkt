@@ -16,26 +16,26 @@
 (reset)
 ; We need to explictly announce which variables are allowed in 
 ; TODO: Should I lambda wrap ?a ?
-(insert 0 (lam x x))
-(match (lam x ?a)) ; no matches. 
-(match (lam x (?a x))) ; match ctx 0: a = $0
+(insert 0 (@lam x x))
+(match (@lam x ?a)) ; no matches. 
+(match (@lam x {?a x})) ; match ctx 0: a = $0
 
 (reset)
 ; ok, de bruijn levels. But then shifting something outside a lambda to the top may require shifting?
-(insert 0 (lam x (lam y x))) ; de buijn level
-(match (lam z (?a z)))  ; de bruijn indices
+(insert 0 (@lam x (@lam y x))) ; de buijn level
+(match (@lam z {?a z}))  ; de bruijn indices
 ; but the pattern then is confusing. What is $0 referring to? If we don't know the context we're in
 ; We can't know that $0 refers to the visible lambda.
 
-;(match 0 (lam z (?a $0))) ; non ambgiuos
+;(match 0 (@lam z (?a $0))) ; non ambgiuos
 
-(match (lam z ?a)) ; 
+(match (@lam z ?a)) ; 
 
 (reset)
 
 ; the two inner lambdas should be seen as equal
-(insert 0 (+ (lam x (lam y y)) (lam z z)))
-(match (+ (lam w ?a) ?a)) 
+(insert 0 (+ (@lam x (@lam y y)) (@lam z z)))
+(match (+ (@lam w ?a) ?a)) 
 
 (reset)
 
@@ -79,46 +79,46 @@
 ; has this been worth it?
 
 (reset)
-(insert 0 (lam x x))
-(match (lam x (?a x)))
+(insert 0 (@lam x x))
+(match (@lam x {?a x}))
 
 
 (reset)
-(insert 0 (lam y (lam x x)))
-(match (lam x (lam y (?a x y))))
-(match (lam x (lam y (?a x y))))
+(insert 0 (@lam y (@lam x x)))
+(match (@lam x (@lam y {?a x y})))
+(match (@lam x (@lam y {?a x y})))
 
 
 (reset)
-(insert 0 (lam y (lam x y)))
-(match (lam x (lam y (?a x y))))
-(match (lam x (lam y (?a x y))))
+(insert 0 (@lam y (@lam x y)))
+(match (@lam x (@lam y {?a x y})))
+(match (@lam x (@lam y {?a x y})))
 (print-egraph)
 
 
 
 (reset)
 ; twisted miller is rejected
-;(match (lam x (lam y (pair (?a x y) (?a y x)))))
+;(match (@lam x (@lam y (pair (?a x y) (?a y x)))))
 
-(insert 0 (sum (lam x (sum (lam y (sum (lam z (a x y z))))))))
+(insert 0 (@sum x (@sum y (@sum  z (a x y z)))))
 (rewrite
-  (sum (lam x (sum (lam y (?m x y)))))
-  (sum (lam x (sum (lam y (?m y x))))))
+  (@sum x (@sum y {?m x y}))
+  (@sum x (@sum y {?m y x})))
 
   
 (reset)
 
-(insert 0 (lam x x))
-(rewrite  (lam x (?a x)) (?a (foo biz)))
+(insert 0 (@lam x x))
+(rewrite  (@lam x {?a x}) {?a (foo biz)})
 (run 1)
 (print-egraph)
 
 
 (reset)
-;(insert 0 (lam z (lam x (lam y (y z))))
+;(insert 0 (@lam z (@lam x (@lam y (y z))))
 
- (insert 0 (lam x (lam z x)))
+ (insert 0 (@lam x (@lam z x)))
 ; good this does fail
-(fail (rewrite (lam x (lam y (?a x y))) (lam x (foo (?a x)))))
+(fail (rewrite (@lam x (@lam y {?a x y})) (@lam x (foo {?a x}))))
 ;(run 10)

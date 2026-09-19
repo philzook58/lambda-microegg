@@ -2,8 +2,8 @@
 
 This stays close to Max Willsey's microegg.  The two additions are fat IDs,
 which remember how an e-class's intrinsic context sits in the current context,
-and capture-avoiding substitution.  Scans are preferred over extra indexes so
-that the binding operations remain visible.
+higher-order application, and capture-avoiding substitution. Scans are preferred over
+extra indexes so that the binding operations remain visible.
 """
 
 from dataclasses import dataclass, field
@@ -74,15 +74,17 @@ type Id = FatId
 
 
 class Term:
-    def __sub__(self, other: "Term") -> "App":
+    def __sub__(self, other: "Term") -> "FOApp":
         assert isinstance(other, Term)
-        return App("-", (self, other))
+        return FOApp("-", (self, other))
 
     def size(self) -> int:
         match self:
-            case App(_f, args):
+            case FOApp(_f, args):
                 return 1 + sum(arg.size() for arg in args)
-            case Lam(body):
+            case HOApp(function, argument):
+                return 1 + function.size() + argument.size()
+            case Binder(_op, body):
                 return 1 + body.size()
             case BVar() | Var():
                 return 1
@@ -91,13 +93,20 @@ class Term:
 
 
 @dataclass(frozen=True)
-class App(Term):
+class FOApp(Term):
     f: object
     args: tuple[Term, ...] = ()
 
 
 @dataclass(frozen=True)
-class Lam(Term):
+class HOApp(Term):
+    function: Term
+    argument: Term
+
+
+@dataclass(frozen=True)
+class Binder(Term):
+    op: object
     body: Term
 
 
@@ -127,7 +136,11 @@ type Substitution = dict[str, FatId]
 
 
 _BOUND = object()
-_LAM = object()
+_HO_APP = object()
+
+@dataclass(frozen=True)
+class BinderHead:
+    op: object
 
 
 @dataclass(frozen=True)
@@ -183,7 +196,7 @@ class EGraph:
     def atom(self, f: object, ctx: int = 0) -> FatId:
         return self._add_node(0, Node(f)).weaken(Lift.empty(ctx))
 
-    def app(self, f: object, args: tuple[FatId, ...], ctx: int | None = None) -> FatId:
+    def fo_app(self, f: object, args: tuple[FatId, ...], ctx: int | None = None) -> FatId:
         if not args:
             assert ctx is not None
             return self.atom(f, ctx)
@@ -198,7 +211,10 @@ class EGraph:
         )
         return self._add_node(len(used), Node(f, core)).weaken(Lift(used, ctx))
 
-    def lam(self, body: FatId) -> FatId:
+    def ho_app(self, function: FatId, argument: FatId) -> FatId:
+        return self.fo_app(_HO_APP, (function, argument))
+
+    def binder(self, op: object, body: FatId) -> FatId:
         assert body.ctx > 0
         body = self.find(body)
         outer_ctx = body.ctx - 1
@@ -208,7 +224,7 @@ class EGraph:
             (len(outer),) if uses_bound else ()
         )
         core_body = FatId(body.raw, Lift(core_positions, len(outer) + 1))
-        return self._add_node(len(outer), Node(_LAM, (core_body,))).weaken(
+        return self._add_node(len(outer), Node(BinderHead(op), (core_body,))).weaken(
             Lift(outer, outer_ctx)
         )
 
@@ -224,15 +240,20 @@ class EGraph:
                 return subst[name]
             case BVar(index):
                 return self.bound(ctx, index)
-            case Lam(body):
-                return self.lam(self.add_term(body, subst, ctx + 1))
+            case Binder(op, body):
+                return self.binder(op, self.add_term(body, subst, ctx + 1))
             case Subst(body, replacement):
                 body_id = self.add_term(body, subst, ctx + 1)
                 replacement_id = self.add_term(replacement, subst, ctx)
                 return self.substitute(body_id, ctx, replacement_id)
-            case App(f, args):
+            case FOApp(f, args):
                 ids = tuple(self.add_term(arg, subst, ctx) for arg in args)
-                return self.app(f, ids, ctx)
+                return self.fo_app(f, ids, ctx)
+            case HOApp(function, argument):
+                return self.ho_app(
+                    self.add_term(function, subst, ctx),
+                    self.add_term(argument, subst, ctx),
+                )
             case _:
                 raise ValueError(f"unexpected term: {term}")
 
@@ -299,7 +320,7 @@ class EGraph:
     def _canonical_node(self, node: Node) -> tuple[Lift, Node]:
         if node.f is _BOUND:
             return Lift.identity(1), node
-        if node.f is _LAM:
+        if isinstance(node.f, BinderHead):
             body = self.find(node.args[0])
             outer_ctx = body.ctx - 1
             outer = tuple(i for i in body.lift.positions if i < outer_ctx)
@@ -309,7 +330,10 @@ class EGraph:
             )
             return (
                 Lift(outer, outer_ctx),
-                Node(_LAM, (FatId(body.raw, Lift(core_positions, len(outer) + 1)),)),
+                Node(
+                    node.f,
+                    (FatId(body.raw, Lift(core_positions, len(outer) + 1)),),
+                ),
             )
         if not node.args:
             return Lift.identity(0), node
@@ -364,14 +388,14 @@ class EGraph:
                     for node, by in self.nodes_in_class(id)
                     if node.f is _BOUND and by.positions == (level,)
                 ]
-            case Lam(body_pattern):
+            case Binder(op, body_pattern):
                 results = []
                 for node, by in self.nodes_in_class(id):
-                    if node.f is _LAM:
+                    if isinstance(node.f, BinderHead) and node.f.op == op:
                         body = node.args[0].weaken(by.extend(True))
                         results.extend(self._ematch(body_pattern, body, subst))
                 return results
-            case App(f, args):
+            case FOApp(f, args):
                 results = []
                 for node, by in self.nodes_in_class(id):
                     if node.f != f or len(node.args) != len(args):
@@ -385,6 +409,22 @@ class EGraph:
                             for out in self._ematch(arg_pattern, target, current)
                         ]
                     results.extend(todo)
+                return results
+            case HOApp(function_pattern, argument_pattern):
+                results = []
+                for node, by in self.nodes_in_class(id):
+                    if node.f is not _HO_APP:
+                        continue
+                    functions = self._ematch(
+                        function_pattern, node.args[0].weaken(by), subst
+                    )
+                    results.extend(
+                        out
+                        for current in functions
+                        for out in self._ematch(
+                            argument_pattern, node.args[1].weaken(by), current
+                        )
+                    )
                 return results
             case _:
                 raise ValueError(f"unsupported match pattern: {pattern}")
@@ -452,18 +492,23 @@ class EGraph:
                         body.ctx - 1, body.ctx - 2 - (old_level - (old_level > level))
                     )
                 )
-            elif node.f is _LAM:
+            elif isinstance(node.f, BinderHead):
                 inner = node.args[0].weaken(by.extend(True))
                 under_binder = replacement.in_context(body.ctx)
-                translated = self.lam(
-                    self._substitute(inner, level, under_binder, memo)
+                translated = self.binder(
+                    node.f.op,
+                    self._substitute(inner, level, under_binder, memo),
                 )
             else:
                 args = tuple(
                     self._substitute(arg.weaken(by), level, replacement, memo)
                     for arg in node.args
                 )
-                translated = self.app(node.f, args, body.ctx - 1)
+                translated = (
+                    self.ho_app(*args)
+                    if node.f is _HO_APP
+                    else self.fo_app(node.f, args, body.ctx - 1)
+                )
             self._union(result, translated)
         return self.find(result)
 
@@ -496,13 +541,13 @@ class EGraph:
         for node, by in self.nodes_in_class(id):
             if node.f is _BOUND:
                 candidate: Term = BVar(id.ctx - 1 - by.positions[0])
-            elif node.f is _LAM:
+            elif isinstance(node.f, BinderHead):
                 body = self._extract(
                     node.args[0].weaken(by.extend(True)), memo, active, cost
                 )
                 if body is None:
                     continue
-                candidate = Lam(body)
+                candidate = Binder(node.f.op, body)
             else:
                 args = tuple(
                     self._extract(arg.weaken(by), memo, active, cost)
@@ -510,7 +555,9 @@ class EGraph:
                 )
                 if any(arg is None for arg in args):
                     continue
-                candidate = App(node.f, args)  # type: ignore[arg-type]
+                candidate = (
+                    HOApp(*args) if node.f is _HO_APP else FOApp(node.f, args)
+                )  # type: ignore[arg-type]
             if best is None or cost(candidate) < cost(best):
                 best = candidate
         active.remove(id.raw)
@@ -518,12 +565,12 @@ class EGraph:
         return best
 
 
-def Consts(names: str) -> list[App]:
-    return [App(name) for name in names.split()]
+def Consts(names: str) -> list[FOApp]:
+    return [FOApp(name) for name in names.split()]
 
 
 def Function(name: str):
-    return lambda *args: App(name, args)
+    return lambda *args: FOApp(name, args)
 
 
 def Vars(names: str) -> list[Var]:
@@ -550,27 +597,32 @@ def test_fat_ids_and_substitution():
     pair = Function("pair")
 
     # Only the nearest variable is retained in the term's intrinsic context.
-    term = egraph.add_term(pair(BVar(0), App("constant")), ctx=2)
+    term = egraph.add_term(pair(BVar(0), FOApp("constant")), ctx=2)
     assert term.ctx == 2 and term.lift.positions == (1,)
 
     # [x := fred] x = fred.
-    assert egraph.extract(Subst(BVar(0), App("fred"))) == App("fred")
+    assert egraph.extract(Subst(BVar(0), FOApp("fred"))) == FOApp("fred")
 
     # Substitution under a lambda shifts the free replacement and avoids capture.
-    capture_test = Subst(Lam(BVar(1)), BVar(0))
-    assert egraph.extract(capture_test, ctx=1) == Lam(BVar(1))
+    capture_test = Subst(Binder("lam", BVar(1)), BVar(0))
+    assert egraph.extract(capture_test, ctx=1) == Binder("lam", BVar(1))
 
     # An unused variable is deleted by changing the fat ID alone.
-    assert egraph.extract(Subst(App("constant"), App("ignored"))) == App("constant")
+    assert egraph.extract(Subst(FOApp("constant"), FOApp("ignored"))) == FOApp("constant")
 
     # A recursive class may recur under a binder with a larger ambient context.
     cyclic = EGraph()
     x = cyclic.bound(1, 0)
-    cyclic._union(x, cyclic.lam(x.in_context(2)))
+    cyclic._union(x, cyclic.binder("lam", x.in_context(2)))
     cyclic.rebuild()
     fred = cyclic.atom("fred")
-    assert cyclic.extract(Subst(BVar(0), App("fred"))) == App("fred")
+    assert cyclic.extract(Subst(BVar(0), FOApp("fred"))) == FOApp("fred")
     assert cyclic.find(cyclic.substitute(x, 0, fred)) == cyclic.find(fred)
+
+    # Higher-order and first-order applications deliberately remain distinct.
+    binary = HOApp(HOApp(FOApp("f"), FOApp("x")), FOApp("y"))
+    assert egraph.extract(binary) == binary
+    assert not egraph.is_eq(binary, FOApp("f", (FOApp("x"), FOApp("y"))))
 
 
 if __name__ == "__main__":

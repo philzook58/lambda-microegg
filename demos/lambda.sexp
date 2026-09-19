@@ -1,8 +1,14 @@
 (echo "Beta reduction through a Miller pattern")
 
-(insert (app (lam x (pair x x)) z))
+(insert [(@lam x (pair x x)) z])
+
+; The beta rule. It isn't quite a built in, since @ and {} are generic binder constructs.
+; But it is pretty close to being built in.
 (rewrite
-  (app (lam x (?body x)) ?arg)
-  (#subst (?body x) x ?arg))
+  [(@lam x {?body x}) ?arg]
+  {?body ?arg})
+
 (run 10)
-(extract (app (lam x (pair x x)) z))
+
+(extract [(@lam x (pair x x)) z])
+(guard [(@lam x (pair x x)) z] (pair z z))

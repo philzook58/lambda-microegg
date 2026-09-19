@@ -1,16 +1,70 @@
 use lambda_microegg::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Delimiter {
+    Paren,
+    Bracket,
+    Brace,
+}
+
+impl Delimiter {
+    fn open(self) -> char {
+        match self {
+            Self::Paren => '(',
+            Self::Bracket => '[',
+            Self::Brace => '{',
+        }
+    }
+    fn close(self) -> char {
+        match self {
+            Self::Paren => ')',
+            Self::Bracket => ']',
+            Self::Brace => '}',
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Sexp {
-    Atom(String),
-    Quoted(String),
-    List(Vec<Sexp>),
+enum SyntaxKind {
+    Atom {
+        text: String,
+        quoted: bool,
+    },
+    Group {
+        delimiter: Delimiter,
+        items: Vec<Syntax>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Syntax {
+    kind: SyntaxKind,
+    location: Location,
+}
+
+impl Syntax {
+    fn locate(&self, error: String) -> String {
+        if error.starts_with("line ") {
+            error
+        } else {
+            self.location.error(error)
+        }
+    }
+    fn group(&self, delimiter: Delimiter) -> Option<&[Syntax]> {
+        match &self.kind {
+            SyntaxKind::Group {
+                delimiter: found,
+                items,
+            } if *found == delimiter => Some(items),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Token {
-    Left(Location),
-    Right(Location),
+    Left(Delimiter, Location),
+    Right(Delimiter, Location),
     Atom(String, bool, Location),
 }
 
@@ -26,7 +80,7 @@ impl Location {
     }
 }
 
-fn lex_sexps(input: &str) -> Result<Vec<Token>, String> {
+fn lex(input: &str) -> Result<Vec<Token>, String> {
     let mut chars = input.chars().peekable();
     let mut tokens = vec![];
     let mut line = 1;
@@ -52,14 +106,26 @@ fn lex_sexps(input: &str) -> Result<Vec<Token>, String> {
                     column += 1;
                 }
             }
-            '(' => {
+            '(' | '[' | '{' => {
                 chars.next();
-                tokens.push(Token::Left(Location { line, column }));
+                let delimiter = match ch {
+                    '(' => Delimiter::Paren,
+                    '[' => Delimiter::Bracket,
+                    '{' => Delimiter::Brace,
+                    _ => unreachable!(),
+                };
+                tokens.push(Token::Left(delimiter, Location { line, column }));
                 column += 1;
             }
-            ')' => {
+            ')' | ']' | '}' => {
                 chars.next();
-                tokens.push(Token::Right(Location { line, column }));
+                let delimiter = match ch {
+                    ')' => Delimiter::Paren,
+                    ']' => Delimiter::Bracket,
+                    '}' => Delimiter::Brace,
+                    _ => unreachable!(),
+                };
+                tokens.push(Token::Right(delimiter, Location { line, column }));
                 column += 1;
             }
             '"' => {
@@ -119,7 +185,7 @@ fn lex_sexps(input: &str) -> Result<Vec<Token>, String> {
                 let start = Location { line, column };
                 let mut atom = String::new();
                 while let Some(&c) = chars.peek() {
-                    if c.is_whitespace() || matches!(c, '(' | ')' | ';') {
+                    if c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ';') {
                         break;
                     }
                     atom.push(c);
@@ -133,59 +199,75 @@ fn lex_sexps(input: &str) -> Result<Vec<Token>, String> {
     Ok(tokens)
 }
 
-fn parse_sexps_with_locations(input: &str) -> Result<Vec<(Location, Sexp)>, String> {
-    fn one(tokens: &[Token], cursor: &mut usize) -> Result<Sexp, String> {
+fn parse_syntax(input: &str) -> Result<Vec<Syntax>, String> {
+    fn one(tokens: &[Token], cursor: &mut usize) -> Result<Syntax, String> {
         match tokens.get(*cursor) {
-            Some(Token::Atom(atom, quoted, _)) => {
+            Some(Token::Atom(atom, quoted, location)) => {
+                let location = *location;
                 *cursor += 1;
-                Ok(if *quoted {
-                    Sexp::Quoted(atom.clone())
-                } else {
-                    Sexp::Atom(atom.clone())
+                Ok(Syntax {
+                    kind: SyntaxKind::Atom {
+                        text: atom.clone(),
+                        quoted: *quoted,
+                    },
+                    location,
                 })
             }
-            Some(Token::Left(location)) => {
+            Some(Token::Left(delimiter, location)) => {
+                let delimiter = *delimiter;
                 let location = *location;
                 *cursor += 1;
                 let mut items = vec![];
-                while !matches!(tokens.get(*cursor), Some(Token::Right(_))) {
-                    if *cursor == tokens.len() {
-                        return Err(location.error("unclosed '('"));
+                loop {
+                    match tokens.get(*cursor) {
+                        Some(Token::Right(found, _)) if *found == delimiter => break,
+                        Some(Token::Right(found, found_location)) => {
+                            return Err(found_location.error(format_args!(
+                                "expected '{}', found '{}'",
+                                delimiter.close(),
+                                found.close()
+                            )));
+                        }
+                        None => {
+                            return Err(
+                                location.error(format_args!("unclosed '{}'", delimiter.open()))
+                            );
+                        }
+                        _ => items.push(one(tokens, cursor)?),
                     }
-                    items.push(one(tokens, cursor)?);
                 }
                 *cursor += 1;
-                Ok(Sexp::List(items))
+                Ok(Syntax {
+                    kind: SyntaxKind::Group { delimiter, items },
+                    location,
+                })
             }
-            Some(Token::Right(location)) => Err(location.error("unexpected ')'")),
+            Some(Token::Right(close, location)) => {
+                Err(location.error(format_args!("unexpected '{}'", close.close())))
+            }
             None => Err(Location { line: 1, column: 1 }.error("unexpected end of input")),
         }
     }
 
-    let tokens = lex_sexps(input)?;
+    let tokens = lex(input)?;
     let mut cursor = 0;
     let mut forms = vec![];
     while cursor < tokens.len() {
-        let location = match &tokens[cursor] {
-            Token::Left(location) | Token::Right(location) | Token::Atom(_, _, location) => {
-                *location
-            }
-        };
-        forms.push((location, one(&tokens, &mut cursor)?));
+        forms.push(one(&tokens, &mut cursor)?);
     }
     Ok(forms)
 }
 
 #[cfg(test)]
 #[allow(dead_code)] // Used by the integration-test crate, not the binary's test harness.
-pub fn parse_sexps(input: &str) -> Result<Vec<Sexp>, String> {
-    parse_sexps_with_locations(input).map(|forms| forms.into_iter().map(|(_, form)| form).collect())
+pub fn parse_forms(input: &str) -> Result<Vec<Syntax>, String> {
+    parse_syntax(input)
 }
 
-fn atom_of(sexp: &Sexp) -> Result<&str, String> {
-    match sexp {
-        Sexp::Atom(atom) | Sexp::Quoted(atom) => Ok(atom),
-        Sexp::List(_) => Err("expected an atom".into()),
+fn atom_of(syntax: &Syntax) -> Result<&str, String> {
+    match &syntax.kind {
+        SyntaxKind::Atom { text, .. } => Ok(text),
+        SyntaxKind::Group { .. } => Err(syntax.location.error("expected an atom")),
     }
 }
 
@@ -209,48 +291,65 @@ fn resolve_binder(atom: &str, binders: &[String]) -> Option<(usize, usize)> {
     Some((binders.len() - 1 - slot, slot))
 }
 
-fn binder_name(sexp: &Sexp) -> Result<&str, String> {
-    let Sexp::Atom(name) = sexp else {
-        return Err("binder must be an unquoted name".into());
+fn binder_name(syntax: &Syntax) -> Result<&str, String> {
+    let SyntaxKind::Atom {
+        text: name,
+        quoted: false,
+    } = &syntax.kind
+    else {
+        return Err(syntax.location.error("binder must be an unquoted name"));
     };
     let has_namespace_index = name
         .rsplit_once('@')
         .is_some_and(|(_, suffix)| suffix.parse::<usize>().is_ok());
     if name.is_empty() || name.starts_with(['?', '$']) || has_namespace_index {
-        return Err(format!("invalid lambda binder '{name}'"));
+        return Err(syntax
+            .location
+            .error(format!("invalid binder name '{name}'")));
     }
     Ok(name)
 }
 
-fn subst_binder_name(sexp: &Sexp) -> Result<&str, String> {
-    if let Sexp::Atom(name) = sexp
+fn subst_binder_name(syntax: &Syntax) -> Result<&str, String> {
+    if let SyntaxKind::Atom {
+        text: name,
+        quoted: false,
+    } = &syntax.kind
         && name
             .strip_prefix('$')
             .is_some_and(|index| index.parse::<usize>().is_ok())
     {
         return Ok(name);
     }
-    binder_name(sexp)
+    binder_name(syntax)
 }
 
-pub fn add_sexp_term(eg: &mut EGraph, sexp: &Sexp, ctx: usize) -> Result<Id, String> {
+pub fn add_syntax_term(eg: &mut EGraph, syntax: &Syntax, ctx: usize) -> Result<Id, String> {
     fn go(
         eg: &mut EGraph,
-        sexp: &Sexp,
+        syntax: &Syntax,
         outer_ctx: usize,
         binders: &mut Vec<String>,
     ) -> Result<Id, String> {
         let ctx = outer_ctx + binders.len();
         if ctx > 7 {
-            return Err("packed IDs support at most 7 context variables".into());
+            return Err(syntax
+                .location
+                .error("packed IDs support at most 7 context variables"));
         }
-        match sexp {
-            Sexp::Quoted(atom) => Ok(eg.atom(atom, ctx)),
-            Sexp::Atom(atom) if resolve_binder(atom, binders).is_some() => {
+        let result = match &syntax.kind {
+            SyntaxKind::Atom { text: atom, quoted } if *quoted => Ok(eg.atom(atom, ctx)),
+            SyntaxKind::Atom {
+                text: atom,
+                quoted: false,
+            } if resolve_binder(atom, binders).is_some() => {
                 let (_, slot) = resolve_binder(atom, binders).unwrap();
                 Ok(eg.var(ctx, outer_ctx + slot))
             }
-            Sexp::Atom(atom) if atom.starts_with('$') => {
+            SyntaxKind::Atom {
+                text: atom,
+                quoted: false,
+            } if atom.starts_with('$') => {
                 let index = atom[1..]
                     .parse::<usize>()
                     .map_err(|_| format!("invalid outer-context variable '{atom}'"))?;
@@ -261,11 +360,37 @@ pub fn add_sexp_term(eg: &mut EGraph, sexp: &Sexp, ctx: usize) -> Result<Id, Str
                 }
                 Ok(eg.var(ctx, index))
             }
-            Sexp::Atom(atom) if atom.starts_with('?') => {
-                Err(format!("pattern variable '{atom}' used in a term"))
+            SyntaxKind::Atom {
+                text: atom,
+                quoted: false,
+            } if atom.starts_with('?') => Err(format!("pattern variable '{atom}' used in a term")),
+            SyntaxKind::Atom { text: atom, .. } => Ok(eg.atom(atom, ctx)),
+            SyntaxKind::Group {
+                delimiter: Delimiter::Brace,
+                ..
+            } => Err("metavariable occurrence used in a term".into()),
+            SyntaxKind::Group {
+                delimiter: Delimiter::Bracket,
+                items,
+            } => {
+                if items.len() < 2 {
+                    return Err(
+                        "higher-order application '[FUNCTION ARGUMENT ...]' needs an argument"
+                            .into(),
+                    );
+                }
+                let mut terms = items.iter();
+                let mut application = go(eg, terms.next().unwrap(), outer_ctx, binders)?;
+                for argument in terms {
+                    let argument = go(eg, argument, outer_ctx, binders)?;
+                    application = eg.ho_app(application, argument);
+                }
+                Ok(application)
             }
-            Sexp::Atom(atom) => Ok(eg.atom(atom, ctx)),
-            Sexp::List(items) => {
+            SyntaxKind::Group {
+                delimiter: Delimiter::Paren,
+                items,
+            } => {
                 let Some(head) = items.first() else {
                     return Err("empty term list".into());
                 };
@@ -278,18 +403,7 @@ pub fn add_sexp_term(eg: &mut EGraph, sexp: &Sexp, ctx: usize) -> Result<Id, Str
                     binders.push(name);
                     let body = go(eg, &items[2], outer_ctx, binders);
                     binders.pop();
-                    let body = eg.lam(body?);
-                    return Ok(eg.app(op, vec![body]));
-                }
-                if op == "lam" {
-                    if items.len() != 3 {
-                        return Err("(lam NAME BODY) takes a binder name and body".into());
-                    }
-                    let name = binder_name(&items[1])?.to_owned();
-                    binders.push(name);
-                    let body = go(eg, &items[2], outer_ctx, binders);
-                    binders.pop();
-                    return Ok(eg.lam(body?));
+                    return Ok(eg.binder(op, body?));
                 }
                 if op == "#subst" {
                     if items.len() != 4 {
@@ -313,162 +427,211 @@ pub fn add_sexp_term(eg: &mut EGraph, sexp: &Sexp, ctx: usize) -> Result<Id, Str
                     .iter()
                     .map(|item| go(eg, item, outer_ctx, binders))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(eg.app(op, children))
+                Ok(eg.fo_app(op, children))
             }
-        }
+        };
+        result.map_err(|error| syntax.locate(error))
     }
 
     if ctx > 7 {
         return Err("packed IDs support at most 7 context variables".into());
     }
-    go(eg, sexp, ctx, &mut vec![])
+    go(eg, syntax, ctx, &mut vec![])
 }
 
-pub fn sexp_pattern(sexp: &Sexp) -> Result<Pattern, String> {
-    fn go(sexp: &Sexp, binders: &mut Vec<String>) -> Result<Pattern, String> {
-        match sexp {
-            Sexp::Quoted(atom) => Ok(Pattern::atom(atom)),
-            Sexp::Atom(atom) if atom.starts_with('?') && atom.len() > 1 => {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PatternMode {
+    MatchLhs,
+    Template,
+}
+
+fn parse_pattern(syntax: &Syntax, mode: PatternMode) -> Result<Pattern, String> {
+    fn go(
+        syntax: &Syntax,
+        mode: PatternMode,
+        binders: &mut Vec<String>,
+    ) -> Result<Pattern, String> {
+        let result = match &syntax.kind {
+            SyntaxKind::Atom { text: atom, quoted } if *quoted => Ok(Pattern::atom(atom)),
+            SyntaxKind::Atom {
+                text: atom,
+                quoted: false,
+            } if atom.starts_with('?') && atom.len() > 1 => {
                 Ok(Pattern::MetaVar(atom.as_str().into(), vec![]))
             }
-            Sexp::Atom(atom) if resolve_binder(atom, binders).is_some() => {
+            SyntaxKind::Atom {
+                text: atom,
+                quoted: false,
+            } if resolve_binder(atom, binders).is_some() => {
                 let (index, _) = resolve_binder(atom, binders).unwrap();
                 Ok(Pattern::BVar(index.into()))
             }
-            Sexp::Atom(atom) if atom.starts_with('$') => {
+            SyntaxKind::Atom {
+                text: atom,
+                quoted: false,
+            } if atom.starts_with('$') => {
                 let index = atom[1..]
                     .parse::<usize>()
                     .map_err(|_| format!("invalid outer-context variable '{atom}'"))?;
                 Ok(Pattern::FVar(index.into()))
             }
-            Sexp::Atom(atom) => Ok(Pattern::atom(atom)),
-            Sexp::List(items) => {
+            SyntaxKind::Atom { text: atom, .. } => Ok(Pattern::atom(atom)),
+            SyntaxKind::Group {
+                delimiter: Delimiter::Brace,
+                items,
+            } => {
+                let Some(name_syntax) = items.first() else {
+                    return Err(syntax
+                        .location
+                        .error("metavariable occurrence must start with ?NAME"));
+                };
+                let name = atom_of(name_syntax)?;
+                if !matches!(&name_syntax.kind, SyntaxKind::Atom { quoted: false, .. })
+                    || !name.starts_with('?')
+                    || name.len() == 1
+                {
+                    return Err(syntax
+                        .location
+                        .error("metavariable occurrence must start with ?NAME"));
+                }
+                if mode == PatternMode::MatchLhs {
+                    let mut resolved = Vec::with_capacity(items.len() - 1);
+                    for argument in &items[1..] {
+                        let SyntaxKind::Atom {
+                            text,
+                            quoted: false,
+                        } = &argument.kind
+                        else {
+                            return Err(argument.location.error(format!(
+                                "match metavariable '{name}' may only be applied to bound variables"
+                            )));
+                        };
+                        let Some((_, slot)) = resolve_binder(text, binders) else {
+                            return Err(argument.location.error(format!(
+                                "match metavariable '{name}' may only be applied to bound variables"
+                            )));
+                        };
+                        if resolved.iter().any(|(previous, _)| *previous == slot) {
+                            return Err(argument.location.error(format!(
+                                "Miller metavariable '{name}' repeats a pattern binder"
+                            )));
+                        }
+                        resolved.push((slot, text));
+                    }
+                    if !resolved.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+                        resolved.sort_unstable_by_key(|(slot, _)| *slot);
+                        let correct = resolved
+                            .iter()
+                            .map(|(_, name)| name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        return Err(syntax.location.error(format!(
+                            "Miller metavariable '{name}' arguments are out of order; write {{{name} {correct}}} on the match left-hand side, then permute its arguments on the rewrite right-hand side if needed"
+                        )));
+                    }
+                }
+                let arguments = items[1..]
+                    .iter()
+                    .map(|argument| go(argument, mode, binders))
+                    .collect::<Result<_, _>>()?;
+                Ok(Pattern::MetaVar(name.into(), arguments))
+            }
+            SyntaxKind::Group {
+                delimiter: Delimiter::Bracket,
+                items,
+            } => {
+                if items.len() < 2 {
+                    return Err(syntax.location.error(
+                        "higher-order application '[FUNCTION ARGUMENT ...]' needs an argument",
+                    ));
+                }
+                let mut terms = items.iter();
+                let mut application = go(terms.next().unwrap(), mode, binders)?;
+                for argument in terms {
+                    application = Pattern::ho_app(application, go(argument, mode, binders)?);
+                }
+                Ok(application)
+            }
+            SyntaxKind::Group {
+                delimiter: Delimiter::Paren,
+                items,
+            } => {
                 let Some(head) = items.first() else {
-                    return Err("empty pattern list".into());
+                    return Err(syntax.location.error("empty pattern list"));
                 };
                 let op = atom_of(head)?;
-                if matches!(head, Sexp::Atom(_)) && op.starts_with('?') && op.len() > 1 {
-                    let arguments = items[1..]
-                        .iter()
-                        .map(|argument| go(argument, binders))
-                        .collect::<Result<_, _>>()?;
-                    return Ok(Pattern::MetaVar(op.into(), arguments));
+                if op.starts_with('?') {
+                    return Err(head.location.error(format!(
+                        "metavariable '{op}' is not allowed in first-order head position; use {{{op} ...}} for a Miller metavariable occurrence or [{op} ...] for a curried higher-order application pattern"
+                    )));
                 }
                 if let Some(op) = op.strip_prefix('@') {
                     if op.is_empty() || items.len() != 3 {
-                        return Err("(@OP NAME PATTERN) takes a binder name and body".into());
+                        return Err(syntax
+                            .location
+                            .error("(@OP NAME PATTERN) takes a binder name and body"));
                     }
                     let name = binder_name(&items[1])?.to_owned();
                     binders.push(name);
-                    let body = go(&items[2], binders);
+                    let body = go(&items[2], mode, binders);
                     binders.pop();
-                    return Ok(Pattern::app(op, vec![Pattern::Lam(Box::new(body?))]));
-                }
-                if op == "lam" {
-                    if items.len() != 3 {
-                        return Err("(lam NAME PATTERN) takes a binder name and body".into());
-                    }
-                    let name = binder_name(&items[1])?.to_owned();
-                    binders.push(name);
-                    let body = go(&items[2], binders);
-                    binders.pop();
-                    return Ok(Pattern::Lam(Box::new(body?)));
+                    return Ok(Pattern::binder(op, body?));
                 }
                 if op == "#subst" {
                     if items.len() != 4 {
-                        return Err(
-                            "(#subst BODY NAME REPLACEMENT) takes a body, binder, and replacement"
-                                .into(),
-                        );
+                        return Err(syntax.location.error(
+                            "(#subst BODY NAME REPLACEMENT) takes a body, binder, and replacement",
+                        ));
                     }
                     let name = subst_binder_name(&items[2])?.to_owned();
                     binders.push(name);
-                    let body = go(&items[1], binders);
+                    let body = go(&items[1], mode, binders);
                     binders.pop();
-                    let replacement = go(&items[3], binders)?;
+                    let replacement = go(&items[3], mode, binders)?;
                     return Ok(Pattern::Subst(Box::new(body?), Box::new(replacement)));
                 }
                 if items.len() < 2 {
-                    return Err(format!("pattern '({op} ...)' needs an argument"));
+                    return Err(syntax
+                        .location
+                        .error(format!("pattern '({op} ...)' needs an argument")));
                 }
                 let children = items[1..]
                     .iter()
-                    .map(|item| go(item, binders))
+                    .map(|item| go(item, mode, binders))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(Pattern::app(op, children))
+                Ok(Pattern::fo_app(op, children))
             }
-        }
+        };
+        result.map_err(|error| syntax.locate(error))
     }
-    go(sexp, &mut vec![])
+    go(syntax, mode, &mut vec![])
 }
 
-pub fn sexp_match_pattern(sexp: &Sexp) -> Result<Pattern, String> {
-    fn check_order(sexp: &Sexp, binders: &mut Vec<String>) -> Result<(), String> {
-        let Sexp::List(items) = sexp else {
-            return Ok(());
-        };
-        let Some(Sexp::Atom(head)) = items.first() else {
-            return Ok(());
-        };
-        if head.starts_with('?') && head.len() > 1 {
-            let resolved: Option<Vec<_>> = items[1..]
-                .iter()
-                .map(|argument| {
-                    let Sexp::Atom(name) = argument else {
-                        return None;
-                    };
-                    let (_, slot) = resolve_binder(name, binders)?;
-                    Some((slot, name))
-                })
-                .collect();
-            if let Some(mut arguments) = resolved
-                && !arguments.iter().enumerate().any(|(i, (slot, _))| {
-                    arguments[..i].iter().any(|(previous, _)| previous == slot)
-                })
-                && !arguments.windows(2).all(|pair| pair[0].0 < pair[1].0)
-            {
-                arguments.sort_unstable_by_key(|(slot, _)| *slot);
-                let correct = arguments
-                    .iter()
-                    .map(|(_, name)| name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                return Err(format!(
-                    "Miller metavariable '{head}' arguments are out of order; write ({head} {correct}) on the match left-hand side, then permute its arguments on the rewrite right-hand side if needed"
-                ));
-            }
-            return Ok(());
-        }
-        if (head == "lam" || head.starts_with('@'))
-            && items.len() == 3
-            && let Ok(name) = binder_name(&items[1])
-        {
-            binders.push(name.to_owned());
-            let result = check_order(&items[2], binders);
-            binders.pop();
-            return result;
-        }
-        for child in &items[1..] {
-            check_order(child, binders)?;
-        }
-        Ok(())
-    }
+pub fn syntax_pattern(syntax: &Syntax) -> Result<Pattern, String> {
+    parse_pattern(syntax, PatternMode::Template)
+}
 
-    check_order(sexp, &mut vec![])?;
-    let pattern = sexp_pattern(sexp)?;
-    pattern.validate_match_pattern()?;
+pub fn syntax_match_pattern(syntax: &Syntax) -> Result<Pattern, String> {
+    let pattern = parse_pattern(syntax, PatternMode::MatchLhs)?;
+    pattern
+        .validate_match_pattern()
+        .map_err(|error| syntax.locate(error))?;
     Ok(pattern)
 }
 
-fn command_term<'a>(items: &'a [Sexp], command: &str) -> Result<(usize, &'a Sexp), String> {
+fn command_term<'a>(items: &'a [Syntax], command: &str) -> Result<(usize, &'a Syntax), String> {
     match items {
         [_, term] => Ok((0, term)),
         [_, context, term] => {
-            let context = atom_of(context)?
-                .parse::<usize>()
-                .map_err(|_| format!("{command} context must be a nonnegative integer"))?;
+            let context = atom_of(context)?.parse::<usize>().map_err(|_| {
+                context
+                    .location
+                    .error(format!("{command} context must be a nonnegative integer"))
+            })?;
             if context > 7 {
-                return Err("packed IDs support at most 7 context variables".into());
+                return Err(items[1]
+                    .location
+                    .error("packed IDs support at most 7 context variables"));
             }
             Ok((context, term))
         }
@@ -477,17 +640,21 @@ fn command_term<'a>(items: &'a [Sexp], command: &str) -> Result<(usize, &'a Sexp
 }
 
 fn command_terms<'a>(
-    items: &'a [Sexp],
+    items: &'a [Syntax],
     command: &str,
-) -> Result<(usize, &'a Sexp, &'a Sexp), String> {
+) -> Result<(usize, &'a Syntax, &'a Syntax), String> {
     match items {
         [_, left, right] => Ok((0, left, right)),
         [_, context, left, right] => {
-            let context = atom_of(context)?
-                .parse::<usize>()
-                .map_err(|_| format!("{command} context must be a nonnegative integer"))?;
+            let context = atom_of(context)?.parse::<usize>().map_err(|_| {
+                context
+                    .location
+                    .error(format!("{command} context must be a nonnegative integer"))
+            })?;
             if context > 7 {
-                return Err("packed IDs support at most 7 context variables".into());
+                return Err(items[1]
+                    .location
+                    .error("packed IDs support at most 7 context variables"));
             }
             Ok((context, left, right))
         }
@@ -502,14 +669,22 @@ fn comment_lines(text: &str) -> String {
         .join("\n")
 }
 
+fn in_context(context: usize, value: impl std::fmt::Display) -> String {
+    if context == 0 {
+        value.to_string()
+    } else {
+        format!("ctx{context} |-> {value}")
+    }
+}
+
 fn run_command(
-    form: &Sexp,
+    form: &Syntax,
     command_index: usize,
     eg: &mut EGraph,
     rules: &mut Vec<Rewrite>,
     output: &mut Vec<String>,
 ) -> Result<(), String> {
-    let Sexp::List(items) = form else {
+    let Some(items) = form.group(Delimiter::Paren) else {
         return Err(format!("command {} must be a list", command_index + 1));
     };
     let Some(head) = items.first() else {
@@ -525,13 +700,13 @@ fn run_command(
         }
         "insert" if matches!(items.len(), 2 | 3) => {
             let (ctx, term) = command_term(items, "insert")?;
-            let id = add_sexp_term(eg, term, ctx)?;
+            let id = add_syntax_term(eg, term, ctx)?;
             output.push(format!("inserted {}", id.show()));
         }
         "union" if matches!(items.len(), 3 | 4) => {
             let (ctx, left, right) = command_terms(items, "union")?;
-            let left = add_sexp_term(eg, left, ctx)?;
-            let right = add_sexp_term(eg, right, ctx)?;
+            let left = add_syntax_term(eg, left, ctx)?;
+            let right = add_syntax_term(eg, right, ctx)?;
             let changed = eg.union(&left, &right);
             eg.rebuild();
             output.push(if changed {
@@ -542,8 +717,8 @@ fn run_command(
         }
         "guard" if matches!(items.len(), 3 | 4) => {
             let (ctx, left, right) = command_terms(items, "guard")?;
-            let left = add_sexp_term(eg, left, ctx)?;
-            let right = add_sexp_term(eg, right, ctx)?;
+            let left = add_syntax_term(eg, left, ctx)?;
+            let right = add_syntax_term(eg, right, ctx)?;
             eg.rebuild();
             if !eg.equivalent(&left, &right) {
                 let left = eg.extract(&left).map_or_else(
@@ -560,13 +735,13 @@ fn run_command(
         }
         "rewrite" if items.len() == 3 => {
             rules.push(Rewrite::new(
-                sexp_match_pattern(&items[1])?,
-                sexp_pattern(&items[2])?,
+                syntax_match_pattern(&items[1])?,
+                syntax_pattern(&items[2])?,
             )?);
             output.push(format!("rewrite {} added", rules.len()));
         }
         "match" if items.len() == 2 => {
-            let pattern = sexp_match_pattern(&items[1])?;
+            let pattern = syntax_match_pattern(&items[1])?;
             let matches = eg.search(&pattern);
             if matches.is_empty() {
                 output.push("no matches".into());
@@ -578,33 +753,31 @@ fn run_command(
                     .collect();
                 let mut rendered = Vec::with_capacity(bindings.len());
                 for (name, binding) in bindings {
-                    let arity = binding
+                    let extra_context = binding
                         .ctx()
                         .checked_sub(context)
                         .ok_or_else(|| format!("binding {name} has an invalid context"))?;
                     let term = eg
                         .extract(&binding)
                         .ok_or_else(|| format!("binding {name} has no finite extractable term"))?;
-                    let parameters: Vec<_> = (0..arity).map(|index| format!("x{index}")).collect();
-                    let body = term.display_with_root_binders(&parameters).to_string();
-                    let value = if parameters.is_empty() {
-                        body
-                    } else {
-                        format!("mlam {} {body}", parameters.join(" "))
-                    };
-                    rendered.push(format!("{name} = {value}"));
+                    rendered.push(format!(
+                        "{name} = {}",
+                        in_context(extra_context, term.display())
+                    ));
                 }
                 output.push(format!(
-                    "match {} ctx{context} |-> {{{}}}",
+                    "match {}: {}",
                     index + 1,
-                    rendered.join(", ")
+                    in_context(context, format_args!("{{{}}}", rendered.join(", ")))
                 ));
             }
         }
         "run" if items.len() == 2 => {
-            let limit = atom_of(&items[1])?
-                .parse::<usize>()
-                .map_err(|_| "run limit must be a nonnegative integer".to_string())?;
+            let limit = atom_of(&items[1])?.parse::<usize>().map_err(|_| {
+                items[1]
+                    .location
+                    .error("run limit must be a nonnegative integer")
+            })?;
             let stats = eg.run(rules, limit);
             output.push(format!(
                         "ran {} rounds, {} unions: {} classes, {} e-nodes\nmatch {:?}, apply {:?}, rebuild {:?}",
@@ -638,7 +811,7 @@ fn run_command(
         "print-egraph" if items.len() == 1 => output.push(eg.dump()),
         "extract" if matches!(items.len(), 2 | 3) => {
             let (ctx, term) = command_term(items, "extract")?;
-            let id = add_sexp_term(eg, term, ctx)?;
+            let id = add_syntax_term(eg, term, ctx)?;
             let term = eg
                 .extract(&id)
                 .ok_or_else(|| "class has no finite extractable term".to_string())?;
@@ -658,15 +831,13 @@ fn run_command(
     Ok(())
 }
 
-pub fn run_sexp_script(input: &str) -> Result<Vec<String>, String> {
+pub fn run_script(input: &str) -> Result<Vec<String>, String> {
     let mut eg = EGraph::new();
     let mut rules = vec![];
     let mut output = vec![];
-    for (command_index, (location, form)) in
-        parse_sexps_with_locations(input)?.into_iter().enumerate()
-    {
+    for (command_index, form) in parse_syntax(input)?.into_iter().enumerate() {
         run_command(&form, command_index, &mut eg, &mut rules, &mut output)
-            .map_err(|error| location.error(error))?;
+            .map_err(|error| form.locate(error))?;
     }
     Ok(output)
 }

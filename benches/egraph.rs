@@ -9,10 +9,10 @@ fn rewrite(lhs: Pattern, rhs: Pattern) -> Rewrite {
 
 fn beta_rule() -> Rewrite {
     rewrite(
-        Pattern::app(
+        Pattern::fo_app(
             "app",
             vec![
-                Pattern::Lam(Box::new(Pattern::miller("?body", vec![0]))),
+                Pattern::binder("lam", Pattern::miller("?body", vec![0])),
                 Pattern::meta("?arg"),
             ],
         ),
@@ -28,14 +28,46 @@ fn ac_case(n: usize) -> (EGraph, Id, Id, [Rewrite; 2]) {
     let atoms: Vec<_> = (0..n).map(|i| eg.atom(&format!("x{i}"), 0)).collect();
     let mut input = atoms[0];
     for atom in &atoms[1..] {
-        input = eg.app("+", vec![input, *atom]);
+        input = eg.fo_app("+", vec![input, *atom]);
     }
     let mut goal = atoms[n - 1];
     for atom in atoms[..n - 1].iter().rev() {
-        goal = eg.app("+", vec![goal, *atom]);
+        goal = eg.fo_app("+", vec![goal, *atom]);
     }
     let var = Pattern::meta;
-    let plus = |a, b| Pattern::app("+", vec![a, b]);
+    let plus = |a, b| Pattern::fo_app("+", vec![a, b]);
+    let rules = [
+        rewrite(
+            plus(plus(var("?a"), var("?b")), var("?c")),
+            plus(var("?a"), plus(var("?b"), var("?c"))),
+        ),
+        rewrite(plus(var("?a"), var("?b")), plus(var("?b"), var("?a"))),
+    ];
+    (eg, input, goal, rules)
+}
+
+/// The same AC problem using `[+ a b]`, represented as two `HOApp` nodes,
+/// instead of the first-order `(+ a b)` node used by `ac_case`.
+fn hoapp_ac_case(n: usize) -> (EGraph, Id, Id, [Rewrite; 2]) {
+    fn plus(eg: &mut EGraph, op: Id, left: Id, right: Id) -> Id {
+        let function = eg.ho_app(op, left);
+        eg.ho_app(function, right)
+    }
+
+    let mut eg = EGraph::new();
+    let op = eg.atom("+", 0);
+    let atoms: Vec<_> = (0..n).map(|i| eg.atom(&format!("x{i}"), 0)).collect();
+    let mut input = atoms[0];
+    for atom in &atoms[1..] {
+        input = plus(&mut eg, op, input, *atom);
+    }
+    let mut goal = atoms[n - 1];
+    for atom in atoms[..n - 1].iter().rev() {
+        goal = plus(&mut eg, op, goal, *atom);
+    }
+
+    let var = Pattern::meta;
+    let plus = |left, right| Pattern::ho_app(Pattern::ho_app(Pattern::atom("+"), left), right);
     let rules = [
         rewrite(
             plus(plus(var("?a"), var("?b")), var("?c")),
@@ -74,6 +106,25 @@ fn bench_ac(c: &mut Criterion) {
             )
         });
     }
+    group.bench_function("AC10-hoapp", |b| {
+        b.iter_batched(
+            || hoapp_ac_case(10),
+            |(mut eg, input, goal, rules)| {
+                let stats = eg.saturate(&rules);
+                assert!(eg.equivalent(&input, &goal));
+                // In addition to the ordinary AC expression classes, HOApp
+                // has one partial-application class `[+ term]` for every
+                // possible proper left subset and one class for the `+` atom.
+                assert_eq!(eg.class_count(), 2 * (1 << 10) - 2);
+                assert_eq!(
+                    eg.node_count(),
+                    3usize.pow(10) - 2usize.pow(11) + 1 + 10 + (1 << 10) - 1
+                );
+                black_box(stats)
+            },
+            BatchSize::PerIteration,
+        )
+    });
     group.finish();
 }
 
@@ -81,13 +132,13 @@ fn lambda_under_case() -> (EGraph, Id, [Rewrite; 1], [Rewrite; 1]) {
     let mut eg = EGraph::new();
     let four = eg.atom("4", 1);
     let inner_y = eg.var(2, 1);
-    let inner_identity = eg.lam(inner_y);
-    let inner_redex = eg.app("app", vec![inner_identity, four]);
-    let sum = eg.app("+", vec![four, inner_redex]);
-    let term = eg.lam(sum);
+    let inner_identity = eg.binder("lam", inner_y);
+    let inner_redex = eg.fo_app("app", vec![inner_identity, four]);
+    let sum = eg.fo_app("+", vec![four, inner_redex]);
+    let term = eg.binder("lam", sum);
     let beta = [beta_rule()];
     let fold = [rewrite(
-        Pattern::app("+", vec![Pattern::atom("4"), Pattern::atom("4")]),
+        Pattern::fo_app("+", vec![Pattern::atom("4"), Pattern::atom("4")]),
         Pattern::atom("8"),
     )];
     (eg, term, beta, fold)
@@ -101,7 +152,7 @@ fn bench_lambda_under(c: &mut Criterion) {
                 let beta_stats = eg.saturate(&beta);
                 let fold_stats = eg.saturate(&fold);
                 let result = eg.extract(&term).unwrap();
-                assert_eq!(result.to_string(), "(lam 8)");
+                assert_eq!(result.to_string(), "(@lam 8)");
                 black_box((beta_stats, fold_stats))
             },
             BatchSize::PerIteration,
@@ -114,14 +165,14 @@ fn ternary_add_case(nodes: usize) -> (EGraph, [Rewrite; 2]) {
     let atoms: Vec<_> = (0..(2 * nodes + 1))
         .map(|i| eg.atom(&format!("x{i}"), 0))
         .collect();
-    let mut term = eg.app("+3", atoms[..3].to_vec());
+    let mut term = eg.fo_app("+3", atoms[..3].to_vec());
     for pair in atoms[3..].as_chunks::<2>().0 {
-        term = eg.app("+3", vec![term, pair[0], pair[1]]);
+        term = eg.fo_app("+3", vec![term, pair[0], pair[1]]);
     }
     black_box(term);
 
     let var = Pattern::meta;
-    let add = |a, b, c| Pattern::app("+3", vec![a, b, c]);
+    let add = |a, b, c| Pattern::fo_app("+3", vec![a, b, c]);
     let rules = [
         rewrite(
             add(var("?a"), var("?b"), var("?c")),
@@ -138,18 +189,16 @@ fn ternary_add_case(nodes: usize) -> (EGraph, [Rewrite; 2]) {
 fn sum_swap_case(binders: usize) -> (EGraph, Id, Id, [Rewrite; 1]) {
     let mut eg = EGraph::new();
     let variables: Vec<_> = (0..binders).map(|level| eg.var(binders, level)).collect();
-    let mut term = eg.app("a", variables.clone());
+    let mut term = eg.fo_app("a", variables.clone());
     for _ in 0..binders {
-        term = eg.lam(term);
-        term = eg.app("sum", vec![term]);
+        term = eg.binder("sum", term);
     }
-    let mut goal = eg.app("a", variables.into_iter().rev().collect());
+    let mut goal = eg.fo_app("a", variables.into_iter().rev().collect());
     for _ in 0..binders {
-        goal = eg.lam(goal);
-        goal = eg.app("sum", vec![goal]);
+        goal = eg.binder("sum", goal);
     }
 
-    let sum = |body| Pattern::app("sum", vec![Pattern::Lam(Box::new(body))]);
+    let sum = |body| Pattern::binder("sum", body);
     let rule = rewrite(
         sum(sum(Pattern::miller("?body", vec![1, 0]))),
         sum(sum(Pattern::miller("?body", vec![0, 1]))),

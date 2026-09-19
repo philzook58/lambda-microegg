@@ -11,22 +11,22 @@
 
 ; Sum distributes over addition and subtraction.
 (rewrite
-  (@sum i (+ (?f i) (?g i)))
-  (+ (@sum i (?f i))
-     (@sum i (?g i))))
+  (@sum i (+ {?f i} {?g i}))
+  (+ (@sum i {?f i})
+     (@sum i {?g i})))
 (rewrite
-  (@sum i (- (?f i) (?g i)))
-  (- (@sum i (?f i))
-     (@sum i (?g i))))
+  (@sum i (- {?f i} {?g i}))
+  (- (@sum i {?f i})
+     (@sum i {?g i})))
 
 ; A bare ?c cannot capture i, which supplies the usual side condition
 ; that c is independent of the summation index.
 (rewrite
-  (@sum i (* ?c (?f i)))
-  (* ?c (@sum i (?f i))))
+  (@sum i (* ?c {?f i}))
+  (* ?c (@sum i {?f i})))
 (rewrite
-  (@sum i (* (?f i) ?c))
-  (* ?c (@sum i (?f i))))
+  (@sum i (* {?f i} ?c))
+  (* ?c (@sum i {?f i})))
 
 (run 10)
 (guard
@@ -57,8 +57,8 @@
 ; The LHS Miller arguments stay in context order. The RHS application
 ; performs the permutation explicitly.
 (rewrite
-  (@sum i (@sum j (?f i j)))
-  (@sum i (@sum j (?f j i))))
+  (@sum i (@sum j {?f i j}))
+  (@sum i (@sum j {?f j i})))
 
 (run 5)
 (guard
@@ -69,27 +69,27 @@
 (reset)
 (echo "Closed forms for sums from 1 through n")
 
-; Here the range is explicit: (sum-1-to n (lam i body)).
+; Here the range is explicit: (sum-1-to n (@lam i body)).
 (insert
-  (+ (sum-1-to n (lam i i))
-     (sum-1-to n (lam i (^ i 2)))))
+  (+ (sum-1-to n (@lam i i))
+     (sum-1-to n (@lam i (^ i 2)))))
 
 (rewrite
-  (sum-1-to ?n (lam i i))
+  (sum-1-to ?n (@lam i i))
   (/ (* ?n (+ ?n 1)) 2))
 (rewrite
-  (sum-1-to ?n (lam i (^ i 2)))
+  (sum-1-to ?n (@lam i (^ i 2)))
   (/ (* ?n (* (+ ?n 1) (+ (* 2 ?n) 1))) 6))
 (rewrite
-  (sum-1-to ?n (lam i ?c))
+  (sum-1-to ?n (@lam i ?c))
   (* ?n ?c))
 
 (run 10)
 (guard
-  (+ (sum-1-to n (lam i i))
-     (sum-1-to n (lam i (^ i 2))))
+  (+ (sum-1-to n (@lam i i))
+     (sum-1-to n (@lam i (^ i 2))))
   (+ (/ (* n (+ n 1)) 2)
      (/ (* n (* (+ n 1) (+ (* 2 n) 1))) 6)))
 (extract
-  (+ (sum-1-to n (lam i i))
-     (sum-1-to n (lam i (^ i 2)))))
+  (+ (sum-1-to n (@lam i i))
+     (sum-1-to n (@lam i (^ i 2)))))

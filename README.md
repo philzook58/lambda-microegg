@@ -8,15 +8,19 @@ The starting point of the basic e-graph implementation is Max Willsey's microegg
 
 WASM Demo pages : <www.philipzucker.com/lambda-microegg>
 
-The "lambda" supported here isn't really a lambda (in the sense that the focus of the thing is to beta substitution). It's a binder. The point of it is alpha equivalence and well-scoping. But I do also have a built in substitution operator for the right hand side of rules.
+Binders are generic. `(@sum i BODY)` and `(@lam x BODY)` have the same internal
+shape, `Binder(Symbol, Id)`; `lam` is only the conventional symbol used when
+modeling lambda calculus. Binder nodes provide alpha equivalence and
+well-scoping, and `#subst` supplies explicit substitution on rewrite right-hand
+sides.
 
 Another important concept is that of a Miller pattern.
 <https://www.philipzucker.com/ho_unify/>
 https://www.lix.polytechnique.fr/Labo/Dale.Miller/lProlog/proghol/extract.html Chapter 4
 
- `(lam x (lam y (?a x)))` is a Miller pattern because the higher order pattern variable `?a` is applied to distinct bound variable. It will match `(lam x (lam y x))` but fail to match `(lam x (lam y y))` because `?a` can't capture the `y`.  
+ `(@lam x (@lam y {?a x}))` is a Miller pattern because the higher order pattern variable `?a` is applied to distinct bound variable. It will match `(@lam x (@lam y x))` but fail to match `(@lam x (@lam y y))` because `?a` can't capture the `y`.
  
- `(lam x (?a (+ one x)))` would _not_ be a Miller pattern, and is not supported. 
+ `(@lam x {?a (+ one x)})` would _not_ be a Miller pattern, and is not supported.
  
  Miller patterns are basically the reasonable least thing you can do to have bound variables but reaspect scope. They are intrinsically tractable to implement, whereas full higher order matching even outside of the e-graph can encode undecidable problems.
 
@@ -42,7 +46,15 @@ cargo run --release -- example.sexp
 - `print-egraph`
 
 Binder operators use `(@OP NAME BODY)` syntax. For example,
-`(@sum i (f i))` is macro expanded as `(sum (lam i (f i)))`.
+`(@sum i (f i))` is stored directly as the `sum` binder. Lambda calculus uses
+the same generic binder representation through `@lam`.
+
+Square brackets are curried higher-order application: `[f x y]` is stored as
+`HOApp(HOApp(f, x), y)`. Parenthesized `(f x y)` remains a single n-ary,
+first-order application node. Braces denote a metavariable occurrence rather
+than an e-node. On a match left-hand side its arguments are Miller parameters;
+on the right they instantiate the captured body. Beta reduction can be written
+`[(@lam x {?body x}) ?e]` to `{?body ?e}`.
 
 
 # AI disclosure
