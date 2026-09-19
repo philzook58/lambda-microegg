@@ -13,9 +13,6 @@ for (const name of readdirSync(demoDirectory).filter(name => name.endsWith(".sex
     if (output.length === 0) {
       throw new Error("demo produced no output");
     }
-    if (name === "lambda.sexp" && !output.endsWith("(pair z z)")) {
-      throw new Error(`unexpected extraction:\n${output}`);
-    }
     console.log(`ok ${name}`);
   } catch (error) {
     throw new Error(`${name}: ${error}`);

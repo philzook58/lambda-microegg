@@ -1,6 +1,6 @@
 (echo "A Miller variable explicitly admits the local x binder")
 
-(insert 1 (@lam x (pair $0 x)))
+(insert 1 (@lam x (pair $0 x))) ; we can explicit refer to free variables. I don't know why you'd do this and it's probably a bad idea.
 (match (@lam x (pair ?outer {?body x})))
 
 (echo "Without the x argument, ?body cannot capture x")

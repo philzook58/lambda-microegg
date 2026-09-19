@@ -20,7 +20,7 @@
 (reset)
 
 
-(union (double a) (* a 2)) ; you can also union stuff
+(union (double a) (* a 2)) ; you can also manually union stuff
 (guard (double a) (* a 2)) ; Test they are equal.
 
 (reset)
