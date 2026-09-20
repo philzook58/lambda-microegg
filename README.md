@@ -63,4 +63,4 @@ on the right they instantiate the captured body. Beta reduction can be written
 
 # AI disclosure
 
-The code in this codebase was produced by giving Max's microegg, my thinning egraph implementations, blog posts and paper to an agent. It still has required back and forth.
+The code in this codebase was initially produced by giving Max's microegg, my thinning egraph implementations, blog posts and paper to an agent.

@@ -3,6 +3,8 @@
 //! - a de Bruijn index counts outward from the nearest binder;
 //! - a de Bruijn level counts a variable coming down from an ambient context.
 //!
+//! - Note that both of these concepts are beside the main point from that of a thinning/lifting
+//!
 //! During pattern matching, `top_ctx` is the ambient context at the top of the
 //! pattern, and `current_ctx` additionally includes the variables introduced
 //! locally by binders inside the pattern. A pattern variable has to be carried
