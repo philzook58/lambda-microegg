@@ -751,6 +751,23 @@ fn run_command(
             )?);
             output.push(format!("rewrite {} added", rules.len()));
         }
+        "birewrite" if items.len() == 3 => {
+            // Both sides are used as a left-hand side, so both must be
+            // observable match patterns. Requiring each to be a valid
+            // template for the other additionally forces the two sides to
+            // bind exactly the same metavariables at the same arities.
+            let left = syntax_match_pattern(&items[1])?;
+            let right = syntax_match_pattern(&items[2])?;
+            let forward = Rewrite::new(left.clone(), right.clone())?;
+            let backward = Rewrite::new(right, left)?;
+            rules.push(forward);
+            rules.push(backward);
+            output.push(format!(
+                "birewrite {} and {} added",
+                rules.len() - 1,
+                rules.len()
+            ));
+        }
         "match" if items.len() == 2 => {
             let pattern = syntax_match_pattern(&items[1])?;
             let matches = eg.search(&pattern);
@@ -828,8 +845,8 @@ fn run_command(
                 .ok_or_else(|| "class has no finite extractable term".to_string())?;
             output.push(term.display().to_string());
         }
-        "reset" | "insert" | "union" | "guard" | "rewrite" | "match" | "run" | "echo" | "fail"
-        | "print-egraph" | "extract" => {
+        "reset" | "insert" | "union" | "guard" | "rewrite" | "birewrite" | "match" | "run"
+        | "echo" | "fail" | "print-egraph" | "extract" => {
             return Err(format!("wrong number of arguments to '{command}'"));
         }
         _ => return Err(format!("unknown command '{command}'")),

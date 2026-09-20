@@ -607,15 +607,39 @@ impl EGraph {
         }
     }
     fn find_mut(&mut self, id: &Id) -> Id {
-        let edge = self.parent[id.raw() as usize];
-        if edge.raw() == id.raw() {
+        if self.parent[id.raw() as usize].raw() == id.raw() {
             return *id;
         }
-        let root = self.find_mut(&edge);
-        // Path compression stores an edge in the raw class's intrinsic
-        // context. `id` itself may be placed in a larger ambient context.
-        debug_assert_eq!(root.ctx(), edge.ctx());
-        self.parent[id.raw() as usize] = root;
+        // Walk to the root iteratively. Recursing once per union-find edge
+        // overflowed the stack on long chains, and chain length is an
+        // internal artifact rather than anything the caller controls.
+        let mut path: SmallVec<[RawId; 16]> = SmallVec::new();
+        let mut current = id.raw();
+        loop {
+            let edge = self.parent[current as usize];
+            if edge.raw() == current {
+                break;
+            }
+            path.push(current);
+            current = edge.raw();
+        }
+        let root_raw = current;
+        // Compress from the root backwards, so each node composes through a
+        // successor that already points straight at the root. Path
+        // compression stores an edge in the raw class's intrinsic context;
+        // `id` itself may be placed in a larger ambient context.
+        for &raw in path.iter().rev() {
+            let edge = self.parent[raw as usize];
+            if edge.raw() == root_raw {
+                continue;
+            }
+            let next = self.parent[edge.raw() as usize];
+            debug_assert_eq!(next.raw(), root_raw);
+            debug_assert_eq!(next.ctx(), edge.lift().dom());
+            self.parent[raw as usize] = Id::new(edge.lift().compose(&next.lift()), root_raw);
+        }
+        let root = self.parent[id.raw() as usize];
+        debug_assert_eq!(root.raw(), root_raw);
         Id::new(id.lift().compose(&root.lift()), root.raw())
     }
     fn intern(&mut self, scope: usize, node: Node) -> Id {

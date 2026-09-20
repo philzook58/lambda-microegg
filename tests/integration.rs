@@ -539,6 +539,142 @@ fn generic_binders_factor_only_independent_sum_terms() {
     assert_eq!(output.last().unwrap(), "; no matches");
 }
 #[test]
+fn birewrite_adds_both_directions() {
+    let output = run_script(
+        r#"
+            (insert (+ a b))
+            (birewrite (+ ?x ?y) (+ ?y ?x))
+            (run 5)
+            (guard (+ a b) (+ b a))
+        "#,
+    )
+    .unwrap();
+    assert_eq!(output[1], "; birewrite 1 and 2 added");
+    assert_eq!(output.last().unwrap(), "; guard passed");
+}
+
+#[test]
+fn birewrite_runs_the_direction_a_rewrite_would_not() {
+    // `rewrite` alone only unfolds; the backward direction is what closes
+    // the guard here.
+    let script = |command: &str| {
+        format!(
+            r#"
+                (insert (g a))
+                (insert (f (f a)))
+                (rewrite (g ?x) (f (f ?x)))
+                ({command} (f ?x) (h ?x))
+                (run 5)
+                (guard (g a) (h (h a)))
+            "#
+        )
+    };
+    assert!(run_script(&script("rewrite")).is_ok());
+    assert!(run_script(&script("birewrite")).is_ok());
+
+    // And the added direction really is usable as a left-hand side.
+    let output = run_script(
+        r#"
+            (insert (h (h a)))
+            (birewrite (f ?x) (h ?x))
+            (run 5)
+            (guard (h (h a)) (f (f a)))
+        "#,
+    )
+    .unwrap();
+    assert_eq!(output.last().unwrap(), "; guard passed");
+}
+
+#[test]
+fn birewrite_works_with_binders_and_miller_patterns() {
+    // Linearity of summation, in both directions.
+    let output = run_script(
+        r#"
+            (insert (@sum i (+ (f i) (g i))))
+            (birewrite (@sum i (+ {?a i} {?b i}))
+                       (+ (@sum i {?a i}) (@sum i {?b i})))
+            (run 5)
+            (guard (@sum i (+ (f i) (g i)))
+                   (+ (@sum i (f i)) (@sum i (g i))))
+        "#,
+    )
+    .unwrap();
+    assert_eq!(output.last().unwrap(), "; guard passed");
+
+    // ... and starting from the factored side, reaching the folded one.
+    let output = run_script(
+        r#"
+            (insert (+ (@sum i (f i)) (@sum i (g i))))
+            (birewrite (@sum i (+ {?a i} {?b i}))
+                       (+ (@sum i {?a i}) (@sum i {?b i})))
+            (run 5)
+            (guard (@sum i (+ (f i) (g i)))
+                   (+ (@sum i (f i)) (@sum i (g i))))
+        "#,
+    )
+    .unwrap();
+    assert_eq!(output.last().unwrap(), "; guard passed");
+}
+
+#[test]
+fn birewrite_rejects_a_reversed_side_whose_miller_arguments_are_out_of_order() {
+    // A binder swap is not expressible as a birewrite: LHS Miller arguments
+    // must be written outer-to-inner, and reversing the rule puts the
+    // right-hand side's arguments inner-to-outer. Write the two directions
+    // as separate `rewrite`s, permuting the arguments on each right-hand side.
+    let error = run_script(
+        "(birewrite (@sum x (@sum y {?b x y})) (@sum y (@sum x {?b x y})))",
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("arguments are out of order"),
+        "unexpected error: {error}"
+    );
+
+    assert!(
+        run_script(
+            r#"
+                (insert (@sum x (@sum y (f x y))))
+                (rewrite (@sum x (@sum y {?b x y})) (@sum y (@sum x {?b y x})))
+                (run 5)
+                (guard (@sum x (@sum y (f x y))) (@sum y (@sum x (f y x))))
+            "#
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn birewrite_rejects_a_side_that_is_not_a_match_pattern() {
+    // `#subst` is computed during instantiation, so it cannot be matched on
+    // and therefore cannot be one side of a bidirectional rule.
+    let error = run_script("(birewrite (app (@lam x {?b x}) ?e) (#subst {?b x} x ?e))")
+        .unwrap_err();
+    assert!(
+        error.contains("#subst is only allowed on a rewrite right-hand side"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn birewrite_rejects_sides_with_different_metavariables() {
+    let error = run_script("(birewrite (f ?x) (g ?x ?y))").unwrap_err();
+    assert!(
+        error.contains("unbound metavariable '?y'"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn birewrite_rejects_a_wrong_argument_count() {
+    let error = run_script("(birewrite (f ?x))").unwrap_err();
+    assert!(
+        error.contains("wrong number of arguments to 'birewrite'"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn a_bare_metavariable_can_leave_a_generic_binder() {
     let output = run_script(
         r#"
@@ -1214,7 +1350,15 @@ fn extract_scales_linearly_in_the_number_of_classes() {
     }
 
     assert_eq!(chain(3), "(f (g (f c)))");
-    assert_eq!(chain(2000).matches('(').count(), 2000);
+
+    // Extraction still recurses once per level of the term, so a chain this
+    // deep needs more than the default test-thread stack in a debug build.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| assert_eq!(chain(2000).matches('(').count(), 2000))
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[test]

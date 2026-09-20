@@ -38,10 +38,14 @@ cargo run --release -- example.sexp
 - `insert`
 - `union`
 - `rewrite`
+- `birewrite` — adds both directions of a rule, so both sides must be valid
+  match patterns binding the same metavariables
 - `run`
 - `match`
 - `guard`
+- `extract`
 - `echo`
+- `fail`
 - `reset`
 - `print-egraph`
 
