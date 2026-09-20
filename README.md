@@ -2,6 +2,9 @@
 
 Using Lifting e-graph ideas https://arxiv.org/abs/2606.22734  https://www.youtube.com/watch?v=h1CzZguA6DE
 
+Blog posts:
+    - <https://www.philipzucker.com/lambda_miller_egg/>
+
 The basic idea is [slotted e-graphs](https://dl.acm.org/doi/10.1145/3729326) combined with Mcbride's [Everybody's Got to Be Somewhere](https://arxiv.org/abs/1807.04085).
 
 The starting point of the basic e-graph implementation is Max Willsey's microegg https://github.com/mwillsey/microegg
