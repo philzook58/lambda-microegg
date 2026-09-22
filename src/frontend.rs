@@ -350,9 +350,9 @@ pub fn add_syntax_term(eg: &mut EGraph, syntax: &Syntax, ctx: usize) -> Result<I
                 quoted: false,
             } if atom.starts_with('$') => match atom[1..].parse::<usize>() {
                 Err(_) => Err(format!("invalid outer-context variable '{atom}'")),
-                Ok(index) if index >= outer_ctx => {
-                    Err(format!("{atom} is out of scope in outer context {outer_ctx}"))
-                }
+                Ok(index) if index >= outer_ctx => Err(format!(
+                    "{atom} is out of scope in outer context {outer_ctx}"
+                )),
                 Ok(index) => Ok(eg.var(ctx, index)),
             },
             SyntaxKind::Atom {
@@ -385,15 +385,13 @@ pub fn add_syntax_term(eg: &mut EGraph, syntax: &Syntax, ctx: usize) -> Result<I
         binders: &mut Vec<String>,
     ) -> Result<Id, String> {
         if items.len() < 2 {
-            return Err(
-                "higher-order application '[FUNCTION ARGUMENT ...]' needs an argument".into(),
-            );
+            return Err("application '[FUNCTION ARGUMENT ...]' needs an argument".into());
         }
         let (function, arguments) = items.split_first().unwrap();
         let mut application = go(eg, function, outer_ctx, binders)?;
         for argument in arguments {
             let argument = go(eg, argument, outer_ctx, binders)?;
-            application = eg.ho_app(application, argument);
+            application = eg.app(application, argument);
         }
         Ok(application)
     }
@@ -441,7 +439,7 @@ pub fn add_syntax_term(eg: &mut EGraph, syntax: &Syntax, ctx: usize) -> Result<I
             .iter()
             .map(|item| go(eg, item, outer_ctx, binders))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(eg.fo_app(op, children))
+        Ok(eg.apps(op, children))
     }
 
     if ctx > 7 {
@@ -551,14 +549,14 @@ fn parse_pattern(syntax: &Syntax, mode: PatternMode) -> Result<Pattern, String> 
                 items,
             } => {
                 if items.len() < 2 {
-                    return Err(syntax.location.error(
-                        "higher-order application '[FUNCTION ARGUMENT ...]' needs an argument",
-                    ));
+                    return Err(syntax
+                        .location
+                        .error("application '[FUNCTION ARGUMENT ...]' needs an argument"));
                 }
                 let mut terms = items.iter();
                 let mut application = go(terms.next().unwrap(), mode, binders)?;
                 for argument in terms {
-                    application = Pattern::ho_app(application, go(argument, mode, binders)?);
+                    application = Pattern::app(application, go(argument, mode, binders)?);
                 }
                 Ok(application)
             }
@@ -572,7 +570,7 @@ fn parse_pattern(syntax: &Syntax, mode: PatternMode) -> Result<Pattern, String> 
                 let op = atom_of(head)?;
                 if op.starts_with('?') {
                     return Err(head.location.error(format!(
-                        "metavariable '{op}' is not allowed in first-order head position; use {{{op} ...}} for a Miller metavariable occurrence or [{op} ...] for a curried higher-order application pattern"
+                        "metavariable '{op}' is not allowed in application head position; use {{{op} ...}} for a Miller metavariable occurrence or [{op} ...] for a curried application pattern"
                     )));
                 }
                 if let Some(op) = op.strip_prefix('@') {
@@ -609,7 +607,7 @@ fn parse_pattern(syntax: &Syntax, mode: PatternMode) -> Result<Pattern, String> 
                     .iter()
                     .map(|item| go(item, mode, binders))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(Pattern::fo_app(op, children))
+                Ok(Pattern::apps(op, children))
             }
         };
         result.map_err(|error| syntax.locate(error))
@@ -647,9 +645,9 @@ fn command_context<'a>(
         return Err(format!("wrong number of arguments to '{command}'"));
     }
     let location = context.location;
-    let context = atom_of(context)?.parse::<usize>().map_err(|_| {
-        location.error(format!("{command} context must be a nonnegative integer"))
-    })?;
+    let context = atom_of(context)?
+        .parse::<usize>()
+        .map_err(|_| location.error(format!("{command} context must be a nonnegative integer")))?;
     if context > 7 {
         return Err(location.error("packed IDs support at most 7 context variables"));
     }

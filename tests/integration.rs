@@ -6,7 +6,7 @@ use frontend::*;
 
 fn beta_rule() -> Rewrite {
     Rewrite::new(
-        Pattern::fo_app(
+        Pattern::apps(
             "app",
             vec![
                 Pattern::binder("lam", Pattern::miller("?body", vec![0])),
@@ -25,7 +25,7 @@ fn beta_rule() -> Rewrite {
 enum ReferenceTerm {
     Var(usize),
     Atom(&'static str),
-    FOApp(&'static str, Vec<ReferenceTerm>),
+    Apps(&'static str, Vec<ReferenceTerm>),
     Binder(&'static str, Box<ReferenceTerm>),
 }
 
@@ -49,8 +49,8 @@ fn generated_term(ctx: usize, depth: usize, state: &mut u64) -> ReferenceTerm {
         0 if ctx > 0 => ReferenceTerm::Var(choice % ctx),
         1 => ReferenceTerm::Atom(["a", "b", "0"][choice % 3]),
         2 => ReferenceTerm::Binder("lam", Box::new(generated_term(ctx + 1, depth - 1, state))),
-        3 => ReferenceTerm::FOApp("f", vec![generated_term(ctx, depth - 1, state)]),
-        _ => ReferenceTerm::FOApp(
+        3 => ReferenceTerm::Apps("f", vec![generated_term(ctx, depth - 1, state)]),
+        _ => ReferenceTerm::Apps(
             "pair",
             vec![
                 generated_term(ctx, depth - 1, state),
@@ -64,12 +64,12 @@ fn add_reference(eg: &mut EGraph, term: &ReferenceTerm, ctx: usize) -> Id {
     match term {
         ReferenceTerm::Var(level) => eg.var(ctx, *level),
         ReferenceTerm::Atom(name) => eg.atom(name, ctx),
-        ReferenceTerm::FOApp(op, children) => {
+        ReferenceTerm::Apps(op, children) => {
             let children = children
                 .iter()
                 .map(|child| add_reference(eg, child, ctx))
                 .collect();
-            eg.fo_app(op, children)
+            eg.apps(op, children)
         }
         ReferenceTerm::Binder(op, body) => {
             let body = add_reference(eg, body, ctx + 1);
@@ -84,7 +84,7 @@ fn embed_reference(term: &ReferenceTerm, root_ctx: usize, extra: usize) -> Refer
             ReferenceTerm::Var(level + usize::from(*level >= root_ctx) * extra)
         }
         ReferenceTerm::Atom(name) => ReferenceTerm::Atom(name),
-        ReferenceTerm::FOApp(op, children) => ReferenceTerm::FOApp(
+        ReferenceTerm::Apps(op, children) => ReferenceTerm::Apps(
             op,
             children
                 .iter()
@@ -110,7 +110,7 @@ fn substitute_reference(
         }
         ReferenceTerm::Var(level) => ReferenceTerm::Var(level - usize::from(*level > variable)),
         ReferenceTerm::Atom(name) => ReferenceTerm::Atom(name),
-        ReferenceTerm::FOApp(op, children) => ReferenceTerm::FOApp(
+        ReferenceTerm::Apps(op, children) => ReferenceTerm::Apps(
             op,
             children
                 .iter()
@@ -156,7 +156,7 @@ fn bundled_sexp_demos_run() {
 
 fn egg_simple_rules() -> Vec<Rewrite> {
     let var = Pattern::meta;
-    let app = |op, left, right| Pattern::fo_app(op, vec![left, right]);
+    let app = |op, left, right| Pattern::apps(op, vec![left, right]);
     let rewrite = |lhs, rhs| Rewrite::new(lhs, rhs).unwrap();
     vec![
         rewrite(
@@ -255,14 +255,14 @@ fn binder_symbol_is_part_of_a_direct_enode() {
     assert!(!eg.equivalent(&sum, &lambda));
 }
 #[test]
-fn bracket_application_is_curried_and_distinct_from_first_order_app() {
+fn application_syntaxes_share_the_same_curried_representation() {
     let output = run_script(
-        "(insert [f x y]) (extract [f x y]) (guard [f x y] [[f x] y]) (fail (guard [f x y] (f x y)))",
+        "(insert [f x y]) (extract [f x y]) (guard [f x y] [[f x] y]) (guard [f x y] (f x y))",
     )
     .unwrap();
-    assert_eq!(output[1], "[f x y]");
+    assert_eq!(output[1], "(f x y)");
     assert_eq!(output[2], "; guard passed");
-    assert!(output[3].starts_with("; failed as expected:"));
+    assert_eq!(output[3], "; guard passed");
 }
 #[test]
 fn bracket_beta_uses_miller_substitution() {
@@ -283,7 +283,7 @@ fn metavariable_occurrences_require_braces() {
     let old = run_script("(rewrite (@lam x (?body x)) ok)").unwrap_err();
     assert_eq!(
         old,
-        "line 1:19: metavariable '?body' is not allowed in first-order head position; use {?body ...} for a Miller metavariable occurrence or [?body ...] for a curried higher-order application pattern"
+        "line 1:19: metavariable '?body' is not allowed in application head position; use {?body ...} for a Miller metavariable occurrence or [?body ...] for a curried application pattern"
     );
 
     let term = run_script("(insert {?body x})").unwrap_err();
@@ -295,7 +295,7 @@ fn metavariable_occurrences_require_braces() {
 #[test]
 fn sexp_frontend_honors_zero_run_limit() {
     let output = run_script("(insert (f a)) (rewrite (f ?x) ?x) (run 0) (extract (f a))").unwrap();
-    assert!(output[2].starts_with("; ran 0 rounds, 0 unions: 2 classes, 2 e-nodes\n"));
+    assert!(output[2].starts_with("; ran 0 rounds, 0 unions: 3 classes, 3 e-nodes\n"));
     assert!(output[2].contains("; match "));
     assert_eq!(output.last().unwrap(), "(f a)");
 }
@@ -622,10 +622,8 @@ fn birewrite_rejects_a_reversed_side_whose_miller_arguments_are_out_of_order() {
     // must be written outer-to-inner, and reversing the rule puts the
     // right-hand side's arguments inner-to-outer. Write the two directions
     // as separate `rewrite`s, permuting the arguments on each right-hand side.
-    let error = run_script(
-        "(birewrite (@sum x (@sum y {?b x y})) (@sum y (@sum x {?b x y})))",
-    )
-    .unwrap_err();
+    let error = run_script("(birewrite (@sum x (@sum y {?b x y})) (@sum y (@sum x {?b x y})))")
+        .unwrap_err();
     assert!(
         error.contains("arguments are out of order"),
         "unexpected error: {error}"
@@ -648,8 +646,8 @@ fn birewrite_rejects_a_reversed_side_whose_miller_arguments_are_out_of_order() {
 fn birewrite_rejects_a_side_that_is_not_a_match_pattern() {
     // `#subst` is computed during instantiation, so it cannot be matched on
     // and therefore cannot be one side of a bidirectional rule.
-    let error = run_script("(birewrite (app (@lam x {?b x}) ?e) (#subst {?b x} x ?e))")
-        .unwrap_err();
+    let error =
+        run_script("(birewrite (app (@lam x {?b x}) ?e) (#subst {?b x} x ?e))").unwrap_err();
     assert!(
         error.contains("#subst is only allowed on a rewrite right-hand side"),
         "unexpected error: {error}"
@@ -777,13 +775,17 @@ fn sexp_print_egraph_shows_classes_nodes_and_lifts() {
     assert_eq!(
         output[1],
         concat!(
-            "; egraph: 3 classes, 3 e-nodes\n",
+            "; egraph: 5 classes, 5 e-nodes\n",
             "; e0 = ctx1 |-> $0\n",
             ";   e0 <- var\n",
-            "; e1 = ctx2 |-> (pair $0 $1)\n",
-            ";   e1 <- (pair l_10(e0) l_01(e0))\n",
-            "; e2 = ctx1 |-> (@lam x0 (pair $0 x0))\n",
-            ";   e2 <- (@lam e1)",
+            "; e1 = ctx0 |-> pair\n",
+            ";   e1 <- pair\n",
+            "; e2 = ctx1 |-> (pair $0)\n",
+            ";   e2 <- (l_0(e1) e0)\n",
+            "; e3 = ctx2 |-> (pair $0 $1)\n",
+            ";   e3 <- (l_10(e2) l_01(e0))\n",
+            "; e4 = ctx1 |-> (@lam x0 (pair $0 x0))\n",
+            ";   e4 <- (@lam e3)",
         )
     );
 }
@@ -864,8 +866,8 @@ fn lift_pull_and_redundant_variable() {
     let x = eg.var(2, 0);
     let y = eg.var(2, 1);
     let z = eg.atom("0", 2);
-    let xz = eg.fo_app("*", vec![x, z]);
-    let yz = eg.fo_app("*", vec![y, z]);
+    let xz = eg.apps("*", vec![x, z]);
+    let yz = eg.apps("*", vec![y, z]);
     assert_eq!(xz.lift().bits(), "10");
     assert_eq!(yz.lift().bits(), "01");
     eg.union(&xz, &z);
@@ -879,7 +881,7 @@ fn binder_rebuild_after_union() {
     let mut eg = EGraph::new();
     let x = eg.var(1, 0);
     let z = eg.atom("0", 1);
-    let xz = eg.fo_app("*", vec![x, z]);
+    let xz = eg.apps("*", vec![x, z]);
     let lam_xz = eg.binder("lam", xz);
     let lam_z = eg.binder("lam", z);
     eg.union(&xz, &z);
@@ -891,8 +893,8 @@ fn ordinary_congruence_after_union() {
     let mut eg = EGraph::new();
     let a = eg.atom("a", 0);
     let b = eg.atom("b", 0);
-    let fa = eg.fo_app("f", vec![a]);
-    let fb = eg.fo_app("f", vec![b]);
+    let fa = eg.apps("f", vec![a]);
+    let fb = eg.apps("f", vec![b]);
     assert!(!eg.equivalent(&fa, &fb));
     eg.union(&a, &b);
     eg.rebuild();
@@ -904,9 +906,9 @@ fn match_and_rewrite_x_times_zero() {
     let x = eg.var(2, 0);
     let y = eg.var(2, 1);
     let zero = eg.atom("0", 2);
-    let xz = eg.fo_app("*", vec![x, zero]);
-    let yz = eg.fo_app("*", vec![y, zero]);
-    let lhs = Pattern::fo_app(
+    let xz = eg.apps("*", vec![x, zero]);
+    let yz = eg.apps("*", vec![y, zero]);
+    let lhs = Pattern::apps(
         "*",
         vec![Pattern::MetaVar("?x".into(), vec![]), Pattern::atom("0")],
     );
@@ -932,9 +934,9 @@ fn run_reports_round_union_and_phase_statistics() {
     let mut eg = EGraph::new();
     let a = eg.atom("a", 0);
     let zero = eg.atom("0", 0);
-    let product = eg.fo_app("*", vec![a, zero]);
+    let product = eg.apps("*", vec![a, zero]);
     let rule = Rewrite::new(
-        Pattern::fo_app("*", vec![Pattern::meta("?x"), Pattern::atom("0")]),
+        Pattern::apps("*", vec![Pattern::meta("?x"), Pattern::atom("0")]),
         Pattern::atom("0"),
     )
     .unwrap();
@@ -957,8 +959,8 @@ fn match_two_variables_and_repeated_variable() {
     let mut eg = EGraph::new();
     let x = eg.var(2, 0);
     let y = eg.var(2, 1);
-    let xy = eg.fo_app("*", vec![x, y]);
-    let two = Pattern::fo_app(
+    let xy = eg.apps("*", vec![x, y]);
+    let two = Pattern::apps(
         "*",
         vec![
             Pattern::MetaVar("?a".into(), vec![]),
@@ -969,7 +971,7 @@ fn match_two_variables_and_repeated_variable() {
     assert_eq!(matches.len(), 1);
     assert!(eg.equivalent(&matches[0]["?a"], &x));
     assert!(eg.equivalent(&matches[0]["?b"], &y));
-    let repeated = Pattern::fo_app(
+    let repeated = Pattern::apps(
         "*",
         vec![
             Pattern::MetaVar("?a".into(), vec![]),
@@ -977,7 +979,7 @@ fn match_two_variables_and_repeated_variable() {
         ],
     );
     assert!(eg.ematch(&repeated, &xy).is_empty());
-    let swapped = Pattern::fo_app(
+    let swapped = Pattern::apps(
         "*",
         vec![
             Pattern::MetaVar("?b".into(), vec![]),
@@ -986,7 +988,7 @@ fn match_two_variables_and_repeated_variable() {
     );
     let rule = Rewrite::new(two, swapped).unwrap();
     assert!(eg.run(&[rule], 1).unions > 0);
-    let yx = eg.fo_app("*", vec![y, x]);
+    let yx = eg.apps("*", vec![y, x]);
     assert!(eg.equivalent(&xy, &yx));
 }
 #[test]
@@ -994,11 +996,11 @@ fn match_inside_lambda() {
     let mut eg = EGraph::new();
     let bound = eg.var(1, 0);
     let zero = eg.atom("0", 1);
-    let body = eg.fo_app("*", vec![bound, zero]);
+    let body = eg.apps("*", vec![bound, zero]);
     let lam = eg.binder("lam", body);
     let pat = Pattern::binder(
         "lam",
-        Pattern::fo_app(
+        Pattern::apps(
             "*",
             vec![Pattern::miller("?body", vec![0]), Pattern::atom("0")],
         ),
@@ -1013,8 +1015,8 @@ fn contextual_metavariable_crosses_an_unused_binder() {
     let a = eg.atom("a", 0);
     let a_under_binder = eg.atom("a", 1);
     let lam_a = eg.binder("lam", a_under_binder);
-    let term = eg.fo_app("pair", vec![a, lam_a]);
-    let pattern = Pattern::fo_app(
+    let term = eg.apps("pair", vec![a, lam_a]);
+    let pattern = Pattern::apps(
         "pair",
         vec![
             Pattern::MetaVar("?x".into(), vec![]),
@@ -1032,8 +1034,8 @@ fn contextual_metavariable_cannot_capture_a_binder() {
     let a = eg.atom("a", 0);
     let bound = eg.var(1, 0);
     let lam_bound = eg.binder("lam", bound);
-    let term = eg.fo_app("pair", vec![a, lam_bound]);
-    let pattern = Pattern::fo_app(
+    let term = eg.apps("pair", vec![a, lam_bound]);
+    let pattern = Pattern::apps(
         "pair",
         vec![
             Pattern::MetaVar("?x".into(), vec![]),
@@ -1076,15 +1078,15 @@ fn redundant_binding_matches_through_an_equivalent_constant() {
     let mut eg = EGraph::new();
     let x = eg.var(1, 0);
     let zero = eg.atom("0", 1);
-    let sub_xx = eg.fo_app("sub", vec![x, x]);
+    let sub_xx = eg.apps("sub", vec![x, x]);
     eg.union(&zero, &sub_xx);
     eg.rebuild();
-    let term = eg.fo_app("f", vec![x, zero]);
-    let pattern = Pattern::fo_app(
+    let term = eg.apps("f", vec![x, zero]);
+    let pattern = Pattern::apps(
         "f",
         vec![
             Pattern::MetaVar("?x".into(), vec![]),
-            Pattern::fo_app(
+            Pattern::apps(
                 "sub",
                 vec![
                     Pattern::MetaVar("?x".into(), vec![]),
@@ -1104,13 +1106,13 @@ fn substitute_an_arbitrary_context_variable() {
     let x = eg.var(3, 0);
     let y = eg.var(3, 1);
     let z = eg.var(3, 2);
-    let body = eg.fo_app("triple", vec![x, y, z]);
+    let body = eg.apps("triple", vec![x, y, z]);
     let left = eg.var(2, 0);
     let right = eg.var(2, 1);
-    let replacement = eg.fo_app("pair", vec![left, right]);
+    let replacement = eg.apps("pair", vec![left, right]);
 
     let result = eg.substitute(&body, 1, &replacement);
-    let expected = eg.fo_app("triple", vec![left, replacement, right]);
+    let expected = eg.apps("triple", vec![left, replacement, right]);
     assert!(eg.equivalent(&result, &expected));
 }
 #[test]
@@ -1118,14 +1120,14 @@ fn substitute_under_a_binder_without_capture() {
     let mut eg = EGraph::new();
     let outer = eg.var(2, 0);
     let inner = eg.var(2, 1);
-    let body = eg.fo_app("pair", vec![outer, inner]);
+    let body = eg.apps("pair", vec![outer, inner]);
     let term = eg.binder("lam", body);
     let replacement = eg.atom("a", 0);
 
     let result = eg.substitute(&term, 0, &replacement);
     let a_under_binder = eg.atom("a", 1);
     let remaining_bound = eg.var(1, 0);
-    let expected_body = eg.fo_app("pair", vec![a_under_binder, remaining_bound]);
+    let expected_body = eg.apps("pair", vec![a_under_binder, remaining_bound]);
     let expected = eg.binder("lam", expected_body);
     assert!(eg.equivalent(&result, &expected));
 }
@@ -1192,12 +1194,12 @@ fn generated_miller_matches_reinstantiate_the_target() {
         let mut state = seed.wrapping_add(20_000);
         let body = generated_term(top_ctx + 1, 2, &mut state);
         let body = add_reference(&mut eg, &body, top_ctx + 1);
-        let pair = eg.fo_app("pair", vec![body, body]);
+        let pair = eg.apps("pair", vec![body, body]);
         let target = eg.binder("lam", pair);
         let occurrence = Pattern::miller("?item", vec![0]);
         let pattern = Pattern::binder(
             "lam",
-            Pattern::fo_app("pair", vec![occurrence.clone(), occurrence]),
+            Pattern::apps("pair", vec![occurrence.clone(), occurrence]),
         );
         let matches = eg.ematch(&pattern, &target);
         assert!(
@@ -1220,28 +1222,28 @@ fn substitution_prunes_the_var_times_zero_cycle() {
     let mut eg = EGraph::new();
     let x = eg.var(1, 0);
     let zero = eg.atom("0", 1);
-    let x_times_zero = eg.fo_app("*", vec![x, zero]);
+    let x_times_zero = eg.apps("*", vec![x, zero]);
     eg.union(&x_times_zero, &zero);
     eg.rebuild();
-    let body = eg.fo_app("pair", vec![x, x_times_zero]);
+    let body = eg.apps("pair", vec![x, x_times_zero]);
     let replacement = eg.atom("a", 0);
 
     let result = eg.substitute(&body, 0, &replacement);
     let zero_closed = eg.atom("0", 0);
-    let expected = eg.fo_app("pair", vec![replacement, zero_closed]);
+    let expected = eg.apps("pair", vec![replacement, zero_closed]);
     assert!(eg.equivalent(&result, &expected));
 }
 #[test]
 fn substitution_memoizes_a_genuinely_recursive_eclass() {
     let mut eg = EGraph::new();
     let x = eg.var(1, 0);
-    let fx = eg.fo_app("f", vec![x]);
+    let fx = eg.apps("f", vec![x]);
     eg.union(&x, &fx);
     eg.rebuild();
     let a = eg.atom("a", 0);
 
     let result = eg.substitute(&x, 0, &a);
-    let fa = eg.fo_app("f", vec![a]);
+    let fa = eg.apps("f", vec![a]);
     assert!(eg.equivalent(&result, &a));
     assert!(eg.equivalent(&result, &fa));
 }
@@ -1266,7 +1268,7 @@ fn extract_prefers_zero_from_the_var_times_zero_class() {
     let mut eg = EGraph::new();
     let x = eg.var(1, 0);
     let zero = eg.atom("0", 1);
-    let x_times_zero = eg.fo_app("*", vec![x, zero]);
+    let x_times_zero = eg.apps("*", vec![x, zero]);
     eg.union(&x_times_zero, &zero);
 
     assert_eq!(
@@ -1281,7 +1283,7 @@ fn extract_prefers_zero_from_the_var_times_zero_class() {
 fn extract_skips_a_recursive_enode() {
     let mut eg = EGraph::new();
     let a = eg.atom("a", 0);
-    let fa = eg.fo_app("f", vec![a]);
+    let fa = eg.apps("f", vec![a]);
     eg.union(&a, &fa);
 
     assert_eq!(
@@ -1297,7 +1299,7 @@ fn extract_reconstructs_variable_placements_under_binders() {
     let mut eg = EGraph::new();
     let outer = eg.var(2, 0);
     let inner = eg.var(2, 1);
-    let pair = eg.fo_app("pair", vec![outer, inner]);
+    let pair = eg.apps("pair", vec![outer, inner]);
     let term = eg.binder("lam", pair);
 
     assert_eq!(
@@ -1306,10 +1308,13 @@ fn extract_reconstructs_variable_placements_under_binders() {
             scope: 1,
             t: Term::Binder(
                 "lam".into(),
-                Box::new(Term::FOApp(
-                    "pair".into(),
-                    vec![Term::FVar(0.into()), Term::BVar(0.into())],
-                ))
+                Box::new(Term::App(
+                    Box::new(Term::App(
+                        Box::new(Term::Atom("pair".into())),
+                        Box::new(Term::FVar(0.into())),
+                    )),
+                    Box::new(Term::BVar(0.into())),
+                )),
             ),
         })
     );
@@ -1326,7 +1331,7 @@ fn extract_accepts_a_custom_node_weight() {
     let mut eg = EGraph::new();
     let expensive = eg.atom("expensive", 0);
     let cheap = eg.atom("cheap", 0);
-    let wrapped = eg.fo_app("wrap", vec![cheap]);
+    let wrapped = eg.apps("wrap", vec![cheap]);
     eg.union(&expensive, &wrapped);
 
     assert_eq!(
@@ -1344,7 +1349,7 @@ fn extract_scales_linearly_in_the_number_of_classes() {
         let mut eg = EGraph::new();
         let mut term = eg.atom("c", 0);
         for i in 0..depth {
-            term = eg.fo_app(if i % 2 == 0 { "f" } else { "g" }, vec![term]);
+            term = eg.apps(if i % 2 == 0 { "f" } else { "g" }, vec![term]);
         }
         eg.extract(&term).unwrap().to_string()
     }
@@ -1370,7 +1375,7 @@ fn beta_avoids_capture_when_the_argument_is_free() {
     let inner_lambda = eg.binder("lam", outer_x);
     let function = eg.binder("lam", inner_lambda);
     let free_y = eg.var(1, 0);
-    let redex = eg.fo_app("app", vec![function, free_y]);
+    let redex = eg.apps("app", vec![function, free_y]);
 
     eg.saturate(&[beta_rule()]);
     assert_eq!(eg.extract(&redex).unwrap().to_string(), "(@lam $0)");
@@ -1390,7 +1395,7 @@ fn beta_does_not_shift_a_lambda_argument() {
     let function = eg.binder("lam", inner_lambda);
     let z = eg.var(1, 0);
     let identity = eg.binder("lam", z);
-    let redex = eg.fo_app("app", vec![function, identity]);
+    let redex = eg.apps("app", vec![function, identity]);
 
     eg.saturate(&[beta_rule()]);
     assert_eq!(eg.extract(&redex).unwrap().to_string(), "(@lam (@lam #0))");
@@ -1405,10 +1410,10 @@ fn beta_discards_an_omega_argument_and_terminates() {
     let a = eg.atom("a", 1);
     let constant_function = eg.binder("lam", a);
     let omega_var = eg.var(1, 0);
-    let omega_body = eg.fo_app("app", vec![omega_var, omega_var]);
+    let omega_body = eg.apps("app", vec![omega_var, omega_var]);
     let delta = eg.binder("lam", omega_body);
-    let omega = eg.fo_app("app", vec![delta, delta]);
-    let redex = eg.fo_app("app", vec![constant_function, omega]);
+    let omega = eg.apps("app", vec![delta, delta]);
+    let redex = eg.apps("app", vec![constant_function, omega]);
 
     eg.saturate(&[beta_rule()]);
     assert_eq!(
@@ -1427,7 +1432,7 @@ fn beta_handles_the_alpha_shared_self_recursive_class() {
     let inner_y = eg.var(2, 1);
     let inner_identity = eg.binder("lam", inner_y);
     let outer_x = eg.var(1, 0);
-    let body = eg.fo_app("app", vec![inner_identity, outer_x]);
+    let body = eg.apps("app", vec![inner_identity, outer_x]);
     let term = eg.binder("lam", body);
 
     eg.saturate(&[beta_rule()]);
@@ -1441,11 +1446,11 @@ fn beta_reduces_multiple_steps_after_self_application() {
     let mut eg = EGraph::new();
     // (λx. x x) (λy. y) -> (λy. y) (λy. y) -> λy. y.
     let x = eg.var(1, 0);
-    let xx = eg.fo_app("app", vec![x, x]);
+    let xx = eg.apps("app", vec![x, x]);
     let duplicator = eg.binder("lam", xx);
     let y = eg.var(1, 0);
     let identity = eg.binder("lam", y);
-    let term = eg.fo_app("app", vec![duplicator, identity]);
+    let term = eg.apps("app", vec![duplicator, identity]);
 
     eg.saturate(&[beta_rule()]);
     assert_eq!(eg.extract(&term).unwrap().to_string(), "(@lam #0)");
@@ -1458,7 +1463,7 @@ fn egg_simple_tests() {
     let mut eg = EGraph::new();
     let zero = eg.atom("0", 0);
     let forty_two = eg.atom("42", 0);
-    let term = eg.fo_app("*", vec![zero, forty_two]);
+    let term = eg.apps("*", vec![zero, forty_two]);
     eg.saturate(&rules);
     assert_eq!(
         eg.extract(&term),
@@ -1472,8 +1477,8 @@ fn egg_simple_tests() {
     let zero = eg.atom("0", 0);
     let one = eg.atom("1", 0);
     let foo = eg.atom("foo", 0);
-    let product = eg.fo_app("*", vec![one, foo]);
-    let term = eg.fo_app("+", vec![zero, product]);
+    let product = eg.apps("*", vec![one, foo]);
+    let term = eg.apps("+", vec![zero, product]);
     eg.saturate(&rules);
     assert_eq!(
         eg.extract(&term),
@@ -1489,10 +1494,10 @@ fn egg_math_associate_adds() {
     let atoms: Vec<_> = (1..=7).map(|n| eg.atom(&n.to_string(), 0)).collect();
     let mut input = atoms[6];
     for atom in atoms[..6].iter().rev() {
-        input = eg.fo_app("+", vec![*atom, input]);
+        input = eg.apps("+", vec![*atom, input]);
     }
     let var = Pattern::meta;
-    let plus = |left, right| Pattern::fo_app("+", vec![left, right]);
+    let plus = |left, right| Pattern::apps("+", vec![left, right]);
     let rewrite = |lhs, rhs| Rewrite::new(lhs, rhs).unwrap();
     let rules = [
         rewrite(plus(var("?a"), var("?b")), plus(var("?b"), var("?a"))),
@@ -1503,11 +1508,11 @@ fn egg_math_associate_adds() {
     ];
 
     eg.saturate(&rules);
-    assert_eq!(eg.class_count(), 127);
-    assert_eq!(eg.node_count(), 1939);
+    assert_eq!(eg.class_count(), 254);
+    assert_eq!(eg.node_count(), 2066);
     let mut goal = atoms[0];
     for atom in atoms[1..].iter() {
-        goal = eg.fo_app("+", vec![*atom, goal]);
+        goal = eg.apps("+", vec![*atom, goal]);
     }
     assert!(eg.equivalent(&input, &goal));
 }
@@ -1517,13 +1522,13 @@ fn egg_lambda_under() {
     let four = eg.atom("4", 1);
     let inner_y = eg.var(2, 1);
     let inner_identity = eg.binder("lam", inner_y);
-    let inner_redex = eg.fo_app("app", vec![inner_identity, four]);
-    let sum = eg.fo_app("+", vec![four, inner_redex]);
+    let inner_redex = eg.apps("app", vec![inner_identity, four]);
+    let sum = eg.apps("+", vec![four, inner_redex]);
     let term = eg.binder("lam", sum);
 
     eg.saturate(&[beta_rule()]);
     let fold_four_plus_four = [Rewrite::new(
-        Pattern::fo_app("+", vec![Pattern::atom("4"), Pattern::atom("4")]),
+        Pattern::apps("+", vec![Pattern::atom("4"), Pattern::atom("4")]),
         Pattern::atom("8"),
     )
     .unwrap()];
@@ -1536,18 +1541,18 @@ fn egg_lambda_compose_beta_core() {
     let f = eg.var(3, 0);
     let g = eg.var(3, 1);
     let x = eg.var(3, 2);
-    let gx = eg.fo_app("app", vec![g, x]);
-    let fgx = eg.fo_app("app", vec![f, gx]);
+    let gx = eg.apps("app", vec![g, x]);
+    let fgx = eg.apps("app", vec![f, gx]);
     let compose_x = eg.binder("lam", fgx);
     let compose_g = eg.binder("lam", compose_x);
     let compose = eg.binder("lam", compose_g);
 
     let y = eg.var(1, 0);
     let one = eg.atom("1", 1);
-    let add_one_body = eg.fo_app("+", vec![y, one]);
+    let add_one_body = eg.apps("+", vec![y, one]);
     let add_one = eg.binder("lam", add_one_body);
-    let partial = eg.fo_app("app", vec![compose, add_one]);
-    let twice = eg.fo_app("app", vec![partial, add_one]);
+    let partial = eg.apps("app", vec![compose, add_one]);
+    let twice = eg.apps("app", vec![partial, add_one]);
 
     eg.saturate(&[beta_rule()]);
     assert_eq!(
@@ -1562,8 +1567,8 @@ fn identical_binders_in_sibling_lambdas_match_one_metavariable() {
     let right_bound = eg.var(1, 0);
     let left = eg.binder("lam", left_bound);
     let right = eg.binder("lam", right_bound);
-    let term = eg.fo_app("pair", vec![left, right]);
-    let pattern = Pattern::fo_app(
+    let term = eg.apps("pair", vec![left, right]);
+    let pattern = Pattern::apps(
         "pair",
         vec![
             Pattern::binder("lam", Pattern::miller("?body", vec![0])),
@@ -1578,11 +1583,11 @@ fn enumerate_alternative_enodes_in_one_class() {
     let mut eg = EGraph::new();
     let a = eg.atom("a", 0);
     let b = eg.atom("b", 0);
-    let aa = eg.fo_app("f", vec![a, a]);
-    let bb = eg.fo_app("f", vec![b, b]);
+    let aa = eg.apps("f", vec![a, a]);
+    let bb = eg.apps("f", vec![b, b]);
     eg.union(&aa, &bb);
     eg.rebuild();
-    let repeated = Pattern::fo_app(
+    let repeated = Pattern::apps(
         "f",
         vec![
             Pattern::MetaVar("?v".into(), vec![]),
@@ -1599,8 +1604,8 @@ fn equating_two_placements_of_one_raw_id_uses_the_equalizer() {
     let mut eg = EGraph::new();
     let x = eg.var(2, 0);
     let y = eg.var(2, 1);
-    let fx = eg.fo_app("f", vec![x]);
-    let fy = eg.fo_app("f", vec![y]);
+    let fx = eg.apps("f", vec![x]);
+    let fy = eg.apps("f", vec![y]);
 
     assert_eq!(fx.raw(), fy.raw());
     assert!(eg.union(&fx, &fy));
@@ -1613,7 +1618,7 @@ fn rebuild_reports_a_count_neutral_canonical_change() {
     let mut eg = EGraph::new();
     let x = eg.var(1, 0);
     let zero = eg.atom("0", 1);
-    let _fx = eg.fo_app("f", vec![x]);
+    let _fx = eg.apps("f", vec![x]);
     eg.union(&x, &zero);
     let classes_before = eg.class_count();
 
@@ -1749,7 +1754,7 @@ fn miller_matching_is_read_only() {
     let mut eg = EGraph::new();
     let x = eg.var(2, 0);
     let y = eg.var(2, 1);
-    let pair = eg.fo_app("pair", vec![x, y]);
+    let pair = eg.apps("pair", vec![x, y]);
     let inner = eg.binder("lam", pair);
     let term = eg.binder("lam", inner);
     let pattern = syntax_pattern(&parse_forms("(@lam x (@lam y {?a x y}))").unwrap()[0]).unwrap();
@@ -1885,8 +1890,8 @@ fn miller_permutation_memoizes_recursive_eclasses() {
     let mut eg = EGraph::new();
     let x = eg.var(2, 0);
     let y = eg.var(2, 1);
-    let pair = eg.fo_app("pair", vec![x, y]);
-    let recursive = eg.fo_app("f", vec![pair]);
+    let pair = eg.apps("pair", vec![x, y]);
+    let recursive = eg.apps("f", vec![pair]);
     eg.union(&pair, &recursive);
     eg.rebuild();
 
@@ -1897,7 +1902,7 @@ fn miller_permutation_memoizes_recursive_eclasses() {
     let rule = Rewrite::new(lhs, rhs).unwrap();
     assert!(eg.run(&[rule], 1).unions > 0);
 
-    let swapped = eg.fo_app("pair", vec![y, x]);
+    let swapped = eg.apps("pair", vec![y, x]);
     let inner = eg.binder("lam", swapped);
     let expected = eg.binder("lam", inner);
     assert!(eg.equivalent(&term, &expected));

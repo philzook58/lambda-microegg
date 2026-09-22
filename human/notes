@@ -162,7 +162,7 @@ Or steal a bit to distinguish between Id and Symbol?
 
 subst enough to kill free variables (a x y k l) and the rest go in an app.
 Have both binary app and
-HOApp(Id, Vec![])
+App(Id, Vec![])
 (f a b)
 ((f) a b)
 

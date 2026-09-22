@@ -75,7 +75,7 @@ fn main() {
          Commands:\n  (reset)\n  (insert [CONTEXT] TERM)\n  (union [CONTEXT] LEFT RIGHT)\n  (guard [CONTEXT] LEFT RIGHT)\n  (rewrite LHS RHS)\n  (birewrite LHS RHS)\n  (match PATTERN)\n  (run LIMIT)\n  (echo VALUE)\n  (fail COMMAND)\n  (extract [CONTEXT] TERM)\n\n\
          Debugging:\n  (print-egraph)\n\n\
          Named binders:\n  (@OP x BODY), x is the nearest binder named x, x@1 is the next outer x\n  Use @lam for lambda calculus; bare lam is an ordinary function symbol\n  $0, $1, ... name variables in the explicit outer context\n\n\
-         Application:\n  (f x y) is one n-ary first-order node\n  [f x y] is curried higher-order application: [[f x] y]\n\n\
+         Application:\n  (f x y) and [f x y] are curried binary application: ((f x) y)\n\n\
          Metavariable occurrences:\n  ?a excludes pattern-local binders; LHS Miller parameters are written outer-to-inner: {{?a x y}}\n  On a rewrite RHS, arguments may be permuted or replaced by terms: {{?a y x}}, {{?a (foo x)}}\n\n\
          Built-ins:\n  (#subst BODY x REPLACEMENT) substitutes REPLACEMENT for x in BODY\n  A free variable may also be named directly: (#subst $0 $0 fred)"
     );

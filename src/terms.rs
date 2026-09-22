@@ -16,10 +16,8 @@ pub enum Pattern {
     /// index counting outward from the nearest pattern binder.
     BVar(DeBruijnIndex),
     Atom(Symbol),
-    /// Parenthesized, n-ary first-order application.
-    FOApp(Symbol, Vec<Pattern>),
-    /// Bracketed, curried higher-order application.
-    HOApp(Box<Pattern>, Box<Pattern>),
+    /// Binary, curried application.
+    App(Box<Pattern>, Box<Pattern>),
     Binder(Symbol, Box<Pattern>),
     /// Built-in capture-avoiding substitution. Its body is parsed beneath
     /// one additional binder and the result lives outside that binder.
@@ -42,11 +40,12 @@ impl Pattern {
     pub fn atom(name: &str) -> Self {
         Self::Atom(name.into())
     }
-    pub fn fo_app(op: &str, children: Vec<Self>) -> Self {
-        Self::FOApp(op.into(), children)
+    pub fn apps(op: &str, arguments: Vec<Self>) -> Self {
+        assert!(!arguments.is_empty());
+        arguments.into_iter().fold(Self::atom(op), Self::app)
     }
-    pub fn ho_app(function: Self, argument: Self) -> Self {
-        Self::HOApp(Box::new(function), Box::new(argument))
+    pub fn app(function: Self, argument: Self) -> Self {
+        Self::App(Box::new(function), Box::new(argument))
     }
     pub fn binder(op: &str, body: Self) -> Self {
         Self::Binder(op.into(), Box::new(body))
@@ -73,10 +72,7 @@ impl Pattern {
                 };
                 occurrence_lift(0, depth, &indices).is_none()
             }
-            Self::FOApp(_, children) => children
-                .iter()
-                .any(|child| child.needs_binding_traversal(depth)),
-            Self::HOApp(function, argument) => {
+            Self::App(function, argument) => {
                 function.needs_binding_traversal(depth) || argument.needs_binding_traversal(depth)
             }
             Self::Binder(_, body) => body.needs_binding_traversal(depth + 1),
@@ -149,13 +145,7 @@ impl Pattern {
                     }
                     Ok(())
                 }
-                Pattern::FOApp(_, children) => {
-                    for child in children {
-                        go(child, depth, arities)?;
-                    }
-                    Ok(())
-                }
-                Pattern::HOApp(function, argument) => {
+                Pattern::App(function, argument) => {
                     go(function, depth, arities)?;
                     go(argument, depth, arities)
                 }
@@ -206,13 +196,7 @@ impl Pattern {
                     }
                     Ok(())
                 }
-                Pattern::FOApp(_, children) => {
-                    for child in children {
-                        go(child, depth, metavariables)?;
-                    }
-                    Ok(())
-                }
-                Pattern::HOApp(function, argument) => {
+                Pattern::App(function, argument) => {
                     go(function, depth, metavariables)?;
                     go(argument, depth, metavariables)
                 }
@@ -266,10 +250,8 @@ pub enum Term {
     FVar(DeBruijnLevel),
     BVar(DeBruijnIndex),
     Atom(Symbol),
-    /// Parenthesized, n-ary first-order application.
-    FOApp(Symbol, Vec<Term>),
-    /// Bracketed, curried higher-order application.
-    HOApp(Box<Term>, Box<Term>),
+    /// Binary, curried application.
+    App(Box<Term>, Box<Term>),
     Binder(Symbol, Box<Term>),
 }
 
@@ -277,12 +259,10 @@ impl Term {
     pub fn size(&self) -> usize {
         match self {
             Self::FVar(_) | Self::BVar(_) | Self::Atom(_) => 1,
-            Self::FOApp(_, children) => 1 + children.iter().map(Self::size).sum::<usize>(),
-            Self::HOApp(function, argument) => 1 + function.size() + argument.size(),
+            Self::App(function, argument) => 1 + function.size() + argument.size(),
             Self::Binder(_, body) => 1 + body.size(),
         }
     }
-
 }
 
 /// Whether an atom must be printed quoted. The delimiter set mirrors the
@@ -298,11 +278,7 @@ fn needs_quoting(text: &str) -> bool {
 /// Write an atom, quoting and escaping it when it cannot be written bare.
 /// `force_quote` additionally quotes a name that would otherwise capture a
 /// binder in scope.
-fn write_atom(
-    f: &mut std::fmt::Formatter<'_>,
-    text: &str,
-    force_quote: bool,
-) -> std::fmt::Result {
+fn write_atom(f: &mut std::fmt::Formatter<'_>, text: &str, force_quote: bool) -> std::fmt::Result {
     if !force_quote && !needs_quoting(text) {
         return f.write_str(text);
     }
@@ -324,7 +300,7 @@ impl std::fmt::Display for Term {
             write_atom(f, text, false)
         }
         fn bin_head(term: &Term, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            if let Term::HOApp(function, argument) = term {
+            if let Term::App(function, argument) = term {
                 bin_head(function, f)?;
                 write!(f, " {argument}")
             } else {
@@ -335,18 +311,10 @@ impl std::fmt::Display for Term {
             Self::FVar(level) => write!(f, "${}", level.get()),
             Self::BVar(index) => write!(f, "#{}", index.get()),
             Self::Atom(name) => atom(f, name.as_str()),
-            Self::FOApp(op, children) => {
+            Self::App(function, argument) => {
                 f.write_str("(")?;
-                atom(f, op.as_str())?;
-                for child in children {
-                    write!(f, " {child}")?;
-                }
-                f.write_str(")")
-            }
-            Self::HOApp(function, argument) => {
-                f.write_str("[")?;
                 bin_head(function, f)?;
-                write!(f, " {argument}]")
+                write!(f, " {argument})")
             }
             Self::Binder(op, body) => write!(f, "(@{op} {body})"),
         }
@@ -435,16 +403,7 @@ impl std::fmt::Display for NamedTerm<'_> {
                     name.as_str(),
                     collides(name.as_str(), root_binders, binders),
                 ),
-                Term::FOApp(op, children) => {
-                    f.write_str("(")?;
-                    atom(f, op.as_str(), false)?;
-                    for child in children {
-                        f.write_str(" ")?;
-                        go(child, f, outer_ctx, root_binders, binders)?;
-                    }
-                    f.write_str(")")
-                }
-                Term::HOApp(function, argument) => {
+                Term::App(function, argument) => {
                     fn head(
                         term: &Term,
                         f: &mut std::fmt::Formatter<'_>,
@@ -452,7 +411,7 @@ impl std::fmt::Display for NamedTerm<'_> {
                         root_binders: &[String],
                         binders: &mut Vec<String>,
                     ) -> std::fmt::Result {
-                        if let Term::HOApp(function, argument) = term {
+                        if let Term::App(function, argument) = term {
                             head(function, f, outer_ctx, root_binders, binders)?;
                             f.write_str(" ")?;
                             go(argument, f, outer_ctx, root_binders, binders)
@@ -460,11 +419,11 @@ impl std::fmt::Display for NamedTerm<'_> {
                             go(term, f, outer_ctx, root_binders, binders)
                         }
                     }
-                    f.write_str("[")?;
+                    f.write_str("(")?;
                     head(function, f, outer_ctx, root_binders, binders)?;
                     f.write_str(" ")?;
                     go(argument, f, outer_ctx, root_binders, binders)?;
-                    f.write_str("]")
+                    f.write_str(")")
                 }
                 Term::Binder(op, body) => {
                     let name = format!("x{}", root_binders.len() + binders.len());

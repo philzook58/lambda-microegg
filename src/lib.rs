@@ -410,17 +410,10 @@ impl Id {
 enum Node {
     Var,
     Atom(Symbol),
-    /// A first-order operator with all of its children in one e-node.
-    FOApp(Symbol, SmallVec<[Id; 2]>),
-    /// One step of higher-order, curried application.
-    HOApp(Id, Id),
+    /// One step of binary, curried application.
+    App(Id, Id),
     Binder(Symbol, Id),
 }
-
-// On 64-bit hosts, Node occupies one 32-byte chunk. This keeps two nodes in a
-// typical 64-byte cache line and is why binary children are stored inline.
-#[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<Node>() == 32);
 
 /// An e-node's head, without its children, as passed to an extraction weight
 /// function. Weights cannot depend on children: the extractor sums node
@@ -429,9 +422,7 @@ const _: () = assert!(std::mem::size_of::<Node>() == 32);
 pub enum Head {
     Var,
     Atom(Symbol),
-    /// Operator and number of children.
-    FOApp(Symbol, usize),
-    HOApp,
+    App,
     Binder(Symbol),
 }
 
@@ -454,8 +445,7 @@ fn var_term(by: &Lift, ctx: usize, root_scope: usize) -> Option<Term> {
 fn node_children(node: &Node, by: &Lift) -> impl Iterator<Item = Id> {
     let (children, under_binder): (SmallVec<[Id; 2]>, bool) = match node {
         Node::Var | Node::Atom(_) => (SmallVec::new(), false),
-        Node::FOApp(_, children) => (children.clone(), false),
-        Node::HOApp(function, argument) => (smallvec::smallvec![*function, *argument], false),
+        Node::App(function, argument) => (smallvec::smallvec![*function, *argument], false),
         Node::Binder(_, body) => (smallvec::smallvec![*body], true),
     };
     let by = if under_binder { by.append(true) } else { *by };
@@ -669,20 +659,19 @@ impl EGraph {
         let base = self.intern(0, Node::Atom(name));
         base.weaken(&Lift::unused(ctx))
     }
-    pub fn fo_app(&mut self, op: &str, children: Vec<Id>) -> Id {
-        self.fo_app_symbol(op.into(), children.into())
+    pub fn apps(&mut self, op: &str, arguments: Vec<Id>) -> Id {
+        assert!(!arguments.is_empty());
+        let ctx = arguments[0].ctx();
+        assert!(arguments.iter().all(|argument| argument.ctx() == ctx));
+        let mut application = self.atom(op, ctx);
+        for argument in arguments {
+            application = self.app(application, argument);
+        }
+        application
     }
-    fn fo_app_symbol(&mut self, op: Symbol, children: SmallVec<[Id; 2]>) -> Id {
-        assert!(!children.is_empty());
-        let ctx = children[0].ctx();
-        assert!(children.iter().all(|c| c.ctx() == ctx));
-        let (common, node) = self.canonical_node(&Node::FOApp(op, children));
-        let base = self.intern(common.dom(), node);
-        base.weaken(&common)
-    }
-    pub fn ho_app(&mut self, function: Id, argument: Id) -> Id {
+    pub fn app(&mut self, function: Id, argument: Id) -> Id {
         assert_eq!(function.ctx(), argument.ctx());
-        let (common, node) = self.canonical_node(&Node::HOApp(function, argument));
+        let (common, node) = self.canonical_node(&Node::App(function, argument));
         let base = self.intern(common.dom(), node);
         base.weaken(&common)
     }
@@ -701,41 +690,19 @@ impl EGraph {
         match node {
             Node::Var => (Lift::identity(1), Node::Var),
             Node::Atom(s) => (Lift::identity(0), Node::Atom(*s)),
-            Node::FOApp(op, children) => {
-                let children: SmallVec<[_; 2]> =
-                    children.iter().map(|c| self.find_mut(c)).collect();
-                if children.iter().all(|c| c.lift().is_identity()) {
-                    return (
-                        Lift::identity(children[0].ctx()),
-                        Node::FOApp(*op, children),
-                    );
-                }
-                let common = children
-                    .iter()
-                    .skip(1)
-                    .fold(children[0].lift(), |t, c| t.union(&c.lift()).lift);
-                let narrowed = children
-                    .into_iter()
-                    .map(|c| {
-                        let projection = common.union(&c.lift()).right;
-                        Id::new(projection, c.raw())
-                    })
-                    .collect();
-                (common, Node::FOApp(*op, narrowed))
-            }
-            Node::HOApp(function, argument) => {
+            Node::App(function, argument) => {
                 let function = self.find_mut(function);
                 let argument = self.find_mut(argument);
                 if function.lift().is_identity() && argument.lift().is_identity() {
                     return (
                         Lift::identity(function.ctx()),
-                        Node::HOApp(function, argument),
+                        Node::App(function, argument),
                     );
                 }
                 let common = function.lift().union(&argument.lift()).lift;
                 let function = Id::new(common.union(&function.lift()).right, function.raw());
                 let argument = Id::new(common.union(&argument.lift()).right, argument.raw());
-                (common, Node::HOApp(function, argument))
+                (common, Node::App(function, argument))
             }
             Node::Binder(op, body) => {
                 let body = self.find_mut(body);
@@ -946,24 +913,14 @@ impl EGraph {
                     replacements[old_index]
                 }
                 Node::Atom(name) => self.atom_symbol(name, output_ctx),
-                Node::FOApp(op, children) => {
-                    let children = children
-                        .into_iter()
-                        .map(|child| {
-                            let child = child.weaken(&by);
-                            self.substitute_many_rec(&child, output_ctx, &replacements, memo)
-                        })
-                        .collect();
-                    self.fo_app_symbol(op, children)
-                }
-                Node::HOApp(function, argument) => {
+                Node::App(function, argument) => {
                     let function = function.weaken(&by);
                     let argument = argument.weaken(&by);
                     let function =
                         self.substitute_many_rec(&function, output_ctx, &replacements, memo);
                     let argument =
                         self.substitute_many_rec(&argument, output_ctx, &replacements, memo);
-                    self.ho_app(function, argument)
+                    self.app(function, argument)
                 }
                 Node::Binder(op, body) => {
                     let body = body.weaken(&by.append(true));
@@ -991,11 +948,7 @@ impl EGraph {
     /// linear: each e-class is costed once, instead of re-walking every
     /// candidate subtree at every level. It also makes the cost monotone by
     /// construction, since wrapping a term only adds a node.
-    pub fn extract_with(
-        &mut self,
-        target: &Id,
-        weight: impl Fn(Head) -> u64,
-    ) -> Option<TermCtx> {
+    pub fn extract_with(&mut self, target: &Id, weight: impl Fn(Head) -> u64) -> Option<TermCtx> {
         self.rebuild();
         let target = self.find(target);
         let scope = target.ctx();
@@ -1048,8 +1001,7 @@ impl EGraph {
                     weight(Head::Var)
                 }
                 Node::Atom(name) => weight(Head::Atom(*name)),
-                Node::FOApp(op, children) => weight(Head::FOApp(*op, children.len())),
-                Node::HOApp(_, _) => weight(Head::HOApp),
+                Node::App(_, _) => weight(Head::App),
                 Node::Binder(op, _) => weight(Head::Binder(*op)),
             };
             let mut finite = true;
@@ -1083,15 +1035,15 @@ impl EGraph {
             .get(&target)
             .and_then(Option::as_ref)
             .expect("choose recorded a finite winner for every reachable class");
-        let mut children = node_children(node, by).map(|child| self.build(&child, root_scope, choices));
+        let mut children =
+            node_children(node, by).map(|child| self.build(&child, root_scope, choices));
         match node {
             Node::Var => var_term(by, target.ctx(), root_scope).expect("checked by choose"),
             Node::Atom(name) => Term::Atom(*name),
-            Node::FOApp(op, _) => Term::FOApp(*op, children.collect()),
-            Node::HOApp(_, _) => {
-                let function = children.next().expect("HOApp has two children");
-                let argument = children.next().expect("HOApp has two children");
-                Term::HOApp(Box::new(function), Box::new(argument))
+            Node::App(_, _) => {
+                let function = children.next().expect("App has two children");
+                let argument = children.next().expect("App has two children");
+                Term::App(Box::new(function), Box::new(argument))
             }
             Node::Binder(op, _) => {
                 Term::Binder(*op, Box::new(children.next().expect("Binder has a body")))
@@ -1192,32 +1144,9 @@ impl EGraph {
                     }
                 }
             }
-            Pattern::FOApp(op, args) => {
+            Pattern::App(function_pattern, argument_pattern) => {
                 for (node, by) in self.nodes_in_class(target, mode) {
-                    let Node::FOApp(head, children) = node else {
-                        continue;
-                    };
-                    if head != op || children.len() != args.len() {
-                        continue;
-                    }
-                    let mut partial: MatchResults = smallvec::smallvec![subst.clone()];
-                    for (arg, child) in args.iter().zip(children) {
-                        let lifted = child.weaken(&by);
-                        let mut next = MatchResults::new();
-                        for partial_subst in partial {
-                            self.ematch_rec(arg, &lifted, partial_subst, mode, top_ctx, &mut next);
-                        }
-                        partial = next;
-                        if partial.is_empty() {
-                            break;
-                        }
-                    }
-                    out.extend(partial);
-                }
-            }
-            Pattern::HOApp(function_pattern, argument_pattern) => {
-                for (node, by) in self.nodes_in_class(target, mode) {
-                    let Node::HOApp(function, argument) = node else {
+                    let Node::App(function, argument) = node else {
                         continue;
                     };
                     let function = function.weaken(&by);
@@ -1332,17 +1261,10 @@ impl EGraph {
                 (index.get() < depth).then(|| self.var(ctx, ctx - 1 - index.get()))
             }
             Pattern::Atom(name) => Some(self.atom_symbol(*name, ctx)),
-            Pattern::FOApp(op, children) => {
-                let children: Option<SmallVec<[Id; 2]>> = children
-                    .iter()
-                    .map(|p| self.try_instantiate_rec(p, ctx, top_ctx, subst))
-                    .collect();
-                Some(self.fo_app_symbol(*op, children?))
-            }
-            Pattern::HOApp(function, argument) => {
+            Pattern::App(function, argument) => {
                 let function = self.try_instantiate_rec(function, ctx, top_ctx, subst)?;
                 let argument = self.try_instantiate_rec(argument, ctx, top_ctx, subst)?;
-                Some(self.ho_app(function, argument))
+                Some(self.app(function, argument))
             }
             Pattern::Binder(op, body) => {
                 let body = self.try_instantiate_rec(body, ctx + 1, top_ctx, subst)?;
@@ -1442,12 +1364,8 @@ impl EGraph {
             match node {
                 Node::Var => "var".into(),
                 Node::Atom(name) => symbol_text(*name),
-                Node::FOApp(op, children) => {
-                    let children = children.iter().map(Id::show).collect::<Vec<_>>().join(" ");
-                    format!("({} {children})", symbol_text(*op))
-                }
-                Node::HOApp(function, argument) => {
-                    format!("[{} {}]", function.show(), argument.show())
+                Node::App(function, argument) => {
+                    format!("({} {})", function.show(), argument.show())
                 }
                 Node::Binder(op, body) => format!("(@{} {})", symbol_text(*op), body.show()),
             }

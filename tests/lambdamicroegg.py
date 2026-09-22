@@ -2,7 +2,7 @@
 
 This stays close to Max Willsey's microegg.  The two additions are fat IDs,
 which remember how an e-class's intrinsic context sits in the current context,
-higher-order application, and capture-avoiding substitution. Scans are preferred over
+binary application, and capture-avoiding substitution. Scans are preferred over
 extra indexes so that the binding operations remain visible.
 """
 
@@ -74,32 +74,29 @@ type Id = FatId
 
 
 class Term:
-    def __sub__(self, other: "Term") -> "FOApp":
+    def __sub__(self, other: "Term") -> "App":
         assert isinstance(other, Term)
-        return FOApp("-", (self, other))
+        return App(App(Atom("-"), self), other)
 
     def size(self) -> int:
         match self:
-            case FOApp(_f, args):
-                return 1 + sum(arg.size() for arg in args)
-            case HOApp(function, argument):
+            case App(function, argument):
                 return 1 + function.size() + argument.size()
             case Binder(_op, body):
                 return 1 + body.size()
-            case BVar() | Var():
+            case Atom() | BVar() | Var():
                 return 1
             case _:
                 raise ValueError(f"unexpected term: {self}")
 
 
 @dataclass(frozen=True)
-class FOApp(Term):
-    f: object
-    args: tuple[Term, ...] = ()
+class Atom(Term):
+    name: object
 
 
 @dataclass(frozen=True)
-class HOApp(Term):
+class App(Term):
     function: Term
     argument: Term
 
@@ -119,7 +116,7 @@ class BVar(Term):
 
 @dataclass(frozen=True)
 class Var(Term):
-    """A first-order pattern variable."""
+    """A pattern variable."""
 
     name: str
 
@@ -136,7 +133,7 @@ type Substitution = dict[str, FatId]
 
 
 _BOUND = object()
-_HO_APP = object()
+_APP = object()
 
 @dataclass(frozen=True)
 class BinderHead:
@@ -196,12 +193,10 @@ class EGraph:
     def atom(self, f: object, ctx: int = 0) -> FatId:
         return self._add_node(0, Node(f)).weaken(Lift.empty(ctx))
 
-    def fo_app(self, f: object, args: tuple[FatId, ...], ctx: int | None = None) -> FatId:
-        if not args:
-            assert ctx is not None
-            return self.atom(f, ctx)
-        ctx = args[0].ctx
-        assert all(arg.ctx == ctx for arg in args)
+    def app(self, function: FatId, argument: FatId) -> FatId:
+        args = (function, argument)
+        ctx = function.ctx
+        assert argument.ctx == ctx
         args = tuple(self.find(arg) for arg in args)
         used = tuple(sorted({i for arg in args for i in arg.lift.positions}))
         where = {level: i for i, level in enumerate(used)}
@@ -209,10 +204,7 @@ class EGraph:
             FatId(arg.raw, Lift(tuple(where[i] for i in arg.lift.positions), len(used)))
             for arg in args
         )
-        return self._add_node(len(used), Node(f, core)).weaken(Lift(used, ctx))
-
-    def ho_app(self, function: FatId, argument: FatId) -> FatId:
-        return self.fo_app(_HO_APP, (function, argument))
+        return self._add_node(len(used), Node(_APP, core)).weaken(Lift(used, ctx))
 
     def binder(self, op: object, body: FatId) -> FatId:
         assert body.ctx > 0
@@ -246,11 +238,10 @@ class EGraph:
                 body_id = self.add_term(body, subst, ctx + 1)
                 replacement_id = self.add_term(replacement, subst, ctx)
                 return self.substitute(body_id, ctx, replacement_id)
-            case FOApp(f, args):
-                ids = tuple(self.add_term(arg, subst, ctx) for arg in args)
-                return self.fo_app(f, ids, ctx)
-            case HOApp(function, argument):
-                return self.ho_app(
+            case Atom(name):
+                return self.atom(name, ctx)
+            case App(function, argument):
+                return self.app(
                     self.add_term(function, subst, ctx),
                     self.add_term(argument, subst, ctx),
                 )
@@ -395,25 +386,16 @@ class EGraph:
                         body = node.args[0].weaken(by.extend(True))
                         results.extend(self._ematch(body_pattern, body, subst))
                 return results
-            case FOApp(f, args):
+            case Atom(name):
+                return [
+                    subst
+                    for node, _by in self.nodes_in_class(id)
+                    if node.f == name and not node.args
+                ]
+            case App(function_pattern, argument_pattern):
                 results = []
                 for node, by in self.nodes_in_class(id):
-                    if node.f != f or len(node.args) != len(args):
-                        continue
-                    todo = [subst]
-                    for arg_pattern, arg in zip(args, node.args):
-                        target = arg.weaken(by)
-                        todo = [
-                            out
-                            for current in todo
-                            for out in self._ematch(arg_pattern, target, current)
-                        ]
-                    results.extend(todo)
-                return results
-            case HOApp(function_pattern, argument_pattern):
-                results = []
-                for node, by in self.nodes_in_class(id):
-                    if node.f is not _HO_APP:
+                    if node.f is not _APP:
                         continue
                     functions = self._ematch(
                         function_pattern, node.args[0].weaken(by), subst
@@ -504,11 +486,7 @@ class EGraph:
                     self._substitute(arg.weaken(by), level, replacement, memo)
                     for arg in node.args
                 )
-                translated = (
-                    self.ho_app(*args)
-                    if node.f is _HO_APP
-                    else self.fo_app(node.f, args, body.ctx - 1)
-                )
+                translated = self.app(*args) if node.f is _APP else self.atom(node.f, body.ctx - 1)
             self._union(result, translated)
         return self.find(result)
 
@@ -555,9 +533,7 @@ class EGraph:
                 )
                 if any(arg is None for arg in args):
                     continue
-                candidate = (
-                    HOApp(*args) if node.f is _HO_APP else FOApp(node.f, args)
-                )  # type: ignore[arg-type]
+                candidate = App(*args) if node.f is _APP else Atom(node.f)  # type: ignore[arg-type]
             if best is None or cost(candidate) < cost(best):
                 best = candidate
         active.remove(id.raw)
@@ -565,12 +541,18 @@ class EGraph:
         return best
 
 
-def Consts(names: str) -> list[FOApp]:
-    return [FOApp(name) for name in names.split()]
+def Consts(names: str) -> list[Atom]:
+    return [Atom(name) for name in names.split()]
 
 
 def Function(name: str):
-    return lambda *args: FOApp(name, args)
+    def apply(*args: Term) -> Term:
+        term: Term = Atom(name)
+        for argument in args:
+            term = App(term, argument)
+        return term
+
+    return apply
 
 
 def Vars(names: str) -> list[Var]:
@@ -583,9 +565,9 @@ def test_egraph():
     x, y = Vars("x y")
     sub = Function("-")
     egraph.add_term(sub(a, b))
-    assert len(egraph.uf) == 3
+    assert len(egraph.uf) == 5
     egraph.add_term(sub(a, b))
-    assert len(egraph.uf) == 3
+    assert len(egraph.uf) == 5
     egraph.union(sub(a, b), c)
     assert egraph.is_eq(a - b, c)
     egraph.rw(sub(x, y), sub(y, x))
@@ -597,18 +579,18 @@ def test_fat_ids_and_substitution():
     pair = Function("pair")
 
     # Only the nearest variable is retained in the term's intrinsic context.
-    term = egraph.add_term(pair(BVar(0), FOApp("constant")), ctx=2)
+    term = egraph.add_term(pair(BVar(0), Atom("constant")), ctx=2)
     assert term.ctx == 2 and term.lift.positions == (1,)
 
     # [x := fred] x = fred.
-    assert egraph.extract(Subst(BVar(0), FOApp("fred"))) == FOApp("fred")
+    assert egraph.extract(Subst(BVar(0), Atom("fred"))) == Atom("fred")
 
     # Substitution under a lambda shifts the free replacement and avoids capture.
     capture_test = Subst(Binder("lam", BVar(1)), BVar(0))
     assert egraph.extract(capture_test, ctx=1) == Binder("lam", BVar(1))
 
     # An unused variable is deleted by changing the fat ID alone.
-    assert egraph.extract(Subst(FOApp("constant"), FOApp("ignored"))) == FOApp("constant")
+    assert egraph.extract(Subst(Atom("constant"), Atom("ignored"))) == Atom("constant")
 
     # A recursive class may recur under a binder with a larger ambient context.
     cyclic = EGraph()
@@ -616,13 +598,11 @@ def test_fat_ids_and_substitution():
     cyclic._union(x, cyclic.binder("lam", x.in_context(2)))
     cyclic.rebuild()
     fred = cyclic.atom("fred")
-    assert cyclic.extract(Subst(BVar(0), FOApp("fred"))) == FOApp("fred")
+    assert cyclic.extract(Subst(BVar(0), Atom("fred"))) == Atom("fred")
     assert cyclic.find(cyclic.substitute(x, 0, fred)) == cyclic.find(fred)
 
-    # Higher-order and first-order applications deliberately remain distinct.
-    binary = HOApp(HOApp(FOApp("f"), FOApp("x")), FOApp("y"))
+    binary = App(App(Atom("f"), Atom("x")), Atom("y"))
     assert egraph.extract(binary) == binary
-    assert not egraph.is_eq(binary, FOApp("f", (FOApp("x"), FOApp("y"))))
 
 
 if __name__ == "__main__":

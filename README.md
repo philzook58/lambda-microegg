@@ -56,10 +56,9 @@ Binder operators use `(@OP NAME BODY)` syntax. For example,
 `(@sum i (f i))` is stored directly as the `sum` binder. Lambda calculus uses
 the same generic binder representation through `@lam`.
 
-Square brackets are curried higher-order application: `[f x y]` is stored as
-`HOApp(HOApp(f, x), y)`. Parenthesized `(f x y)` remains a single n-ary,
-first-order application node. Braces denote a metavariable occurrence rather
-than an e-node. On a match left-hand side its arguments are Miller parameters;
+Applications are binary and curried: both `[f x y]` and `(f x y)` are stored as
+`App(App(f, x), y)`. Braces denote a metavariable occurrence rather than an
+e-node. On a match left-hand side its arguments are Miller parameters;
 on the right they instantiate the captured body. Beta reduction can be written
 `[(@lam x {?body x}) ?e]` to `{?body ?e}`.
 
