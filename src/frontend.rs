@@ -332,10 +332,10 @@ pub fn add_syntax_term(eg: &mut EGraph, syntax: &Syntax, ctx: usize) -> Result<I
         binders: &mut Vec<String>,
     ) -> Result<Id, String> {
         let ctx = outer_ctx + binders.len();
-        if ctx > 7 {
+        if ctx > 31 {
             return Err(syntax
                 .location
-                .error("packed IDs support at most 7 context variables"));
+                .error("thinnings support at most 31 context variables"));
         }
         let result = match &syntax.kind {
             SyntaxKind::Atom { text: atom, quoted } if *quoted => Ok(eg.atom(atom, ctx)),
@@ -442,8 +442,8 @@ pub fn add_syntax_term(eg: &mut EGraph, syntax: &Syntax, ctx: usize) -> Result<I
         Ok(eg.apps(op, children))
     }
 
-    if ctx > 7 {
-        return Err("packed IDs support at most 7 context variables".into());
+    if ctx > 31 {
+        return Err("thinnings support at most 31 context variables".into());
     }
     go(eg, syntax, ctx, &mut vec![])
 }
@@ -648,8 +648,8 @@ fn command_context<'a>(
     let context = atom_of(context)?
         .parse::<usize>()
         .map_err(|_| location.error(format!("{command} context must be a nonnegative integer")))?;
-    if context > 7 {
-        return Err(location.error("packed IDs support at most 7 context variables"));
+    if context > 31 {
+        return Err(location.error("thinnings support at most 31 context variables"));
     }
     Ok((context, arguments))
 }

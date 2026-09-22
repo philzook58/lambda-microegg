@@ -816,13 +816,14 @@ fn sexp_echo_emits_quoted_strings_and_atoms() {
     );
 }
 #[test]
-fn packed_lift_limit() {
-    let last = Lift::select(7, 6);
-    assert_eq!(last.cod(), 7);
+fn thinning_limit() {
+    let last = Lift::select(31, 30);
+    assert_eq!(last.cod(), 31);
     assert_eq!(last.dom(), 1);
-    assert!(last.get(6));
-    assert_eq!(Lift::identity(7).compose(&last), last);
-    assert_eq!(std::mem::size_of::<Id>(), 4);
+    assert!(last.get(30));
+    assert_eq!(Lift::identity(31).compose(&last), last);
+    assert_eq!(std::mem::size_of::<Lift>(), 4);
+    assert_eq!(std::mem::size_of::<Id>(), 8);
 }
 #[test]
 fn fat_ids_hide_identity_lifts() {
@@ -1934,8 +1935,8 @@ fn printed_quoted_atoms_round_trip() {
 #[test]
 fn overly_deep_frontend_context_is_an_error() {
     assert!(
-        run_script("(insert 8 a)")
+        run_script("(insert 32 a)")
             .unwrap_err()
-            .contains("at most 7")
+            .contains("at most 31")
     );
 }

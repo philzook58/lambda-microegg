@@ -131,7 +131,7 @@ fn pattern_occurrence_lift(
 /// an ambient context. The leading 1 records the codomain length; lower bits
 /// select where each domain variable occurs in that codomain.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct Lift(u8);
+pub struct Lift(u32);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Union {
@@ -149,13 +149,13 @@ struct Pullback {
 }
 
 impl Lift {
-    fn mask(n: usize) -> u8 {
-        assert!(n <= 7, "packed IDs support at most 7 context variables");
-        if n == 0 { 0 } else { (1u8 << n) - 1 }
+    fn mask(n: usize) -> u32 {
+        assert!(n <= 31, "thinnings support at most 31 context variables");
+        if n == 0 { 0 } else { (1u32 << n) - 1 }
     }
-    fn from_bits(bits: u8, n: usize) -> Self {
+    fn from_bits(bits: u32, n: usize) -> Self {
         let mask = Self::mask(n);
-        Self((1u8 << n) | (bits & mask))
+        Self((1u32 << n) | (bits & mask))
     }
     pub fn identity(n: usize) -> Self {
         Self::from_bits(Self::mask(n), n)
@@ -165,19 +165,19 @@ impl Lift {
     }
     pub fn select(n: usize, i: usize) -> Self {
         assert!(i < n);
-        Self::from_bits(1u8 << i, n)
+        Self::from_bits(1u32 << i, n)
     }
     fn selected(n: usize, indices: &[usize]) -> Self {
         let bits = indices.iter().fold(0, |bits, &i| {
             assert!(i < n);
-            bits | (1u8 << i)
+            bits | (1u32 << i)
         });
         Self::from_bits(bits, n)
     }
     pub fn cod(&self) -> usize {
-        (7 - self.0.leading_zeros()) as usize
+        (31 - self.0.leading_zeros()) as usize
     }
-    fn selected_bits(&self) -> u8 {
+    fn selected_bits(&self) -> u32 {
         self.0 & Self::mask(self.cod())
     }
     pub fn dom(&self) -> usize {
@@ -185,7 +185,7 @@ impl Lift {
     }
     pub fn get(&self, i: usize) -> bool {
         assert!(i < self.cod());
-        self.selected_bits() & (1u8 << i) != 0
+        self.selected_bits() & (1u32 << i) != 0
     }
     fn prefix(&self, n: usize) -> Self {
         assert!(n <= self.cod());
@@ -193,7 +193,7 @@ impl Lift {
     }
     fn append(&self, keep: bool) -> Self {
         Self::from_bits(
-            self.selected_bits() | ((keep as u8) << self.cod()),
+            self.selected_bits() | ((keep as u32) << self.cod()),
             self.cod() + 1,
         )
     }
@@ -217,7 +217,7 @@ impl Lift {
         for i in 0..self.cod() {
             if self.get(i) {
                 if small.get(j) {
-                    bits |= 1u8 << i;
+                    bits |= 1u32 << i;
                 }
                 j += 1;
             }
@@ -238,7 +238,7 @@ impl Lift {
             }
             if self.get(level) {
                 if target.get(level) {
-                    bits |= 1u8 << position;
+                    bits |= 1u32 << position;
                 }
                 position += 1;
             }
@@ -271,10 +271,10 @@ impl Lift {
         for i in 0..self.cod() {
             if union.get(i) {
                 if self.get(i) {
-                    left |= 1u8 << j;
+                    left |= 1u32 << j;
                 }
                 if other.get(i) {
-                    right |= 1u8 << j;
+                    right |= 1u32 << j;
                 }
                 j += 1;
             }
@@ -312,13 +312,13 @@ impl Lift {
         for i in 0..self.cod() {
             if self.get(i) {
                 if other.get(i) {
-                    left |= 1u8 << a;
+                    left |= 1u32 << a;
                 }
                 a += 1;
             }
             if other.get(i) {
                 if self.get(i) {
-                    right |= 1u8 << b;
+                    right |= 1u32 << b;
                 }
                 b += 1;
             }
@@ -340,7 +340,7 @@ impl Lift {
             .zip(right)
             .enumerate()
             .fold(0, |bits, (i, (left, right))| {
-                bits | (u8::from(left == right) << i)
+                bits | (u32::from(left == right) << i)
             });
         Self::from_bits(bits, self.dom())
     }
@@ -351,29 +351,28 @@ impl Lift {
     }
 }
 
-/// Upper 8 bits encode the lift; lower 24 bits hold Max's raw ID.
+/// A fat e-class ID: its thinning records the placement of the raw e-class in
+/// the ambient context.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct Id(u32);
+pub struct Id {
+    thinning: Lift,
+    raw: RawId,
+}
 
-// These packed values are intentionally smaller than a machine register.
-// Widening Lift (and therefore Id) should make us reconsider the inline
-// capacities and layouts below rather than silently changing every hot type.
 const _: () = {
-    assert!(std::mem::size_of::<Lift>() == 1);
-    assert!(std::mem::size_of::<Id>() == 4);
+    assert!(std::mem::size_of::<Lift>() == 4);
+    assert!(std::mem::size_of::<Id>() == 8);
 };
 
 impl Id {
-    const RAW_MASK: u32 = (1 << 24) - 1;
-    fn new(lift: Lift, raw: RawId) -> Self {
-        assert!(raw <= Self::RAW_MASK, "exhausted 24-bit raw IDs");
-        Self(((lift.0 as u32) << 24) | raw)
+    fn new(thinning: Lift, raw: RawId) -> Self {
+        Self { thinning, raw }
     }
     pub fn lift(&self) -> Lift {
-        Lift((self.0 >> 24) as u8)
+        self.thinning
     }
     pub fn raw(&self) -> RawId {
-        self.0 & Self::RAW_MASK
+        self.raw
     }
     pub fn ctx(&self) -> usize {
         self.lift().cod()
@@ -474,10 +473,10 @@ impl RunStats {
 #[derive(Clone, Default)]
 pub struct Subst(SmallVec<[(Symbol, Id); 3]>);
 
-// Three common bindings fit in one 32-byte value on 64-bit hosts. Treat a
+// Three common bindings fit in one 48-byte value on 64-bit hosts. Treat a
 // change here as a prompt to remeasure matcher allocation and cache behavior.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<Subst>() == 32);
+const _: () = assert!(std::mem::size_of::<Subst>() == 48);
 
 type MatchResults = SmallVec<[Subst; 1]>;
 
@@ -574,8 +573,8 @@ impl EGraph {
     }
     fn make_set(&mut self, scope: usize) -> Id {
         assert!(
-            self.parent.len() <= Id::RAW_MASK as usize,
-            "exhausted 24-bit raw IDs"
+            self.parent.len() <= RawId::MAX as usize,
+            "exhausted raw IDs"
         );
         self.rev_valid = false;
         let raw = self.parent.len() as RawId;
