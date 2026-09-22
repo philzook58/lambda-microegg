@@ -407,8 +407,14 @@ pub fn add_syntax_term(eg: &mut EGraph, syntax: &Syntax, ctx: usize) -> Result<I
         let Some(head) = items.first() else {
             return Err("empty term list".into());
         };
-        let op = atom_of(head)?;
-        if let Some(op) = op.strip_prefix('@') {
+        let special = match &head.kind {
+            SyntaxKind::Atom {
+                text,
+                quoted: false,
+            } => Some(text.as_str()),
+            _ => None,
+        };
+        if let Some(op) = special.and_then(|op| op.strip_prefix('@')) {
             if op.is_empty() || items.len() != 3 {
                 return Err("(@OP NAME BODY) takes a binder name and body".into());
             }
@@ -418,7 +424,7 @@ pub fn add_syntax_term(eg: &mut EGraph, syntax: &Syntax, ctx: usize) -> Result<I
             binders.pop();
             return Ok(eg.binder(op, body?));
         }
-        if op == "#subst" {
+        if special == Some("#subst") {
             if items.len() != 4 {
                 return Err(
                     "(#subst BODY NAME REPLACEMENT) takes a body, binder, and replacement".into(),
@@ -432,14 +438,7 @@ pub fn add_syntax_term(eg: &mut EGraph, syntax: &Syntax, ctx: usize) -> Result<I
             let replacement = go(eg, &items[3], outer_ctx, binders)?;
             return Ok(eg.substitute(&body, ctx, &replacement));
         }
-        if items.len() < 2 {
-            return Err(format!("application '({op} ...)' needs an argument"));
-        }
-        let children = items[1..]
-            .iter()
-            .map(|item| go(eg, item, outer_ctx, binders))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(eg.apps(op, children))
+        bracket(eg, items, outer_ctx, binders)
     }
 
     if ctx > 31 {
@@ -567,13 +566,14 @@ fn parse_pattern(syntax: &Syntax, mode: PatternMode) -> Result<Pattern, String> 
                 let Some(head) = items.first() else {
                     return Err(syntax.location.error("empty pattern list"));
                 };
-                let op = atom_of(head)?;
-                if op.starts_with('?') {
-                    return Err(head.location.error(format!(
-                        "metavariable '{op}' is not allowed in application head position; use {{{op} ...}} for a Miller metavariable occurrence or [{op} ...] for a curried application pattern"
-                    )));
-                }
-                if let Some(op) = op.strip_prefix('@') {
+                let special = match &head.kind {
+                    SyntaxKind::Atom {
+                        text,
+                        quoted: false,
+                    } => Some(text.as_str()),
+                    _ => None,
+                };
+                if let Some(op) = special.and_then(|op| op.strip_prefix('@')) {
                     if op.is_empty() || items.len() != 3 {
                         return Err(syntax
                             .location
@@ -585,7 +585,7 @@ fn parse_pattern(syntax: &Syntax, mode: PatternMode) -> Result<Pattern, String> 
                     binders.pop();
                     return Ok(Pattern::binder(op, body?));
                 }
-                if op == "#subst" {
+                if special == Some("#subst") {
                     if items.len() != 4 {
                         return Err(syntax.location.error(
                             "(#subst BODY NAME REPLACEMENT) takes a body, binder, and replacement",
@@ -601,13 +601,14 @@ fn parse_pattern(syntax: &Syntax, mode: PatternMode) -> Result<Pattern, String> 
                 if items.len() < 2 {
                     return Err(syntax
                         .location
-                        .error(format!("pattern '({op} ...)' needs an argument")));
+                        .error("application '(FUNCTION ARGUMENT ...)' needs an argument"));
                 }
-                let children = items[1..]
-                    .iter()
-                    .map(|item| go(item, mode, binders))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Pattern::apps(op, children))
+                let mut terms = items.iter();
+                let mut application = go(terms.next().unwrap(), mode, binders)?;
+                for argument in terms {
+                    application = Pattern::app(application, go(argument, mode, binders)?);
+                }
+                Ok(application)
             }
         };
         result.map_err(|error| syntax.locate(error))

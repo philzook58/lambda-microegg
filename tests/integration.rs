@@ -257,12 +257,14 @@ fn binder_symbol_is_part_of_a_direct_enode() {
 #[test]
 fn application_syntaxes_share_the_same_curried_representation() {
     let output = run_script(
-        "(insert [f x y]) (extract [f x y]) (guard [f x y] [[f x] y]) (guard [f x y] (f x y))",
+        "(insert [f x y]) (extract [f x y]) (guard [f x y] [[f x] y]) (guard [f x y] (f x y)) (guard (@lam x (x y)) (@lam x [x y])) (extract (@lam x (x y)))",
     )
     .unwrap();
     assert_eq!(output[1], "(f x y)");
     assert_eq!(output[2], "; guard passed");
     assert_eq!(output[3], "; guard passed");
+    assert_eq!(output[4], "; guard passed");
+    assert_eq!(output[5], "(@lam x0 (x0 y))");
 }
 #[test]
 fn bracket_beta_uses_miller_substitution() {
@@ -280,12 +282,6 @@ fn bracket_beta_uses_miller_substitution() {
 }
 #[test]
 fn metavariable_occurrences_require_braces() {
-    let old = run_script("(rewrite (@lam x (?body x)) ok)").unwrap_err();
-    assert_eq!(
-        old,
-        "line 1:19: metavariable '?body' is not allowed in application head position; use {?body ...} for a Miller metavariable occurrence or [?body ...] for a curried application pattern"
-    );
-
     let term = run_script("(insert {?body x})").unwrap_err();
     assert!(term.contains("metavariable occurrence used in a term"));
 
@@ -776,14 +772,14 @@ fn sexp_print_egraph_shows_classes_nodes_and_lifts() {
         output[1],
         concat!(
             "; egraph: 5 classes, 5 e-nodes\n",
-            "; e0 = ctx1 |-> $0\n",
-            ";   e0 <- var\n",
-            "; e1 = ctx0 |-> pair\n",
-            ";   e1 <- pair\n",
+            "; e0 = ctx0 |-> pair\n",
+            ";   e0 <- pair\n",
+            "; e1 = ctx1 |-> $0\n",
+            ";   e1 <- var\n",
             "; e2 = ctx1 |-> (pair $0)\n",
-            ";   e2 <- (l_0(e1) e0)\n",
+            ";   e2 <- (l_0(e0) e1)\n",
             "; e3 = ctx2 |-> (pair $0 $1)\n",
-            ";   e3 <- (l_10(e2) l_01(e0))\n",
+            ";   e3 <- (l_10(e2) l_01(e1))\n",
             "; e4 = ctx1 |-> (@lam x0 (pair $0 x0))\n",
             ";   e4 <- (@lam e3)",
         )
