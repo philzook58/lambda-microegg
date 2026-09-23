@@ -162,7 +162,7 @@ Or steal a bit to distinguish between Id and Symbol?
 
 subst enough to kill free variables (a x y k l) and the rest go in an app.
 Have both binary app and
-App(Id, Vec![])
+HOApp(Id, Vec![])
 (f a b)
 ((f) a b)
 
@@ -195,3 +195,5 @@ Maybe the haskell one hsould just be entirely using []
 
 I'd inline instatiiate_bindings
 and I'd panic rather than Option out for stuff that really shouldn't happen.
+
+(rewrite (@fix x {?body x}) {{?body (@fix x (?body x)})

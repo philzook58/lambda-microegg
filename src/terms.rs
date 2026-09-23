@@ -1,4 +1,4 @@
-use super::{DeBruijnIndex, DeBruijnLevel, occurrence_lift};
+use super::Lift;
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use symbol_table::GlobalSymbol as Symbol;
@@ -245,7 +245,7 @@ impl Rewrite {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub enum Term {
     FVar(DeBruijnLevel),
     BVar(DeBruijnIndex),
@@ -323,7 +323,7 @@ impl std::fmt::Display for Term {
 
 /// An extracted term together with the size of its free-variable context.
 /// `FVar` levels refer to this scope; `BVar` indices refer to enclosing binders.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct TermCtx {
     pub scope: usize,
     pub t: Term,
@@ -437,5 +437,115 @@ impl std::fmt::Display for NamedTerm<'_> {
         }
         let outer_ctx = self.term.scope - self.root_binders.len();
         go(&self.term.t, f, outer_ctx, self.root_binders, &mut vec![])
+    }
+}
+
+// Two ways of naming a variable:
+//
+// - a de Bruijn index counts outward from the nearest binder;
+// - a de Bruijn level counts a variable coming down from an ambient context.
+//
+// - Note that both of these concepts are beside the main point from that of a thinning/lifting internally inside the egraph
+//   We have these really for the more conventional user syntax. Working with raw thinnings is too mind boggling
+
+/// A de Bruijn index: zero names the nearest enclosing binder.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize)]
+pub struct DeBruijnIndex(usize);
+
+impl DeBruijnIndex {
+    pub fn new(index: usize) -> Self {
+        Self(index)
+    }
+    pub fn get(self) -> usize {
+        self.0
+    }
+    pub fn to_level(self, context_len: usize) -> Option<DeBruijnLevel> {
+        Some(DeBruijnLevel(
+            context_len.checked_sub(self.0.checked_add(1)?)?,
+        ))
+    }
+}
+
+impl From<usize> for DeBruijnIndex {
+    fn from(index: usize) -> Self {
+        Self(index)
+    }
+}
+
+/// A de Bruijn level: zero names the outermost variable in a context.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize)]
+pub struct DeBruijnLevel(usize);
+
+impl DeBruijnLevel {
+    pub fn new(level: usize) -> Self {
+        Self(level)
+    }
+    pub fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for DeBruijnLevel {
+    fn from(level: usize) -> Self {
+        Self(level)
+    }
+}
+
+/// Convert distinct pattern-local indices to levels in the current context.
+fn local_indices_to_levels(
+    top_ctx: usize,
+    current_ctx: usize, // == top context + # of bound variables
+    arguments: &[DeBruijnIndex],
+) -> Option<SmallVec<[DeBruijnLevel; 4]>> {
+    let local_depth = current_ctx.checked_sub(top_ctx)?;
+    if arguments.iter().any(|index| index.get() >= local_depth)
+        || arguments
+            .iter()
+            .enumerate()
+            .any(|(i, index)| arguments[..i].contains(index))
+    {
+        return None;
+    }
+    arguments
+        .iter()
+        .map(|index| index.to_level(current_ctx))
+        .collect()
+}
+
+/// Bring down `top context + Miller arguments` into the current context. Match
+/// arguments are required to be written in this outer-to-inner order.
+#[inline(always)]
+fn occurrence_lift(
+    top_ctx: usize,
+    current_ctx: usize,
+    arguments: &[DeBruijnIndex],
+) -> Option<Lift> {
+    // First-order metavariables are overwhelmingly common. They keep the
+    // whole top context and none of the binders introduced inside the rule.
+    if arguments.is_empty() {
+        current_ctx.checked_sub(top_ctx)?;
+        return Some(Lift::from_bits(Lift::mask(top_ctx), current_ctx));
+    }
+    let levels = local_indices_to_levels(top_ctx, current_ctx, arguments)?;
+    if !levels.windows(2).all(|pair| pair[0] < pair[1]) {
+        return None;
+    }
+    let selected: SmallVec<[usize; 8]> = (0..top_ctx)
+        .chain(levels.iter().map(|level| level.get()))
+        .collect();
+    Some(Lift::selected(current_ctx, &selected))
+}
+
+#[inline(always)]
+pub(crate) fn pattern_occurrence_lift(
+    top_ctx: usize,
+    current_ctx: usize,
+    arguments: &[Pattern],
+) -> Option<Lift> {
+    if arguments.is_empty() {
+        occurrence_lift(top_ctx, current_ctx, &[])
+    } else {
+        let indices = Pattern::miller_indices(arguments)?;
+        occurrence_lift(top_ctx, current_ctx, &indices)
     }
 }

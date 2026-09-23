@@ -3,7 +3,8 @@
 Using Lifting e-graph ideas https://arxiv.org/abs/2606.22734  https://www.youtube.com/watch?v=h1CzZguA6DE
 
 Blog posts:
-    - <https://www.philipzucker.com/lambda_miller_egg/>
+
+- <https://www.philipzucker.com/lambda_miller_egg/> [tag](https://github.com/philzook58/lambda-microegg/tree/blogpost1)
 
 The basic idea is [slotted e-graphs](https://dl.acm.org/doi/10.1145/3729326) combined with McBride's [Everybody's Got to Be Somewhere](https://arxiv.org/abs/1807.04085).
 
@@ -35,6 +36,17 @@ There is an instrinsic question about how to take patterns that are bound in a d
 ```sh
 cargo run --release -- example.sexp
 ```
+
+For subprocess use, `--json` writes one JSON object per `extract` or
+`print-egraph` command to stdout. All other command output is written to
+stderr, leaving stdout as a newline-delimited JSON stream:
+
+```sh
+cargo run --release -- --json example.sexp
+```
+
+Extracted terms are serialized as a recursive AST. E-graph dumps contain
+structured classes, representatives, nodes, child IDs, and thinning bits.
 
 # Commands
 

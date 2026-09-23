@@ -157,6 +157,76 @@ fn sum_swap_case(binders: usize) -> (EGraph, Id, Id, [Rewrite; 1]) {
     (eg, term, goal, [rule])
 }
 
+/// A tensor-contraction-shaped summation workload. Unlike `sum_swap_case`,
+/// every index occurs in the body, several terms share indices, and the rules
+/// exercise thinning side conditions as well as binder permutation.
+fn dense_sum_case() -> (EGraph, [Rewrite; 7]) {
+    let mut eg = EGraph::new();
+    let x: Vec<_> = (0..10).map(|level| eg.var(10, level)).collect();
+
+    let a = eg.apps("a", vec![x[0], x[1]]);
+    let b = eg.apps("b", vec![x[2]]);
+    let c = eg.apps("c", vec![x[2], x[3]]);
+    let d = eg.apps("d", vec![x[4]]);
+    let e = eg.apps("e", vec![x[4], x[5]]);
+    let f = eg.apps("f", vec![x[6]]);
+    let g = eg.apps("g", vec![x[6], x[7]]);
+    let h = eg.apps("h", vec![x[8]]);
+    let i = eg.apps("i", vec![x[8], x[9]]);
+    let j = eg.apps("j", vec![x[0]]);
+    let products = [
+        eg.apps("*", vec![a, b]),
+        eg.apps("*", vec![c, d]),
+        eg.apps("*", vec![e, f]),
+        eg.apps("*", vec![g, h]),
+        eg.apps("*", vec![i, j]),
+    ];
+    let mut body = products[0];
+    for product in &products[1..] {
+        body = eg.apps("+", vec![body, *product]);
+    }
+    for _ in 0..10 {
+        body = eg.binder("sum", body);
+    }
+    black_box(body);
+
+    let var = Pattern::meta;
+    let sum = |body| Pattern::binder("sum", body);
+    let plus = |left, right| Pattern::apps("+", vec![left, right]);
+    let times = |left, right| Pattern::apps("*", vec![left, right]);
+    let rules = [
+        rewrite(
+            sum(sum(Pattern::miller("?body", vec![1, 0]))),
+            sum(sum(Pattern::miller("?body", vec![0, 1]))),
+        ),
+        rewrite(
+            sum(plus(
+                Pattern::miller("?a", vec![0]),
+                Pattern::miller("?b", vec![0]),
+            )),
+            plus(
+                sum(Pattern::miller("?a", vec![0])),
+                sum(Pattern::miller("?b", vec![0])),
+            ),
+        ),
+        rewrite(
+            sum(times(var("?c"), Pattern::miller("?f", vec![0]))),
+            times(var("?c"), sum(Pattern::miller("?f", vec![0]))),
+        ),
+        rewrite(
+            sum(times(Pattern::miller("?f", vec![0]), var("?c"))),
+            times(var("?c"), sum(Pattern::miller("?f", vec![0]))),
+        ),
+        rewrite(
+            plus(plus(var("?a"), var("?b")), var("?c")),
+            plus(var("?a"), plus(var("?b"), var("?c"))),
+        ),
+        rewrite(plus(var("?a"), var("?b")), plus(var("?b"), var("?a"))),
+        rewrite(times(var("?a"), var("?b")), times(var("?b"), var("?a"))),
+    ];
+    (eg, rules)
+}
+
 /// A deep chain of distinct e-classes beneath one context variable. Each link
 /// is its own e-class, so this isolates traversal cost over many classes from
 /// the combinatorial blowup the AC cases measure.
@@ -249,6 +319,18 @@ fn bench_shape_and_binders(c: &mut Criterion) {
                 let stats = eg.saturate(&rules);
                 assert!(eg.equivalent(&term, &goal));
                 black_box(stats)
+            },
+            BatchSize::PerIteration,
+        )
+    });
+    group.bench_function("dense-sum-10-binders-2-rounds", |b| {
+        b.iter_batched(
+            dense_sum_case,
+            |(mut eg, rules)| {
+                let stats = eg.run(&rules, 2);
+                assert_eq!(stats.rounds, 2);
+                assert!(stats.unions > 100);
+                black_box((stats, eg.class_count(), eg.node_count()))
             },
             BatchSize::PerIteration,
         )

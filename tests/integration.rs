@@ -797,6 +797,47 @@ fn sexp_print_egraph_handles_an_empty_graph_and_rejects_arguments() {
     );
 }
 #[test]
+fn json_cli_emits_queries_on_stdout_and_diagnostics_on_stderr() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lambda-microegg"))
+        .args(["--json", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"(insert (f a)) (echo noisy) (extract (f a)) (print-egraph)")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let values: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0]["command"], "extract");
+    assert_eq!(values[0]["context"], 0);
+    assert_eq!(values[0]["term"]["scope"], 0);
+    assert_eq!(values[0]["term"]["t"]["App"][0]["Atom"], "f");
+    assert_eq!(values[1]["command"], "print-egraph");
+    assert_eq!(values[1]["class_count"], 3);
+    assert_eq!(values[1]["node_count"], 3);
+    assert_eq!(values[1]["classes"].as_array().unwrap().len(), 3);
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("; inserted"));
+    assert!(stderr.contains("; noisy"));
+    assert!(!stderr.contains("\"command\""));
+}
+#[test]
 fn sexp_echo_emits_quoted_strings_and_atoms() {
     assert_eq!(
         run_script(r#"(echo "hello world") (echo done)"#).unwrap(),
@@ -1049,7 +1090,7 @@ fn contextual_metavariable_can_be_inserted_under_a_binder() {
     let lhs = Pattern::MetaVar("?x".into(), vec![]);
     let rhs = Pattern::binder("lam", Pattern::MetaVar("?x".into(), vec![]));
     let subst = eg.ematch(&lhs, &a).pop().unwrap();
-    let result = eg.try_instantiate(&rhs, 0, &subst).unwrap();
+    let result = eg.try_instantiate_metavars(&rhs, 0, &subst).unwrap();
     let expected_body = eg.atom("a", 1);
     let expected = eg.binder("lam", expected_body);
 
@@ -1178,7 +1219,7 @@ fn generated_miller_matches_reinstantiate_the_target() {
         );
         for subst in matches {
             let instantiated = eg
-                .try_instantiate(&pattern, top_ctx, &subst)
+                .try_instantiate_metavars(&pattern, top_ctx, &subst)
                 .expect("a match substitution must instantiate its own pattern");
             assert!(
                 eg.equivalent(&instantiated, &target),
@@ -1205,7 +1246,7 @@ fn generated_miller_matches_reinstantiate_the_target() {
         );
         for subst in matches {
             let instantiated = eg
-                .try_instantiate(&pattern, top_ctx, &subst)
+                .try_instantiate_metavars(&pattern, top_ctx, &subst)
                 .expect("a nonlinear match must instantiate its own pattern");
             assert!(
                 eg.equivalent(&instantiated, &target),
@@ -1678,7 +1719,7 @@ fn miller_arguments_can_select_a_later_nested_binder() {
     let pattern = syntax_pattern(&parse_forms("(@lam x (@lam y {?f y}))").unwrap()[0]).unwrap();
 
     let subst = eg.ematch(&pattern, &term).pop().unwrap();
-    let rebuilt = eg.try_instantiate(&pattern, 0, &subst).unwrap();
+    let rebuilt = eg.try_instantiate_metavars(&pattern, 0, &subst).unwrap();
     assert!(eg.equivalent(&rebuilt, &term));
 }
 #[test]
@@ -1690,7 +1731,7 @@ fn miller_indices_count_outward_from_the_nearest_pattern_binder() {
     let pattern = syntax_pattern(&parse_forms("(@lam x (@lam y {?f x}))").unwrap()[0]).unwrap();
 
     let subst = eg.ematch(&pattern, &term).pop().unwrap();
-    let rebuilt = eg.try_instantiate(&pattern, 0, &subst).unwrap();
+    let rebuilt = eg.try_instantiate_metavars(&pattern, 0, &subst).unwrap();
     assert!(eg.equivalent(&rebuilt, &term));
 }
 #[test]

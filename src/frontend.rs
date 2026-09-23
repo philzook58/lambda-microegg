@@ -1,4 +1,18 @@
 use lambda_microegg::*;
+use serde::Serialize;
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "command", rename_all = "kebab-case")]
+pub enum JsonOutput {
+    Extract {
+        context: usize,
+        term: TermCtx,
+    },
+    PrintEgraph {
+        #[serde(flatten)]
+        egraph: EGraphDump,
+    },
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Delimiter {
@@ -693,6 +707,7 @@ fn run_command(
     eg: &mut EGraph,
     rules: &mut Vec<Rewrite>,
     output: &mut Vec<String>,
+    mut json_output: Option<&mut Vec<JsonOutput>>,
 ) -> Result<(), String> {
     let Some(items) = form.group(Delimiter::Paren) else {
         return Err(format!("command {} must be a list", command_index + 1));
@@ -830,19 +845,32 @@ fn run_command(
                 &mut trial_eg,
                 &mut trial_rules,
                 &mut trial_output,
+                None,
             ) {
                 Ok(()) => return Err("wrapped command succeeded".into()),
                 Err(error) => output.push(format!("failed as expected: {error}")),
             }
         }
-        "print-egraph" if items.len() == 1 => output.push(eg.dump()),
+        "print-egraph" if items.len() == 1 => {
+            if let Some(json_output) = json_output.as_deref_mut() {
+                json_output.push(JsonOutput::PrintEgraph {
+                    egraph: eg.json_dump(),
+                });
+            } else {
+                output.push(eg.dump());
+            }
+        }
         "extract" if matches!(items.len(), 2 | 3) => {
             let (ctx, term) = command_term(items, "extract")?;
             let id = add_syntax_term(eg, term, ctx)?;
             let term = eg
                 .extract(&id)
                 .ok_or_else(|| "class has no finite extractable term".to_string())?;
-            output.push(term.display().to_string());
+            if let Some(json_output) = json_output {
+                json_output.push(JsonOutput::Extract { context: ctx, term });
+            } else {
+                output.push(term.display().to_string());
+            }
         }
         "reset" | "insert" | "union" | "guard" | "rewrite" | "birewrite" | "match" | "run"
         | "echo" | "fail" | "print-egraph" | "extract" => {
@@ -859,12 +887,33 @@ fn run_command(
 }
 
 pub fn run_script(input: &str) -> Result<Vec<String>, String> {
+    run_script_inner(input, None)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub fn run_script_json(input: &str) -> Result<(Vec<JsonOutput>, Vec<String>), String> {
+    let mut json_output = vec![];
+    let diagnostics = run_script_inner(input, Some(&mut json_output))?;
+    Ok((json_output, diagnostics))
+}
+
+fn run_script_inner(
+    input: &str,
+    mut json_output: Option<&mut Vec<JsonOutput>>,
+) -> Result<Vec<String>, String> {
     let mut eg = EGraph::new();
     let mut rules = vec![];
     let mut output = vec![];
     for (command_index, form) in parse_syntax(input)?.into_iter().enumerate() {
-        run_command(&form, command_index, &mut eg, &mut rules, &mut output)
-            .map_err(|error| form.locate(error))?;
+        run_command(
+            &form,
+            command_index,
+            &mut eg,
+            &mut rules,
+            &mut output,
+            json_output.as_deref_mut(),
+        )
+        .map_err(|error| form.locate(error))?;
     }
     Ok(output)
 }
