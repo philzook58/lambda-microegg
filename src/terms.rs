@@ -1,3 +1,9 @@
+// Patterns, Terms, TermCtx
+// Pattern is basically a term that also allows metavariables
+// A lot of duplication, but whatyagonnado.
+// These are all in a conventional de bruijn index/level style, whereas the internals of the lifting egraph use thinnings/liftings.
+// A related but more flexible concept
+
 use super::Lift;
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;

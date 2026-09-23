@@ -1,3 +1,17 @@
+// The guts of the lifting egraph
+// Liftings are an annotation on the edges of the union find, akin to group elements like offsets
+// Each Id represent a function that takes n ordered arguments
+// Liftings are an algebra of taking n-argument functions to m-argument function by adding redundant arguments.
+// For example
+// fun x y => x + y  -----lift_101-------> fun x y z => x + z
+// These functions are NOT equal, but are clearly highly related
+// The lifting egraph deduplicates interning memory for these different lifts of the same base function.
+
+// Liftings have identity and composition. They form a category (uh oh! I said the C word!).
+
+// See my EGRAPHS 2026 talk for more details.
+
+
 //! During pattern matching, `top_ctx` is the ambient context at the top of the
 //! pattern, and `current_ctx` additionally includes the variables introduced
 //! locally by binders inside the pattern. A pattern variable has to be carried
