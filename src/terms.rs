@@ -4,6 +4,27 @@
 // These are all in a conventional de bruijn index/level style, whereas the internals of the lifting egraph use thinnings/liftings.
 // A related but more flexible concept
 
+
+/*
+
+ Maybe conceptually speaking I should have a LiftTerm type here too that uses liftings.
+
+```rust
+enum LiftTerm {
+    App(Lifted<LiftTerm>, Lifted<LiftTerm),
+    Var,
+    Atom(Symbol)
+    Binder(Symbol, Lifted<LiftTerm>)
+}
+
+struct Lifted<T>  {
+  lift : Lift,
+  t : T
+}
+```
+
+*/
+
 use super::Lift;
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
