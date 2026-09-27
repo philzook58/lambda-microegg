@@ -24,6 +24,10 @@ backwards and prints only live term and proof bindings, preserving their arena I
 densely renumbering them. `examples/proof_egraph.rs` demonstrates `a = b` producing `f a = f b` and
 the test suite asks Lean to check the result.
 
+Application congruence uses the direct core Lean combinator for each shape: `congrArg` when only the
+argument changes, `congrFun (congrArg app ...)` when only the function changes, and
+`congr (congrArg app ...)` when both change.
+
 Rewrite applications currently become explicit theorem assumptions. Instantiating named rewrite
 theorems can be added after congruence; operations involving variables, binders, dependency
 shrinking, or non-identity lifts record a precise unsupported-operation error for final printing.

@@ -411,19 +411,10 @@ impl EGraphProofState {
                     format!("Eq.trans p{} p{}", first.0, second.0)
                 }
                 EGraphProofKind::CongApp(function, argument) => {
-                    let function_node = &self.arena[function.0 as usize];
-                    let argument_node = &self.arena[argument.0 as usize];
-                    format!(
-                        "Eq.trans (congrArg (fun function => app function e{}) p{}) \
-                         (congrArg (app e{}) p{})",
-                        argument_node.left, function.0, function_node.right, argument.0
-                    )
+                    format!("congr (congrArg app p{}) p{}", function.0, argument.0)
                 }
                 EGraphProofKind::CongFunction { argument, proof } => {
-                    format!(
-                        "congrArg (fun function => app function e{argument}) p{}",
-                        proof.0
-                    )
+                    format!("congrFun (congrArg app p{}) e{argument}", proof.0)
                 }
                 EGraphProofKind::CongArgument { function, proof } => {
                     format!("congrArg (app e{function}) p{}", proof.0)
@@ -844,6 +835,48 @@ mod tests {
         assert!(
             output.status.success(),
             "Lean rejected two-child congruence:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn egraph_congruence_can_change_only_the_function() {
+        let mut egraph = crate::EGraph::new_with_proofs();
+        let f = egraph.atom("f", 0);
+        let g = egraph.atom("g", 0);
+        let a = egraph.atom("a", 0);
+        let fa = egraph.app(f, a);
+        let ga = egraph.app(g, a);
+        egraph.union_assuming(&f, &g, "f = g");
+        let certificate = egraph
+            .lean_proof(
+                "function_congruence",
+                "{α : Type} (app : α → α → α) (f g a : α)",
+                &fa,
+                &ga,
+            )
+            .unwrap();
+        assert!(certificate.contains("congrFun (congrArg app"));
+
+        let Ok(mut lean) = Command::new("lean")
+            .arg("--stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            return;
+        };
+        lean.stdin
+            .take()
+            .unwrap()
+            .write_all(certificate.as_bytes())
+            .unwrap();
+        let output = lean.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "Lean rejected function congruence:\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
