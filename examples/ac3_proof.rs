@@ -1,0 +1,53 @@
+use lambda_microegg::{EGraph, Pattern, Rewrite};
+use std::time::Instant;
+
+fn main() {
+    let mut egraph = EGraph::new_with_proofs();
+    let atoms: Vec<_> = (0..3)
+        .map(|index| egraph.atom(&format!("x{index}"), 0))
+        .collect();
+    let input_pair = egraph.apps("plus", vec![atoms[0], atoms[1]]);
+    let input = egraph.apps("plus", vec![input_pair, atoms[2]]);
+    let goal_pair = egraph.apps("plus", vec![atoms[1], atoms[0]]);
+    let goal = egraph.apps("plus", vec![atoms[2], goal_pair]);
+    let var = Pattern::meta;
+    let plus = |left, right| Pattern::apps("plus", vec![left, right]);
+    let rules = [
+        Rewrite::named(
+            "assoc",
+            plus(plus(var("?a"), var("?b")), var("?c")),
+            plus(var("?a"), plus(var("?b"), var("?c"))),
+        )
+        .unwrap(),
+        Rewrite::named(
+            "comm",
+            plus(var("?a"), var("?b")),
+            plus(var("?b"), var("?a")),
+        )
+        .unwrap(),
+    ];
+
+    let saturation_started = Instant::now();
+    egraph.saturate(&rules);
+    let saturation = saturation_started.elapsed();
+    assert!(egraph.equivalent(&input, &goal));
+    let arena_steps = egraph.proof_step_count();
+    let arena = egraph.proof_stats().unwrap();
+    let render_started = Instant::now();
+    let certificate = egraph
+        .lean_proof(
+            "ac3",
+            "{α : Type} (app : α → α → α) (plus x0 x1 x2 : α) \
+             (assoc : ∀ a b c, app (app plus (app (app plus a) b)) c = app (app plus a) (app (app plus b) c)) \
+             (comm : ∀ a b, app (app plus a) b = app (app plus b) a)",
+            &input,
+            &goal,
+        )
+        .unwrap();
+    let render = render_started.elapsed();
+    eprintln!(
+        "saturation={saturation:?} render={render:?} arena_steps={arena_steps} arena={arena:?} bytes={}",
+        certificate.len()
+    );
+    print!("{certificate}");
+}

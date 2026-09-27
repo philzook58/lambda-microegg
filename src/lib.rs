@@ -29,8 +29,8 @@ use web_time::{Duration, Instant};
 
 mod proof;
 mod terms;
-use proof::{EGraphProofState, EGraphProofTerm};
-pub use proof::{ProofError, ProofId, ProofUnionFind};
+use proof::{EGraphProofState, EGraphProofTerm, EGraphTermId};
+pub use proof::{EGraphProofStats, ProofError, ProofId, ProofUnionFind};
 use terms::pattern_occurrence_lift;
 pub use terms::{DeBruijnIndex, DeBruijnLevel, NamedTerm, Pattern, Rewrite, Term, TermCtx};
 
@@ -440,6 +440,9 @@ impl EGraph {
     }
     pub fn proof_step_count(&self) -> usize {
         self.proofs.as_ref().map_or(0, EGraphProofState::step_count)
+    }
+    pub fn proof_stats(&self) -> Option<EGraphProofStats> {
+        self.proofs.as_ref().map(EGraphProofState::stats)
     }
     fn make_set(&mut self, scope: usize) -> Id {
         assert!(
@@ -1204,28 +1207,11 @@ impl EGraph {
         self.try_instantiate_metavars_rec(pattern, ctx, ctx, subst)
     }
 
-    fn collect_raw_normalizers(&mut self, raw: RawId, out: &mut Vec<ProofId>) -> Option<()> {
-        match self.proofs.as_ref()?.definition(raw)? {
-            EGraphProofTerm::Atom(_) => {}
-            EGraphProofTerm::App(function, argument) => {
-                self.collect_raw_normalizers(function, out)?;
-                self.collect_raw_normalizers(argument, out)?;
-            }
-        }
-        let root = self.find_mut(&Id::new(Lift::identity(0), raw));
-        let proof = self.proofs.as_mut()?.proof_between(raw, root.raw());
-        if !self.proofs.as_ref()?.is_refl(proof) {
-            out.push(proof);
-        }
-        Some(())
-    }
-
-    fn collect_pattern_normalizers(
+    fn normalize_pattern_proof(
         &mut self,
         pattern: &Pattern,
         subst: &Subst,
-        out: &mut Vec<ProofId>,
-    ) -> Option<Id> {
+    ) -> Option<(Id, EGraphTermId, ProofId)> {
         match pattern {
             Pattern::MetaVar(name, arguments) if arguments.is_empty() => {
                 let original = *subst.get(name)?;
@@ -1233,30 +1219,45 @@ impl EGraph {
                     return None;
                 }
                 let normalized = self.find_mut(&original);
-                let proof = self
-                    .proofs
-                    .as_mut()?
-                    .proof_between(original.raw(), normalized.raw());
-                if !self.proofs.as_ref()?.is_refl(proof) {
-                    out.push(proof);
-                }
-                Some(normalized)
+                let proofs = self.proofs.as_mut()?;
+                let term = proofs.raw_term(original.raw());
+                let proof = proofs.proof_between(original.raw(), normalized.raw());
+                Some((normalized, term, proof))
             }
             Pattern::Atom(name) => {
                 let node = Node::Atom(*name);
                 let normalized = self.atom_symbol(*name, 0);
                 let witness = *self.memo.get(&node)?;
-                self.collect_raw_normalizers(witness, out)?;
-                Some(normalized)
+                let proofs = self.proofs.as_mut()?;
+                let term = proofs.raw_term(witness);
+                let proof = proofs.proof_between(witness, normalized.raw());
+                Some((normalized, term, proof))
             }
             Pattern::App(function, argument) => {
-                let function = self.collect_pattern_normalizers(function, subst, out)?;
-                let argument = self.collect_pattern_normalizers(argument, subst, out)?;
+                let (function, function_term, function_proof) =
+                    self.normalize_pattern_proof(function, subst)?;
+                let (argument, argument_term, argument_proof) =
+                    self.normalize_pattern_proof(argument, subst)?;
                 let normalized = self.app(function, argument);
                 let node = Node::App(function, argument);
                 let witness = *self.memo.get(&node)?;
-                self.collect_raw_normalizers(witness, out)?;
-                Some(normalized)
+                let EGraphProofTerm::App(old_function, old_argument) =
+                    self.proofs.as_ref()?.definition(witness)?
+                else {
+                    return None;
+                };
+                self.find_mut(&Id::new(Lift::identity(0), old_function));
+                self.find_mut(&Id::new(Lift::identity(0), old_argument));
+                let proofs = self.proofs.as_mut()?;
+                let expression = proofs.app_term(function_term, argument_term);
+                let expression_to_normal = proofs.congr_terms(function_proof, argument_proof);
+                let witness_to_normal =
+                    proofs.raw_app_to(witness, function.raw(), argument.raw())?;
+                let normal_to_witness = proofs.symm(witness_to_normal);
+                let expression_to_witness = proofs.trans(expression_to_normal, normal_to_witness);
+                let witness_to_root = proofs.proof_between(witness, normalized.raw());
+                let proof = proofs.trans(expression_to_witness, witness_to_root);
+                Some((normalized, expression, proof))
             }
             _ => None,
         }
@@ -1303,24 +1304,23 @@ impl EGraph {
 
         // Everything that can fail has now been checked. Only now allocate
         // normalization and rewrite proof nodes for this new union.
-        let mut normalizers = Vec::new();
-        let left = self.collect_pattern_normalizers(rule.lhs(), subst, &mut normalizers)?;
-        let right = self.collect_pattern_normalizers(rule.rhs(), subst, &mut normalizers)?;
+        let (left, left_term, left_normalization) =
+            self.normalize_pattern_proof(rule.lhs(), subst)?;
+        let (right, right_term, right_normalization) =
+            self.normalize_pattern_proof(rule.rhs(), subst)?;
         if left != target_root || right != replacement_root {
             return None;
         }
-        self.collect_raw_normalizers(target.raw(), &mut normalizers)?;
-        self.collect_raw_normalizers(replacement.raw(), &mut normalizers)?;
-        normalizers.sort_unstable();
-        normalizers.dedup();
         let proofs = self.proofs.as_mut()?;
-        Some(proofs.rewrite_normalized(
-            target.raw(),
-            replacement.raw(),
-            name,
-            arguments,
-            normalizers,
-        ))
+        let rewrite = proofs.rewrite(left_term, right_term, name, arguments);
+        let target_path = proofs.parent_proof(target.raw());
+        let left_back = proofs.symm(left_normalization);
+        let proof = proofs.trans(target_path, left_back);
+        let proof = proofs.trans(proof, rewrite);
+        let proof = proofs.trans(proof, right_normalization);
+        let replacement_path = proofs.parent_proof(replacement.raw());
+        let replacement_back = proofs.symm(replacement_path);
+        Some(proofs.trans(proof, replacement_back))
     }
     fn try_instantiate_metavars_rec(
         &mut self,
