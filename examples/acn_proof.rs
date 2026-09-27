@@ -41,7 +41,7 @@ fn main() {
     egraph.saturate(&rules);
     let saturation = saturation_started.elapsed();
     assert!(egraph.equivalent(&input, &goal));
-    let arena = egraph.proof_stats().unwrap();
+    let recorded = egraph.proof_stats().unwrap();
     let atom_binders = (0..n)
         .map(|index| format!("x{index}"))
         .collect::<Vec<_>>()
@@ -56,8 +56,9 @@ fn main() {
         .lean_proof(&format!("ac{n}"), &binders, &input, &goal)
         .unwrap();
     let render = render_started.elapsed();
+    let materialized = egraph.proof_stats().unwrap();
     eprintln!(
-        "n={n} saturation={saturation:?} render={render:?} arena={arena:?} bytes={}",
+        "n={n} saturation={saturation:?} render={render:?} recorded={recorded:?} materialized={materialized:?} bytes={}",
         certificate.len()
     );
     print!("{certificate}");

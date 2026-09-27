@@ -301,12 +301,44 @@ struct EGraphExplanationPath {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum EGraphReasonKind {
     Direct(ProofId),
+    RewriteDirect {
+        name: String,
+        arguments: Vec<RawId>,
+    },
+    Rewrite {
+        name: String,
+        arguments: Vec<RawId>,
+        left: EGraphPatternRecipe,
+        right: EGraphPatternRecipe,
+    },
     Congruence {
         left_function: RawId,
         right_function: RawId,
         left_argument: RawId,
         right_argument: RawId,
     },
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum EGraphPatternRecipe {
+    Raw {
+        raw: RawId,
+        normal: RawId,
+    },
+    App {
+        witness: RawId,
+        normal: RawId,
+        function: Box<EGraphPatternRecipe>,
+        argument: Box<EGraphPatternRecipe>,
+    },
+}
+
+impl EGraphPatternRecipe {
+    fn normal(&self) -> RawId {
+        match self {
+            Self::Raw { normal, .. } | Self::App { normal, .. } => *normal,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -325,6 +357,16 @@ struct EGraphExplainEdge {
 #[derive(Clone, Debug)]
 pub(crate) enum EGraphUnionReason {
     Direct(ProofId),
+    RewriteDirect {
+        name: String,
+        arguments: Vec<RawId>,
+    },
+    Rewrite {
+        name: String,
+        arguments: Vec<RawId>,
+        left: EGraphPatternRecipe,
+        right: EGraphPatternRecipe,
+    },
     Congruence {
         left_function: RawId,
         right_function: RawId,
@@ -707,6 +749,20 @@ impl EGraphProofState {
                 debug_assert_eq!(self.arena[proof.0 as usize].right, self.raw_term(right));
                 EGraphReasonKind::Direct(proof)
             }
+            EGraphUnionReason::RewriteDirect { name, arguments } => {
+                EGraphReasonKind::RewriteDirect { name, arguments }
+            }
+            EGraphUnionReason::Rewrite {
+                name,
+                arguments,
+                left,
+                right,
+            } => EGraphReasonKind::Rewrite {
+                name,
+                arguments,
+                left,
+                right,
+            },
             EGraphUnionReason::Congruence {
                 left_function,
                 right_function,
@@ -753,6 +809,32 @@ impl EGraphProofState {
         let node = self.reasons[reason.0 as usize].clone();
         let proof = match node.kind {
             EGraphReasonKind::Direct(proof) => proof,
+            EGraphReasonKind::RewriteDirect { name, arguments } => self.rewrite(
+                self.raw_term(node.left),
+                self.raw_term(node.right),
+                name,
+                arguments,
+            ),
+            EGraphReasonKind::Rewrite {
+                name,
+                arguments,
+                left,
+                right,
+            } => {
+                let left_normal = left.normal();
+                let right_normal = right.normal();
+                let (left_term, left_normalization) = self.materialize_pattern_recipe(&left);
+                let (right_term, right_normalization) = self.materialize_pattern_recipe(&right);
+                let target_path = self.proof_between(node.left, left_normal);
+                let left_back = self.symm(left_normalization);
+                let proof = self.trans(target_path, left_back);
+                let rewrite = self.rewrite(left_term, right_term, name, arguments);
+                let proof = self.trans(proof, rewrite);
+                let proof = self.trans(proof, right_normalization);
+                let replacement_path = self.proof_between(node.right, right_normal);
+                let replacement_back = self.symm(replacement_path);
+                self.trans(proof, replacement_back)
+            }
             EGraphReasonKind::Congruence {
                 left_function,
                 right_function,
@@ -769,6 +851,38 @@ impl EGraphProofState {
         };
         self.materialized_reasons[reason.0 as usize] = Some(proof);
         proof
+    }
+
+    fn materialize_pattern_recipe(
+        &mut self,
+        recipe: &EGraphPatternRecipe,
+    ) -> (EGraphTermId, ProofId) {
+        match recipe {
+            EGraphPatternRecipe::Raw { raw, normal } => {
+                let term = self.raw_term(*raw);
+                let proof = self.proof_between(*raw, *normal);
+                (term, proof)
+            }
+            EGraphPatternRecipe::App {
+                witness,
+                normal,
+                function,
+                argument,
+            } => {
+                let (function_term, function_proof) = self.materialize_pattern_recipe(function);
+                let (argument_term, argument_proof) = self.materialize_pattern_recipe(argument);
+                let expression = self.app_term(function_term, argument_term);
+                let expression_to_normal = self.congr_terms(function_proof, argument_proof);
+                let witness_to_normal = self
+                    .raw_app_to(*witness, function.normal(), argument.normal())
+                    .expect("a rewrite application recipe retains an application witness");
+                let normal_to_witness = self.symm(witness_to_normal);
+                let expression_to_witness = self.trans(expression_to_normal, normal_to_witness);
+                let witness_to_root = self.proof_between(*witness, *normal);
+                let proof = self.trans(expression_to_witness, witness_to_root);
+                (expression, proof)
+            }
+        }
     }
 
     fn materialize_path(&mut self, path: EGraphExplanationPath) -> ProofId {
@@ -1512,6 +1626,7 @@ mod tests {
         )
         .unwrap();
         egraph.saturate(std::slice::from_ref(&rule));
+        assert_eq!(egraph.proof_stats().unwrap().rewrites, 0);
         let settled_steps = egraph.proof_step_count();
         egraph.saturate(std::slice::from_ref(&rule));
         assert_eq!(egraph.proof_step_count(), settled_steps);
@@ -1525,7 +1640,8 @@ mod tests {
                 &x,
             )
             .unwrap();
-        assert_eq!(certificate.matches("r1 e").count(), 1);
+        assert_eq!(egraph.proof_stats().unwrap().rewrites, 2);
+        assert_eq!(certificate.matches("r1 e").count(), 2);
         assert!(!certificate.contains("simpa"));
         assert!(!certificate.contains("  let t"));
         assert!(!certificate.contains(" := rfl"));

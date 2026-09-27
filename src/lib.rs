@@ -29,7 +29,7 @@ use web_time::{Duration, Instant};
 
 mod proof;
 mod terms;
-use proof::{EGraphProofState, EGraphProofTerm, EGraphTermId, EGraphUnionReason};
+use proof::{EGraphPatternRecipe, EGraphProofState, EGraphProofTerm, EGraphUnionReason};
 pub use proof::{EGraphProofStats, ProofError, ProofId, ProofUnionFind};
 use terms::pattern_occurrence_lift;
 pub use terms::{DeBruijnIndex, DeBruijnLevel, NamedTerm, Pattern, Rewrite, Term, TermCtx};
@@ -1173,11 +1173,11 @@ impl EGraph {
         self.try_instantiate_metavars_rec(pattern, ctx, ctx, subst)
     }
 
-    fn normalize_pattern_proof(
+    fn pattern_recipe(
         &mut self,
         pattern: &Pattern,
         subst: &Subst,
-    ) -> Option<(Id, EGraphTermId, ProofId)> {
+    ) -> Option<(Id, EGraphPatternRecipe)> {
         match pattern {
             Pattern::MetaVar(name, arguments) if arguments.is_empty() => {
                 let original = *subst.get(name)?;
@@ -1185,45 +1185,41 @@ impl EGraph {
                     return None;
                 }
                 let normalized = self.find_mut(&original);
-                let proofs = self.proofs.as_mut()?;
-                let term = proofs.raw_term(original.raw());
-                let proof = proofs.proof_between(original.raw(), normalized.raw());
-                Some((normalized, term, proof))
+                Some((
+                    normalized,
+                    EGraphPatternRecipe::Raw {
+                        raw: original.raw(),
+                        normal: normalized.raw(),
+                    },
+                ))
             }
             Pattern::Atom(name) => {
                 let node = Node::Atom(*name);
-                let normalized = self.atom_symbol(*name, 0);
                 let witness = *self.memo.get(&node)?;
-                let proofs = self.proofs.as_mut()?;
-                let term = proofs.raw_term(witness);
-                let proof = proofs.proof_between(witness, normalized.raw());
-                Some((normalized, term, proof))
+                let normalized = self.find_mut(&Id::new(Lift::identity(0), witness));
+                Some((
+                    normalized,
+                    EGraphPatternRecipe::Raw {
+                        raw: witness,
+                        normal: normalized.raw(),
+                    },
+                ))
             }
             Pattern::App(function, argument) => {
-                let (function, function_term, function_proof) =
-                    self.normalize_pattern_proof(function, subst)?;
-                let (argument, argument_term, argument_proof) =
-                    self.normalize_pattern_proof(argument, subst)?;
-                let normalized = self.app(function, argument);
+                let (function, function_recipe) = self.pattern_recipe(function, subst)?;
+                let (argument, argument_recipe) = self.pattern_recipe(argument, subst)?;
                 let node = Node::App(function, argument);
                 let witness = *self.memo.get(&node)?;
-                let EGraphProofTerm::App(old_function, old_argument) =
-                    self.proofs.as_ref()?.definition(witness)?
-                else {
-                    return None;
-                };
-                self.find_mut(&Id::new(Lift::identity(0), old_function));
-                self.find_mut(&Id::new(Lift::identity(0), old_argument));
-                let proofs = self.proofs.as_mut()?;
-                let expression = proofs.app_term(function_term, argument_term);
-                let expression_to_normal = proofs.congr_terms(function_proof, argument_proof);
-                let witness_to_normal =
-                    proofs.raw_app_to(witness, function.raw(), argument.raw())?;
-                let normal_to_witness = proofs.symm(witness_to_normal);
-                let expression_to_witness = proofs.trans(expression_to_normal, normal_to_witness);
-                let witness_to_root = proofs.proof_between(witness, normalized.raw());
-                let proof = proofs.trans(expression_to_witness, witness_to_root);
-                Some((normalized, expression, proof))
+                let normalized = self.find_mut(&Id::new(Lift::identity(0), witness));
+                Some((
+                    normalized,
+                    EGraphPatternRecipe::App {
+                        witness,
+                        normal: normalized.raw(),
+                        function: Box::new(function_recipe),
+                        argument: Box::new(argument_recipe),
+                    },
+                ))
             }
             _ => None,
         }
@@ -1253,13 +1249,13 @@ impl EGraph {
         }
     }
 
-    fn named_rewrite_proof(
+    fn named_rewrite_reason(
         &mut self,
         rule: &Rewrite,
         target: &Id,
         replacement: &Id,
         subst: &Subst,
-    ) -> Option<ProofId> {
+    ) -> Option<EGraphUnionReason> {
         let name = rule.name()?.to_owned();
         fn supported(pattern: &Pattern) -> bool {
             match pattern {
@@ -1276,12 +1272,8 @@ impl EGraph {
         {
             return None;
         }
-        let left_check = self.try_instantiate_metavars(rule.lhs(), 0, subst)?;
         let target_root = self.find_mut(target);
         let replacement_root = self.find_mut(replacement);
-        if self.find_mut(&left_check) != target_root {
-            return None;
-        }
         let arguments: Option<Vec<_>> = rule
             .metavariables()
             .iter()
@@ -1299,34 +1291,23 @@ impl EGraph {
         if self.pattern_is_definitionally(rule.lhs(), subst, target.raw())
             && self.pattern_is_definitionally(rule.rhs(), subst, replacement.raw())
         {
-            let proofs = self.proofs.as_mut()?;
-            return Some(proofs.rewrite(
-                proofs.raw_term(target.raw()),
-                proofs.raw_term(replacement.raw()),
-                name,
-                arguments,
-            ));
+            return Some(EGraphUnionReason::RewriteDirect { name, arguments });
         }
 
-        // Everything that can fail has now been checked. Only now allocate
-        // normalization and rewrite proof nodes for this new union.
-        let (left, left_term, left_normalization) =
-            self.normalize_pattern_proof(rule.lhs(), subst)?;
-        let (right, right_term, right_normalization) =
-            self.normalize_pattern_proof(rule.rhs(), subst)?;
+        // Retain only the raw witnesses needed to reconstruct normalization.
+        // The Lean proof arena is populated later, and only for rewrite edges
+        // selected by the final explanation.
+        let (left, left_recipe) = self.pattern_recipe(rule.lhs(), subst)?;
+        let (right, right_recipe) = self.pattern_recipe(rule.rhs(), subst)?;
         if left != target_root || right != replacement_root {
             return None;
         }
-        let proofs = self.proofs.as_mut()?;
-        let rewrite = proofs.rewrite(left_term, right_term, name, arguments);
-        let target_path = proofs.proof_between(target.raw(), left.raw());
-        let left_back = proofs.symm(left_normalization);
-        let proof = proofs.trans(target_path, left_back);
-        let proof = proofs.trans(proof, rewrite);
-        let proof = proofs.trans(proof, right_normalization);
-        let replacement_path = proofs.proof_between(replacement.raw(), right.raw());
-        let replacement_back = proofs.symm(replacement_path);
-        Some(proofs.trans(proof, replacement_back))
+        Some(EGraphUnionReason::Rewrite {
+            name,
+            arguments,
+            left: left_recipe,
+            right: right_recipe,
+        })
     }
     fn try_instantiate_metavars_rec(
         &mut self,
@@ -1463,16 +1444,12 @@ impl EGraph {
                             continue;
                         }
                         let unioned = if self.proofs.is_some() && rule.name().is_some() {
-                            let Some(proof) =
-                                self.named_rewrite_proof(rule, &target, &replacement, &subst)
+                            let Some(reason) =
+                                self.named_rewrite_reason(rule, &target, &replacement, &subst)
                             else {
                                 continue;
                             };
-                            self.union_with_reason(
-                                &target,
-                                &replacement,
-                                Some(EGraphUnionReason::Direct(proof)),
-                            )
+                            self.union_with_reason(&target, &replacement, Some(reason))
                         } else {
                             self.union(&target, &replacement)
                         };

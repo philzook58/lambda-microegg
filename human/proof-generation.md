@@ -161,35 +161,38 @@ A paired AC4 measurement of the definitional-reduction fast path reduced the che
 from 47,864 bytes and 1,279 lines to 43,106 bytes and 1,159 lines. Thirteen of the 48 live rewrite
 applications used the direct form.
 
-The proof forest and lazy congruence reasons then reduce the same AC4 and AC5 certificates as
-follows. Lean times and memory are means of five fresh processes; they include process startup.
+The proof forest and lazy congruence reasons reduce the same AC4 and AC5 certificates as follows.
+Making named-rewrite normalization lazy gives the final column. The first two columns' Lean times
+and memory are means of five fresh processes; the lazy-rewrite column is one checked run and also
+includes process startup.
 
-| Example | Metric | Eager parent proofs | Proof forest |
-| --- | --- | ---: | ---: |
-| AC4 | bytes | 43,106 | 11,823 |
-|  | lines | 1,159 | 345 |
-|  | live proof bindings | 851 | 225 |
-|  | live rewrite applications | 48 | 16 |
-|  | Lean time | 0.858 s | 0.382 s |
-|  | peak memory | 546 MB | 480 MB |
-| AC5 | bytes | 244,277 | 17,771 |
-|  | lines | 6,011 | 510 |
-|  | live proof bindings | 4,566 | 334 |
-|  | live rewrite applications | 239 | 22 |
-|  | Lean time | 6.262 s | 0.464 s |
-|  | peak memory | 1,800 MB | 493 MB |
+| Example | Metric | Eager parent proofs | Proof forest | Lazy rewrites |
+| --- | --- | ---: | ---: | ---: |
+| AC4 | bytes | 43,106 | 11,823 | 10,995 |
+|  | lines | 1,159 | 345 | 319 |
+|  | live proof bindings | 851 | 225 | 206 |
+|  | live rewrite applications | 48 | 16 | 16 |
+|  | Lean time | 0.858 s | 0.382 s | 0.41 s |
+|  | peak memory | 546 MB | 480 MB | 487 MB |
+| AC5 | bytes | 244,277 | 17,771 | 11,588 |
+|  | lines | 6,011 | 510 | 336 |
+|  | live proof bindings | 4,566 | 334 | 216 |
+|  | live rewrite applications | 239 | 22 | 17 |
+|  | Lean time | 6.262 s | 0.464 s | 0.38 s |
+|  | peak memory | 1,800 MB | 493 MB | 489 MB |
 
-The post-saturation arena also shrinks, from 1,236 to 972 nodes for AC4 and from 6,452 to 4,872 for
-AC5. This is a smaller reduction than the live certificate because non-definitional named rewrites
-still build their normalization proofs eagerly. The generated certificates are kept in
+Lazy rewrites leave the proof arena empty after saturation. Rendering AC4 materializes 264 proof
+nodes, and rendering AC5 materializes 275; the previous eager-rewrite version held 972 and 4,872
+nodes respectively before rendering. Each successful rewrite now records a compact instantiated
+pattern recipe. Only recipes reached by the requested explanation are expanded into normalization,
+rule, congruence, symmetry, and transitivity nodes. The generated certificates are kept in
 `proofs/AC4.lean` and `proofs/AC5.lean`.
 
 ## Proof-recording overhead
 
 `examples/acn_saturation.rs` runs the same named AC saturation with proof recording off and on,
-without constructing or checking a certificate. Release-build measurements from AC5 through AC8
-are means of three fresh processes; AC9 is one run because the proof arena had reached 1,032,246
-nodes and the scaling trend was already clear.
+without constructing or checking a certificate. Before rewrite proofs were made lazy, the
+measurements were:
 
 | Size | Off time | On time | Time ratio | Off peak RSS | On peak RSS | Memory ratio |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -202,7 +205,22 @@ nodes and the scaling trend was already clear.
 AC9 spends 5,943 ms of its 6,200 ms proof-enabled saturation in the apply phase, compared with
 173 ms of 329 ms without proofs. Proof mode constructs 50,761 named rewrite nodes and reaches
 148,387 raw IDs, versus 84,634 raw IDs without proofs, even though both runs finish with exactly
-1,022 classes and 19,180 e-nodes. The main remaining recording cost is therefore eager construction
-of named-rewrite normalization proofs and the transient terms that normalization inserts. The
-proof-forest bookkeeping itself is not the dominant cost. AC10 was not run: extrapolating from the
-AC8-to-AC9 jump put it at material risk of exceeding a minute or a gigabyte.
+1,022 classes and 19,180 e-nodes. AC10 was not run because extrapolation put it at material risk of
+exceeding a minute or a gigabyte.
+
+With lazy rewrite recipes, three fresh-process runs give:
+
+| Size | Off time | On time | Time ratio | Off peak RSS | On peak RSS | Memory ratio |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| AC5 | 1.34 ms | 1.57 ms | 1.17× | 2.6 MiB | 2.8 MiB | 1.09× |
+| AC6 | 4.67 ms | 6.91 ms | 1.48× | 3.0 MiB | 3.7 MiB | 1.24× |
+| AC7 | 19.16 ms | 32.56 ms | 1.70× | 3.6 MiB | 6.7 MiB | 1.85× |
+| AC8 | 81.69 ms | 107.18 ms | 1.31× | 6.9 MiB | 18.0 MiB | 2.61× |
+| AC9 | 331.46 ms | 595.74 ms | 1.80× | 19.8 MiB | 72.6 MiB | 3.67× |
+| AC10 | 1,861.43 ms | 3,373.53 ms | 1.81× | 72.6 MiB | 274.3 MiB | 3.78× |
+
+AC9 proof recording is now about ten times faster and uses about one quarter of the memory of the
+eager version. No proof nodes are allocated during saturation: the remaining overhead comes from
+raw term definitions, the explanation forest, and the stored rewrite recipes. AC10 now completes
+comfortably, although its roughly 499,000 explanation reasons show that compacting or sharing the
+recipes is the next memory target.
