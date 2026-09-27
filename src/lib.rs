@@ -28,9 +28,11 @@ use symbol_table::GlobalSymbol as Symbol;
 use web_time::{Duration, Instant};
 
 mod proof;
+mod proof_union_find;
 mod terms;
 use proof::{EGraphPatternRecipe, EGraphProofState, EGraphProofTerm, EGraphUnionReason};
-pub use proof::{EGraphProofStats, ProofError, ProofId, ProofUnionFind};
+pub use proof::{EGraphProofStats, ProofError, ProofId};
+pub use proof_union_find::ProofUnionFind;
 use terms::pattern_occurrence_lift;
 pub use terms::{DeBruijnIndex, DeBruijnLevel, NamedTerm, Pattern, Rewrite, Term, TermCtx};
 
