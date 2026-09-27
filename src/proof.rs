@@ -300,7 +300,11 @@ struct EGraphExplanationPath {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum EGraphReasonKind {
-    Direct(ProofId),
+    Definitional,
+    Assumption {
+        index: usize,
+        label: String,
+    },
     RewriteDirect {
         name: String,
         arguments: Vec<RawId>,
@@ -356,7 +360,11 @@ struct EGraphExplainEdge {
 
 #[derive(Clone, Debug)]
 pub(crate) enum EGraphUnionReason {
-    Direct(ProofId),
+    Definitional,
+    Assumption {
+        index: usize,
+        label: String,
+    },
     RewriteDirect {
         name: String,
         arguments: Vec<RawId>,
@@ -377,19 +385,22 @@ pub(crate) enum EGraphUnionReason {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EGraphProofState {
-    arena: Vec<EGraphProofNode>,
-    proof_memo: HashMap<EGraphProofNode, ProofId>,
-    terms: Vec<EGraphTermNode>,
-    term_memo: HashMap<EGraphTermNode, EGraphTermId>,
-    raw_terms: Vec<EGraphTermId>,
+    // Persistent search trace. Saturation writes only these fields.
     definitions: Vec<Option<EGraphProofTerm>>,
     explain_parents: Vec<RawId>,
     explain_edges: Vec<Option<EGraphExplainEdge>>,
     explain_sizes: Vec<usize>,
     reasons: Vec<EGraphReasonNode>,
-    materialized_reasons: Vec<Option<ProofId>>,
     assumptions: usize,
     unsupported: Option<String>,
+
+    // Lean certificate cache. These stay empty until a proof is requested.
+    arena: Vec<EGraphProofNode>,
+    proof_memo: HashMap<EGraphProofNode, ProofId>,
+    terms: Vec<EGraphTermNode>,
+    term_memo: HashMap<EGraphTermNode, EGraphTermId>,
+    raw_terms: Vec<Option<EGraphTermId>>,
+    materialized_reasons: Vec<Option<ProofId>>,
 }
 
 impl EGraphProofState {
@@ -435,8 +446,7 @@ impl EGraphProofState {
     pub(crate) fn make_set(&mut self, raw: RawId, context: usize) {
         assert_eq!(self.definitions.len(), raw as usize);
         self.definitions.push(None);
-        let term = self.alloc_term(EGraphTermNode::Raw(raw));
-        self.raw_terms.push(term);
+        self.raw_terms.push(None);
         self.explain_parents.push(raw);
         self.explain_edges.push(None);
         self.explain_sizes.push(1);
@@ -455,8 +465,13 @@ impl EGraphProofState {
         term
     }
 
-    pub(crate) fn raw_term(&self, raw: RawId) -> EGraphTermId {
-        self.raw_terms[raw as usize]
+    pub(crate) fn raw_term(&mut self, raw: RawId) -> EGraphTermId {
+        if let Some(term) = self.raw_terms[raw as usize] {
+            return term;
+        }
+        let term = self.alloc_term(EGraphTermNode::Raw(raw));
+        self.raw_terms[raw as usize] = Some(term);
+        term
     }
 
     pub(crate) fn app_term(
@@ -485,21 +500,19 @@ impl EGraphProofState {
     }
 
     pub(crate) fn refl_between(&mut self, left: RawId, right: RawId) -> ProofId {
-        self.refl_terms(self.raw_term(left), self.raw_term(right))
+        let left = self.raw_term(left);
+        let right = self.raw_term(right);
+        self.refl_terms(left, right)
     }
 
     pub(crate) fn refl_terms(&mut self, left: EGraphTermId, right: EGraphTermId) -> ProofId {
         self.alloc(left, right, EGraphProofKind::Refl)
     }
 
-    pub(crate) fn assumption(&mut self, left: RawId, right: RawId, label: String) -> ProofId {
+    pub(crate) fn assumption(&mut self, label: String) -> EGraphUnionReason {
         let index = self.assumptions;
         self.assumptions += 1;
-        self.alloc(
-            self.raw_term(left),
-            self.raw_term(right),
-            EGraphProofKind::Assumption { index, label },
-        )
+        EGraphUnionReason::Assumption { index, label }
     }
 
     pub(crate) fn symm(&mut self, proof: ProofId) -> ProofId {
@@ -616,8 +629,11 @@ impl EGraphProofState {
         };
         let fp = self.proof_between(old_function, function);
         let ap = self.proof_between(old_argument, argument);
-        let definition = self.app_term(self.raw_term(old_function), self.raw_term(old_argument));
-        let unfold = self.refl_terms(self.raw_term(raw), definition);
+        let old_function = self.raw_term(old_function);
+        let old_argument = self.raw_term(old_argument);
+        let definition = self.app_term(old_function, old_argument);
+        let raw = self.raw_term(raw);
+        let unfold = self.refl_terms(raw, definition);
         let normalize = self.congr_terms(fp, ap);
         Some(self.trans(unfold, normalize))
     }
@@ -744,10 +760,9 @@ impl EGraphProofState {
             "a proof edge must join two components"
         );
         let kind = match reason {
-            EGraphUnionReason::Direct(proof) => {
-                debug_assert_eq!(self.arena[proof.0 as usize].left, self.raw_term(left));
-                debug_assert_eq!(self.arena[proof.0 as usize].right, self.raw_term(right));
-                EGraphReasonKind::Direct(proof)
+            EGraphUnionReason::Definitional => EGraphReasonKind::Definitional,
+            EGraphUnionReason::Assumption { index, label } => {
+                EGraphReasonKind::Assumption { index, label }
             }
             EGraphUnionReason::RewriteDirect { name, arguments } => {
                 EGraphReasonKind::RewriteDirect { name, arguments }
@@ -808,13 +823,17 @@ impl EGraphProofState {
         }
         let node = self.reasons[reason.0 as usize].clone();
         let proof = match node.kind {
-            EGraphReasonKind::Direct(proof) => proof,
-            EGraphReasonKind::RewriteDirect { name, arguments } => self.rewrite(
-                self.raw_term(node.left),
-                self.raw_term(node.right),
-                name,
-                arguments,
-            ),
+            EGraphReasonKind::Definitional => self.refl_between(node.left, node.right),
+            EGraphReasonKind::Assumption { index, label } => {
+                let left = self.raw_term(node.left);
+                let right = self.raw_term(node.right);
+                self.alloc(left, right, EGraphProofKind::Assumption { index, label })
+            }
+            EGraphReasonKind::RewriteDirect { name, arguments } => {
+                let left = self.raw_term(node.left);
+                let right = self.raw_term(node.right);
+                self.rewrite(left, right, name, arguments)
+            }
             EGraphReasonKind::Rewrite {
                 name,
                 arguments,
@@ -1626,7 +1645,10 @@ mod tests {
         )
         .unwrap();
         egraph.saturate(std::slice::from_ref(&rule));
-        assert_eq!(egraph.proof_stats().unwrap().rewrites, 0);
+        let recorded = egraph.proof_stats().unwrap();
+        assert_eq!(recorded.steps, 0);
+        assert_eq!(recorded.expression_terms, 0);
+        assert_eq!(recorded.rewrites, 0);
         let settled_steps = egraph.proof_step_count();
         egraph.saturate(std::slice::from_ref(&rule));
         assert_eq!(egraph.proof_step_count(), settled_steps);

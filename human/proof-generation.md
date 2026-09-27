@@ -168,20 +168,20 @@ includes process startup.
 
 | Example | Metric | Eager parent proofs | Proof forest | Lazy rewrites |
 | --- | --- | ---: | ---: | ---: |
-| AC4 | bytes | 43,106 | 11,823 | 10,995 |
+| AC4 | bytes | 43,106 | 11,823 | 10,678 |
 |  | lines | 1,159 | 345 | 319 |
 |  | live proof bindings | 851 | 225 | 206 |
 |  | live rewrite applications | 48 | 16 | 16 |
 |  | Lean time | 0.858 s | 0.382 s | 0.41 s |
 |  | peak memory | 546 MB | 480 MB | 487 MB |
-| AC5 | bytes | 244,277 | 17,771 | 11,588 |
+| AC5 | bytes | 244,277 | 17,771 | 11,273 |
 |  | lines | 6,011 | 510 | 336 |
 |  | live proof bindings | 4,566 | 334 | 216 |
 |  | live rewrite applications | 239 | 22 | 17 |
 |  | Lean time | 6.262 s | 0.464 s | 0.38 s |
 |  | peak memory | 1,800 MB | 493 MB | 489 MB |
 
-Lazy rewrites leave the proof arena empty after saturation. Rendering AC4 materializes 264 proof
+Lazy rewrites leave both certificate arenas empty after saturation. Rendering AC4 materializes 264 proof
 nodes, and rendering AC5 materializes 275; the previous eager-rewrite version held 972 and 4,872
 nodes respectively before rendering. Each successful rewrite now records a compact instantiated
 pattern recipe. Only recipes reached by the requested explanation are expanded into normalization,

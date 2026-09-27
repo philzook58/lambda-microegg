@@ -653,9 +653,10 @@ impl EGraph {
         self.union_assuming(a, b, "input equality")
     }
     pub fn union_assuming(&mut self, a: &Id, b: &Id, label: impl Into<String>) -> bool {
-        let reason = self.proofs.as_mut().map(|proofs| {
-            EGraphUnionReason::Direct(proofs.assumption(a.raw(), b.raw(), label.into()))
-        });
+        let reason = self
+            .proofs
+            .as_mut()
+            .map(|proofs| proofs.assumption(label.into()));
         self.union_with_reason(a, b, reason)
     }
     fn union_with_reason(&mut self, a: &Id, b: &Id, reason: Option<EGraphUnionReason>) -> bool {
@@ -720,12 +721,7 @@ impl EGraph {
             (Some(EGraphProofTerm::Atom(left_name)), Some(EGraphProofTerm::Atom(right_name)))
                 if left_name == right_name =>
             {
-                Some(EGraphUnionReason::Direct(
-                    self.proofs
-                        .as_mut()
-                        .expect("checked above")
-                        .refl_between(left, right),
-                ))
+                Some(EGraphUnionReason::Definitional)
             }
             (
                 Some(EGraphProofTerm::App(left_function, left_argument)),
