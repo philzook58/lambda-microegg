@@ -6,46 +6,34 @@
 //!
 //! The thinning experiment is deliberately single-sorted. An entry of arity `n`
 //! denotes a curried Lean function `α → ... → α` with `n` inputs; an ordinary
-//! constant has arity zero. Dumping a term to a smaller context fills every removed
+//! constant has arity zero. Constructing a restricted witness fills every removed
 //! input with `default`, so generated theorems that prune dependencies require
-//! `[Inhabited α]`.
+//! `[Inhabited α]`. This construction is not stored in explanation-forest edges.
 
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::proof::{ProofError, ProofId};
 use crate::{Id, Lift, RawId};
 
-/// A partial, order-preserving wiring from one context to another.
+/// A partially known lift used only while reconciling two explanation paths.
 ///
-/// The two lifts share a domain. Their selected positions are connected; source
-/// positions not selected by `source` are dumped to `default`, and target positions
-/// not selected by `target` are ignored. Swapping them reverses the partial wiring.
+/// The two lifts share a domain. Their selected positions are connected, while
+/// unselected source positions have not been chosen yet. A completed path always
+/// has an identity `source`, leaving one ordinary `target` lift.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PartialThinning {
+struct PartialLift {
     source: Lift,
     target: Lift,
 }
 
-impl PartialThinning {
+impl PartialLift {
     fn new(source: Lift, target: Lift) -> Self {
         assert_eq!(source.dom(), target.dom());
         Self { source, target }
     }
 
-    fn identity(arity: usize) -> Self {
-        Self::new(Lift::identity(arity), Lift::identity(arity))
-    }
-
-    fn lift(thinning: Lift) -> Self {
+    fn total(thinning: Lift) -> Self {
         Self::new(Lift::identity(thinning.dom()), thinning)
-    }
-
-    fn dump(thinning: Lift) -> Self {
-        Self::lift(thinning).reverse()
-    }
-
-    fn is_identity(&self) -> bool {
-        self.source == self.target && self.source.is_identity()
     }
 
     fn reverse(&self) -> Self {
@@ -80,15 +68,19 @@ impl PartialThinning {
         merged
     }
 
-    fn target_arity(&self) -> usize {
-        self.target.cod()
+    fn finish(&self) -> Lift {
+        assert!(
+            self.source.is_identity(),
+            "an explanation path did not determine a total lift"
+        );
+        self.target
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Endpoint {
-    Named { name: String, map: PartialThinning },
-    Raw { raw: RawId, map: PartialThinning },
+    Named { name: String, lift: Lift },
+    Raw { raw: RawId, lift: Lift },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,9 +88,9 @@ enum ProofKind {
     Refl,
     Symm(ProofId),
     Trans(ProofId, ProofId),
-    Map {
+    Lift {
         proof: ProofId,
-        map: PartialThinning,
+        lift: Lift,
     },
     SpecializeLeft {
         equality: ProofId,
@@ -132,9 +124,8 @@ struct ProofNode {
     kind: ProofKind,
 }
 
-/// A canonical edge proves `larger = lift(thinning, smaller)`. `reversed`
-/// changes which raw node is the forest child; traversal then specializes the
-/// larger context with defaults, the proof-producing form of `dump`.
+/// A canonical edge proves `larger = lift(thinning, smaller)`.
+/// `reversed` records which endpoint is the forest child after rerooting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExplainEdge {
     forward: ProofId,
@@ -209,37 +200,37 @@ impl ProofState {
         self.alloc(
             Endpoint::Raw {
                 raw: left.raw(),
-                map: PartialThinning::lift(left.lift()),
+                lift: left.lift(),
             },
             Endpoint::Raw {
                 raw: right.raw(),
-                map: PartialThinning::lift(right.lift()),
+                lift: right.lift(),
             },
             ProofKind::Assumption { index, label },
         )
     }
 
-    fn map_endpoint(endpoint: &Endpoint, outer: &PartialThinning) -> Endpoint {
+    fn lift_endpoint(endpoint: &Endpoint, outer: Lift) -> Endpoint {
         match endpoint {
-            Endpoint::Named { name, map } => Endpoint::Named {
+            Endpoint::Named { name, lift } => Endpoint::Named {
                 name: name.clone(),
-                map: map.then(outer),
+                lift: outer.compose(lift),
             },
-            Endpoint::Raw { raw, map } => Endpoint::Raw {
+            Endpoint::Raw { raw, lift } => Endpoint::Raw {
                 raw: *raw,
-                map: map.then(outer),
+                lift: outer.compose(lift),
             },
         }
     }
 
-    fn map_proof(&mut self, proof: ProofId, map: PartialThinning) -> ProofId {
-        if map.is_identity() {
+    fn lift_proof(&mut self, proof: ProofId, lift: Lift) -> ProofId {
+        if lift.is_identity() {
             return proof;
         }
         let node = &self.arena[proof.0 as usize];
-        let left = Self::map_endpoint(&node.left, &map);
-        let right = Self::map_endpoint(&node.right, &map);
-        self.alloc(left, right, ProofKind::Map { proof, map })
+        let left = Self::lift_endpoint(&node.left, lift);
+        let right = Self::lift_endpoint(&node.right, lift);
+        self.alloc(left, right, ProofKind::Lift { proof, lift })
     }
 
     fn reroot_explanation(&mut self, node: RawId) {
@@ -263,8 +254,8 @@ impl ProofState {
         }
     }
 
-    /// Record `larger = lift(thinning, smaller)`. The forest initially points
-    /// in the dump direction; subsequent links reroot and flip edges as needed.
+    /// Record `larger = lift(thinning, smaller)`. Rerooting changes only the
+    /// forest orientation flag; the stored relation remains this ordinary lift.
     fn link_thinning_equality(
         &mut self,
         larger: RawId,
@@ -326,6 +317,13 @@ impl ProofState {
         let mut left_maps = Self::plan_path(left, &left_path);
         let mut right_maps = Self::plan_path(right, &right_path);
         Self::complete_paths(&mut left_maps, &left_path, &mut right_maps, &right_path);
+        debug_assert!(
+            left_maps
+                .iter()
+                .chain(&right_maps)
+                .all(|map| map.source.is_identity()),
+            "a completed explanation path must contain only ordinary lifts"
+        );
 
         let left_to_common = self.materialize_path(left, &left_path, &left_maps);
         let right_to_common = self.materialize_path(right, &right_path, &right_maps);
@@ -335,7 +333,7 @@ impl ProofState {
             self.arena[proof.0 as usize].right,
             Endpoint::Raw {
                 raw: right.raw(),
-                map: PartialThinning::lift(right.lift()),
+                lift: right.lift(),
             },
             "explanation forest disagrees with operational thinning"
         );
@@ -343,9 +341,9 @@ impl ProofState {
     }
 
     fn complete_paths(
-        left: &mut [PartialThinning],
+        left: &mut [PartialLift],
         left_edges: &[ExplainEdge],
-        right: &mut [PartialThinning],
+        right: &mut [PartialLift],
         right_edges: &[ExplainEdge],
     ) {
         let common = left.last().unwrap().merge(right.last().unwrap());
@@ -355,26 +353,28 @@ impl ProofState {
         Self::complete_path(right, right_edges);
     }
 
-    fn complete_path(maps: &mut [PartialThinning], edges: &[ExplainEdge]) {
+    fn complete_path(maps: &mut [PartialLift], edges: &[ExplainEdge]) {
         for index in (0..edges.len()).rev() {
             let edge = edges[index];
             let required = if edge.reversed {
-                PartialThinning::lift(edge.thinning).then(&maps[index + 1])
+                PartialLift::total(edge.thinning).then(&maps[index + 1])
             } else {
-                PartialThinning::dump(edge.thinning).then(&maps[index + 1])
+                PartialLift::total(edge.thinning)
+                    .reverse()
+                    .then(&maps[index + 1])
             };
             maps[index] = maps[index].merge(&required);
         }
     }
 
-    fn plan_path(start: Id, path: &[ExplainEdge]) -> Vec<PartialThinning> {
-        let mut maps = vec![PartialThinning::lift(start.lift())];
+    fn plan_path(start: Id, path: &[ExplainEdge]) -> Vec<PartialLift> {
+        let mut maps = vec![PartialLift::total(start.lift())];
         for &edge in path {
             let current = maps.last().unwrap();
             let next = if edge.reversed {
-                PartialThinning::dump(edge.thinning).then(current)
+                PartialLift::total(edge.thinning).reverse().then(current)
             } else {
-                PartialThinning::lift(edge.thinning).then(current)
+                PartialLift::total(edge.thinning).then(current)
             };
             maps.push(next);
         }
@@ -385,19 +385,19 @@ impl ProofState {
         &mut self,
         start: Id,
         path: &[ExplainEdge],
-        maps: &[PartialThinning],
+        maps: &[PartialLift],
     ) -> ProofId {
         let endpoint = Endpoint::Raw {
             raw: start.raw(),
-            map: maps[0],
+            lift: maps[0].finish(),
         };
         let mut proof = self.alloc(endpoint.clone(), endpoint, ProofKind::Refl);
         for (index, &edge) in path.iter().enumerate() {
             let mapped = if edge.reversed {
-                let mapped = self.map_proof(edge.forward, maps[index + 1]);
+                let mapped = self.lift_proof(edge.forward, maps[index + 1].finish());
                 self.symm(mapped)
             } else {
-                self.map_proof(edge.forward, maps[index])
+                self.lift_proof(edge.forward, maps[index].finish())
             };
             proof = self.trans(proof, mapped);
         }
@@ -414,7 +414,7 @@ impl ProofState {
             }
             match self.arena[index].kind {
                 ProofKind::Refl | ProofKind::Assumption { .. } => {}
-                ProofKind::Symm(child) | ProofKind::Map { proof: child, .. } => work.push(child),
+                ProofKind::Symm(child) | ProofKind::Lift { proof: child, .. } => work.push(child),
                 ProofKind::SpecializeLeft { equality, .. }
                 | ProofKind::SpecializeRight { equality, .. }
                 | ProofKind::FactorLeft { equality, .. }
@@ -483,11 +483,11 @@ impl ProofUnionFind {
             let memo_proof = proofs.alloc(
                 Endpoint::Named {
                     name: name.clone(),
-                    map: PartialThinning::identity(arity),
+                    lift: Lift::identity(arity),
                 },
                 Endpoint::Raw {
                     raw,
-                    map: PartialThinning::identity(arity),
+                    lift: Lift::identity(arity),
                 },
                 ProofKind::Refl,
             );
@@ -565,11 +565,11 @@ impl ProofUnionFind {
                 let proof = proofs.alloc(
                     Endpoint::Raw {
                         raw: root.raw(),
-                        map: PartialThinning::lift(root.lift()),
+                        lift: root.lift(),
                     },
                     Endpoint::Raw {
                         raw: parent.raw(),
-                        map: PartialThinning::lift(parent.lift()),
+                        lift: parent.lift(),
                     },
                     ProofKind::FactorLeft {
                         equality,
@@ -590,11 +590,11 @@ impl ProofUnionFind {
                 let proof = proofs.alloc(
                     Endpoint::Raw {
                         raw: left.raw(),
-                        map: PartialThinning::lift(left.lift()),
+                        lift: left.lift(),
                     },
                     Endpoint::Raw {
                         raw: parent.raw(),
-                        map: PartialThinning::lift(parent.lift()),
+                        lift: parent.lift(),
                     },
                     ProofKind::SpecializeLeft {
                         equality,
@@ -616,11 +616,11 @@ impl ProofUnionFind {
                 let proof = proofs.alloc(
                     Endpoint::Raw {
                         raw: right.raw(),
-                        map: PartialThinning::lift(right.lift()),
+                        lift: right.lift(),
                     },
                     Endpoint::Raw {
                         raw: parent.raw(),
-                        map: PartialThinning::lift(parent.lift()),
+                        lift: parent.lift(),
                     },
                     ProofKind::SpecializeRight {
                         equality,
@@ -645,11 +645,11 @@ impl ProofUnionFind {
                 let left_proof = proofs.alloc(
                     Endpoint::Raw {
                         raw: left.raw(),
-                        map: PartialThinning::lift(left.lift()),
+                        lift: left.lift(),
                     },
                     Endpoint::Raw {
                         raw: left_parent.raw(),
-                        map: PartialThinning::lift(left_parent.lift()),
+                        lift: left_parent.lift(),
                     },
                     ProofKind::FactorLeft {
                         equality,
@@ -661,11 +661,11 @@ impl ProofUnionFind {
                 let right_proof = proofs.alloc(
                     Endpoint::Raw {
                         raw: right.raw(),
-                        map: PartialThinning::lift(right.lift()),
+                        lift: right.lift(),
                     },
                     Endpoint::Raw {
                         raw: right_parent.raw(),
-                        map: PartialThinning::lift(right_parent.lift()),
+                        lift: right_parent.lift(),
                     },
                     ProofKind::FactorRight {
                         equality,
@@ -762,11 +762,11 @@ impl ProofUnionFind {
         let arity = self.arities[self.memo[left] as usize];
         let left_endpoint = Endpoint::Named {
             name: left.to_owned(),
-            map: PartialThinning::identity(arity),
+            lift: Lift::identity(arity),
         };
         let right_endpoint = Endpoint::Named {
             name: right.to_owned(),
-            map: PartialThinning::identity(arity),
+            lift: Lift::identity(arity),
         };
         output.push_str(&format!(
             " : {} := by\n",
@@ -814,9 +814,9 @@ impl ProofUnionFind {
                         ),
                     )
                 }
-                ProofKind::Map { proof, ref map } => Self::pointwise(
-                    map.target_arity(),
-                    Self::apply_proof(proof, &Self::map_arguments(map)),
+                ProofKind::Lift { proof, lift } => Self::pointwise(
+                    lift.cod(),
+                    Self::apply_proof(proof, &Self::selected_arguments(lift)),
                 ),
                 ProofKind::SpecializeLeft { equality, left } => Self::pointwise(
                     left.dom(),
@@ -865,21 +865,21 @@ impl ProofUnionFind {
 
     fn endpoint_value(&self, endpoint: &Endpoint, local: bool) -> String {
         match endpoint {
-            Endpoint::Named { name, map } => {
-                let arguments = Self::map_arguments(map);
+            Endpoint::Named { name, lift } => {
+                let arguments = Self::selected_arguments(*lift);
                 if arguments.is_empty() {
                     name.clone()
                 } else {
                     Self::apply(&format!("({name})"), &arguments)
                 }
             }
-            Endpoint::Raw { raw, map } => {
+            Endpoint::Raw { raw, lift } => {
                 let source = if local {
                     format!("e{raw}")
                 } else {
                     self.definition_expression(*raw, false)
                 };
-                let arguments = Self::map_arguments(map);
+                let arguments = Self::selected_arguments(*lift);
                 if arguments.is_empty() {
                     source
                 } else {
@@ -891,7 +891,7 @@ impl ProofUnionFind {
 
     fn endpoint_arity(endpoint: &Endpoint) -> usize {
         match endpoint {
-            Endpoint::Named { map, .. } | Endpoint::Raw { map, .. } => map.target_arity(),
+            Endpoint::Named { lift, .. } | Endpoint::Raw { lift, .. } => lift.cod(),
         }
     }
 
@@ -934,16 +934,10 @@ impl ProofUnionFind {
         }
     }
 
-    fn map_arguments(map: &PartialThinning) -> Vec<String> {
-        let mut targets = (0..map.target.cod()).filter(|&index| map.target.get(index));
-        (0..map.source.cod())
-            .map(|source| {
-                if map.source.get(source) {
-                    format!("x{}", targets.next().unwrap())
-                } else {
-                    "default".to_owned()
-                }
-            })
+    fn selected_arguments(lift: Lift) -> Vec<String> {
+        (0..lift.cod())
+            .filter(|&index| lift.get(index))
+            .map(|index| format!("x{index}"))
             .collect()
     }
 
@@ -1028,24 +1022,27 @@ mod tests {
     use std::process::{Command, Stdio};
 
     #[test]
-    fn partial_thinning_is_a_pair_of_lifts() {
-        let map = PartialThinning::new(Lift::selected(3, &[0, 2]), Lift::selected(4, &[1, 3]));
-        assert_eq!(std::mem::size_of::<PartialThinning>(), 8);
-        assert_eq!(ProofUnionFind::map_arguments(&map), ["x1", "default", "x3"]);
-        assert_eq!(map.reverse().reverse(), map);
+    fn partial_lift_reverses_by_swapping_its_two_lifts() {
+        let partial = PartialLift::new(Lift::selected(3, &[0, 2]), Lift::selected(4, &[1, 3]));
+        assert_eq!(std::mem::size_of::<PartialLift>(), 8);
+        assert_eq!(partial.reverse().source, partial.target);
+        assert_eq!(partial.reverse().target, partial.source);
+        assert_eq!(partial.reverse().reverse(), partial);
     }
 
     #[test]
-    fn partial_thinning_composition_uses_the_middle_pullback() {
-        let first = PartialThinning::new(Lift::selected(3, &[0, 2]), Lift::selected(4, &[1, 3]));
-        let second = PartialThinning::new(Lift::selected(4, &[1, 3]), Lift::selected(3, &[0, 2]));
+    fn partial_lift_composition_uses_the_middle_pullback() {
+        let first = PartialLift::new(Lift::selected(3, &[0, 2]), Lift::selected(4, &[1, 3]));
+        let second = PartialLift::new(Lift::selected(4, &[1, 3]), Lift::selected(3, &[0, 2]));
         let composite = first.then(&second);
         assert_eq!(composite.source, Lift::selected(3, &[0, 2]));
         assert_eq!(composite.target, Lift::selected(3, &[0, 2]));
-        assert_eq!(
-            ProofUnionFind::map_arguments(&composite),
-            ["x0", "default", "x2"]
-        );
+    }
+
+    #[test]
+    fn completed_partial_lift_finishes_to_one_lift() {
+        let lift = Lift::selected(3, &[0, 2]);
+        assert_eq!(PartialLift::total(lift).finish(), lift);
     }
 
     #[test]
@@ -1163,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn dependency_pruning_uses_dump_and_checks_in_lean() {
+    fn dependency_pruning_constructs_a_witness_and_checks_in_lean() {
         let mut union_find = ProofUnionFind::new(true);
         let f = union_find.make_set_with_arity("f", 1);
         let g = union_find.make_set_with_arity("g", 1);
@@ -1192,7 +1189,7 @@ mod tests {
                 .iter()
                 .flatten()
                 .any(|edge| edge.reversed),
-            "the example should exercise a rerooted dump edge"
+            "the example should exercise a rerooted lift edge"
         );
 
         let certificate = union_find
