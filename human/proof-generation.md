@@ -18,7 +18,7 @@ available.
 The context-zero fragment is now integrated into `EGraph`: atoms and binary applications, without
 variables, binders, or non-identity lifts. `EGraph::new_with_proofs` allocates parallel proof state;
 ordinary `EGraph::new` pays no proof-arena cost. Each raw e-class retains its immutable defining
-node. Rebuild justifies application memo collisions with `congrArg` or `congrArg₂`, and unions carry
+node. Rebuild justifies application memo collisions with `congrArg`, and unions carry
 those proofs through parent links and path compression. `EGraph::lean_proof` traverses the proof
 backwards and prints only live term and proof bindings, preserving their arena IDs rather than
 densely renumbering them. `examples/proof_egraph.rs` demonstrates `a = b` producing `f a = f b` and

@@ -23,8 +23,12 @@ fn beta_rule() -> Rewrite {
     )
 }
 
-fn ac_case(n: usize) -> (EGraph, Id, Id, [Rewrite; 2]) {
-    let mut eg = EGraph::new();
+fn ac_case(n: usize, proofs: bool) -> (EGraph, Id, Id, [Rewrite; 2]) {
+    let mut eg = if proofs {
+        EGraph::new_with_proofs()
+    } else {
+        EGraph::new()
+    };
     let atoms: Vec<_> = (0..n).map(|i| eg.atom(&format!("x{i}"), 0)).collect();
     let mut input = atoms[0];
     for atom in &atoms[1..] {
@@ -59,7 +63,7 @@ fn bench_ac(c: &mut Criterion) {
     for n in [7, 10] {
         group.bench_function(format!("AC{n}"), |b| {
             b.iter_batched(
-                || ac_case(n),
+                || ac_case(n, false),
                 |(mut eg, input, goal, rules)| {
                     let stats = eg.saturate(&rules);
                     assert!(eg.equivalent(&input, &goal));
@@ -75,6 +79,19 @@ fn bench_ac(c: &mut Criterion) {
                 BatchSize::PerIteration,
             )
         });
+        if n == 7 {
+            group.bench_function("AC7-proof-tracking", |b| {
+                b.iter_batched(
+                    || ac_case(n, true),
+                    |(mut eg, input, goal, rules)| {
+                        let stats = eg.saturate(&rules);
+                        assert!(eg.equivalent(&input, &goal));
+                        black_box(stats)
+                    },
+                    BatchSize::PerIteration,
+                )
+            });
+        }
     }
     group.finish();
 }

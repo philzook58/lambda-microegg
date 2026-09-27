@@ -411,7 +411,13 @@ impl EGraphProofState {
                     format!("Eq.trans p{} p{}", first.0, second.0)
                 }
                 EGraphProofKind::CongApp(function, argument) => {
-                    format!("congrArg₂ app p{} p{}", function.0, argument.0)
+                    let function_node = &self.arena[function.0 as usize];
+                    let argument_node = &self.arena[argument.0 as usize];
+                    format!(
+                        "Eq.trans (congrArg (fun function => app function e{}) p{}) \
+                         (congrArg (app e{}) p{})",
+                        argument_node.left, function.0, function_node.right, argument.0
+                    )
                 }
                 EGraphProofKind::CongFunction { argument, proof } => {
                     format!(
@@ -794,6 +800,50 @@ mod tests {
         assert!(
             output.status.success(),
             "Lean rejected the generated e-graph certificate:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn egraph_congruence_can_change_both_application_children() {
+        let mut egraph = crate::EGraph::new_with_proofs();
+        let f = egraph.atom("f", 0);
+        let g = egraph.atom("g", 0);
+        let a = egraph.atom("a", 0);
+        let b = egraph.atom("b", 0);
+        let fa = egraph.app(f, a);
+        let gb = egraph.app(g, b);
+        egraph.union_assuming(&f, &g, "f = g");
+        egraph.union_assuming(&a, &b, "a = b");
+        let certificate = egraph
+            .lean_proof(
+                "two_child_congruence",
+                "{α : Type} (app : α → α → α) (f g a b : α)",
+                &fa,
+                &gb,
+            )
+            .unwrap();
+        assert!(!certificate.contains("congrArg₂"));
+
+        let Ok(mut lean) = Command::new("lean")
+            .arg("--stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            return;
+        };
+        lean.stdin
+            .take()
+            .unwrap()
+            .write_all(certificate.as_bytes())
+            .unwrap();
+        let output = lean.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "Lean rejected two-child congruence:\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
