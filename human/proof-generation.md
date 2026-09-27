@@ -183,11 +183,11 @@ includes process startup.
 
 Lazy rewrites leave certificate arenas absent during saturation. `EGraphProofTrace` retains only
 definitions, the explanation forest, and compact reasons. `render_egraph_proof` creates a local
-`EGraphProofArena`, materializes the requested explanation, prints it, and drops the arena. Each
-successful rewrite records a shared pattern schema plus its substitutions and witnesses. Only
-reasons reached by the requested explanation are expanded into normalization, rule, congruence,
-symmetry, and transitivity nodes. The generated certificates are kept in `proofs/AC4.lean` and
-`proofs/AC5.lean`.
+`EGraphProofArena`, materializes the requested explanation, prints it, and drops the arena. The trace
+registers each existing `Rewrite` once. A successful application stores its existing `Subst` and,
+when necessary, one raw/representative witness pair per pattern node. Only reasons reached by the
+requested explanation are expanded into normalization, rule, congruence, symmetry, and transitivity
+nodes. The generated certificates are kept in `proofs/AC4.lean` and `proofs/AC5.lean`.
 
 ## Proof-recording overhead
 
@@ -239,3 +239,9 @@ certificate caches sparse reduces that target further:
 These are means of three fresh processes. Saturation time did not improve measurably: AC9 remained
 about 0.59 seconds and AC10 remained about 3.2 seconds. The change removes repeated representation
 rather than work on the matching and rebuilding hot paths.
+
+The later readability cleanup stores the existing `Rewrite` and `Subst` types directly, keeps left
+and right witness vectors separate, and puts the complete reason on `ReasonNode`. One
+fresh-process run measured 13.8 MiB for AC8, 52.1 MiB for AC9, and 201.1 MiB for AC10: roughly
+11–19% above the shared flat representation. AC9 still took 0.59 seconds and AC10 took 2.96 seconds.
+The generated AC4 and AC5 certificates remained byte-for-byte identical.

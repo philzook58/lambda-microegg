@@ -30,11 +30,11 @@ use web_time::{Duration, Instant};
 mod proof;
 mod proof_union_find;
 mod terms;
-use proof::{
-    EGraphPatternWitness, EGraphProofTerm, EGraphProofTrace, EGraphRewriteSchemaId,
-    EGraphUnionReason, render_egraph_proof,
-};
 pub use proof::{EGraphProofStats, ProofError, ProofId};
+use proof::{
+    EGraphProofTrace, EGraphTermDefinition, PatternNodeWitness, Reason, RewriteNormalization,
+    RuleId, render_egraph_proof,
+};
 pub use proof_union_find::ProofUnionFind;
 use terms::pattern_occurrence_lift;
 pub use terms::{DeBruijnIndex, DeBruijnLevel, NamedTerm, Pattern, Rewrite, Term, TermCtx};
@@ -330,7 +330,7 @@ enum Node {
 
 /// Match results contain only fat IDs. A binding for an n-ary metavariable
 /// lives in `top_ctx + n`; its lift records unused top variables and formals.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Subst(SmallVec<[(Symbol, Id); 3]>);
 
 // Three common bindings fit in one 48-byte value on 64-bit hosts. Treat a
@@ -519,7 +519,7 @@ impl EGraph {
         if let Some(proofs) = &mut self.proofs {
             let definition = match &node {
                 Node::Atom(name) if scope == 0 => {
-                    Some(EGraphProofTerm::Atom(name.as_str().to_owned()))
+                    Some(EGraphTermDefinition::Atom(name.as_str().to_owned()))
                 }
                 Node::App(function, argument)
                     if scope == 0
@@ -528,7 +528,7 @@ impl EGraph {
                         && function.lift().is_identity()
                         && argument.lift().is_identity() =>
                 {
-                    Some(EGraphProofTerm::App(function.raw(), argument.raw()))
+                    Some(EGraphTermDefinition::App(function.raw(), argument.raw()))
                 }
                 _ => None,
             };
@@ -661,7 +661,7 @@ impl EGraph {
             .map(|proofs| proofs.assumption(label.into()));
         self.union_with_reason(a, b, reason)
     }
-    fn union_with_reason(&mut self, a: &Id, b: &Id, reason: Option<EGraphUnionReason>) -> bool {
+    fn union_with_reason(&mut self, a: &Id, b: &Id, reason: Option<Reason>) -> bool {
         assert_eq!(a.ctx(), b.ctx(), "equality needs a shared context");
         let input_a = *a;
         let input_b = *b;
@@ -714,20 +714,19 @@ impl EGraph {
         self.find(a) == self.find(b)
     }
 
-    fn congruence_reason(&mut self, left: RawId, right: RawId) -> Option<EGraphUnionReason> {
+    fn congruence_reason(&mut self, left: RawId, right: RawId) -> Option<Reason> {
         let (left_definition, right_definition) = {
             let proofs = self.proofs.as_ref()?;
             (proofs.definition(left), proofs.definition(right))
         };
         match (left_definition, right_definition) {
-            (Some(EGraphProofTerm::Atom(left_name)), Some(EGraphProofTerm::Atom(right_name)))
-                if left_name == right_name =>
-            {
-                Some(EGraphUnionReason::Definitional)
-            }
             (
-                Some(EGraphProofTerm::App(left_function, left_argument)),
-                Some(EGraphProofTerm::App(right_function, right_argument)),
+                Some(EGraphTermDefinition::Atom(left_name)),
+                Some(EGraphTermDefinition::Atom(right_name)),
+            ) if left_name == right_name => Some(Reason::Definitional),
+            (
+                Some(EGraphTermDefinition::App(left_function, left_argument)),
+                Some(EGraphTermDefinition::App(right_function, right_argument)),
             ) => {
                 let left_function_root = self.find_mut(&Id::new(Lift::identity(0), left_function));
                 let right_function_root =
@@ -744,7 +743,7 @@ impl EGraph {
                         .unsupported("memo collision does not have congruent children");
                     return None;
                 }
-                Some(EGraphUnionReason::Congruence {
+                Some(Reason::Congruence {
                     left_function,
                     right_function,
                     left_argument,
@@ -1179,7 +1178,7 @@ impl EGraph {
         &mut self,
         pattern: &Pattern,
         subst: &Subst,
-        out: &mut Vec<EGraphPatternWitness>,
+        out: &mut Vec<PatternNodeWitness>,
     ) -> Option<Id> {
         match pattern {
             Pattern::MetaVar(name, arguments) if arguments.is_empty() => {
@@ -1188,7 +1187,7 @@ impl EGraph {
                     return None;
                 }
                 let normalized = self.find_mut(&original);
-                out.push(EGraphPatternWitness {
+                out.push(PatternNodeWitness {
                     raw: original.raw(),
                     normal: normalized.raw(),
                 });
@@ -1198,7 +1197,7 @@ impl EGraph {
                 let node = Node::Atom(*name);
                 let witness = *self.memo.get(&node)?;
                 let normalized = self.find_mut(&Id::new(Lift::identity(0), witness));
-                out.push(EGraphPatternWitness {
+                out.push(PatternNodeWitness {
                     raw: witness,
                     normal: normalized.raw(),
                 });
@@ -1210,7 +1209,7 @@ impl EGraph {
                 let node = Node::App(function, argument);
                 let witness = *self.memo.get(&node)?;
                 let normalized = self.find_mut(&Id::new(Lift::identity(0), witness));
-                out.push(EGraphPatternWitness {
+                out.push(PatternNodeWitness {
                     raw: witness,
                     normal: normalized.raw(),
                 });
@@ -1227,10 +1226,10 @@ impl EGraph {
             }
             Pattern::Atom(name) => matches!(
                 self.proofs.as_ref().and_then(|proofs| proofs.definition(raw)),
-                Some(EGraphProofTerm::Atom(actual)) if actual == name.as_str()
+                Some(EGraphTermDefinition::Atom(actual)) if actual == name.as_str()
             ),
             Pattern::App(function, argument) => {
-                let Some(EGraphProofTerm::App(function_raw, argument_raw)) = self
+                let Some(EGraphTermDefinition::App(function_raw, argument_raw)) = self
                     .proofs
                     .as_ref()
                     .and_then(|proofs| proofs.definition(raw))
@@ -1247,25 +1246,22 @@ impl EGraph {
     fn named_rewrite_reason(
         &mut self,
         rule: &Rewrite,
-        schema: EGraphRewriteSchemaId,
+        proof_rule: RuleId,
         target: &Id,
         replacement: &Id,
         subst: &Subst,
-    ) -> Option<EGraphUnionReason> {
+    ) -> Option<Reason> {
         if target.ctx() != 0 || replacement.ctx() != 0 {
             return None;
         }
         let target_root = self.find_mut(target);
         let replacement_root = self.find_mut(replacement);
-        let arguments: Option<SmallVec<[RawId; 4]>> = rule
-            .metavariables()
-            .iter()
-            .map(|name| {
-                let id = *subst.get(name)?;
-                (id.ctx() == 0 && id.lift().is_identity()).then_some(id.raw())
-            })
-            .collect();
-        let arguments = arguments?;
+        for name in rule.metavariables() {
+            let id = *subst.get(name)?;
+            if id.ctx() != 0 || !id.lift().is_identity() {
+                return None;
+            }
+        }
 
         // When both stored terms unfold to this exact rule instance, Lean can
         // check the theorem application at the raw endpoints by definitional
@@ -1274,24 +1270,30 @@ impl EGraph {
         if self.pattern_is_definitionally(rule.lhs(), subst, target.raw())
             && self.pattern_is_definitionally(rule.rhs(), subst, replacement.raw())
         {
-            return Some(EGraphUnionReason::RewriteDirect { schema, arguments });
+            return Some(Reason::Rewrite {
+                rule: proof_rule,
+                subst: subst.clone(),
+                normalization: None,
+            });
         }
 
         // Retain only the raw witnesses needed to reconstruct normalization.
         // The Lean proof arena is populated later, and only for rewrite edges
         // selected by the final explanation.
-        let mut witnesses = Vec::new();
-        let left = self.pattern_witnesses(rule.lhs(), subst, &mut witnesses)?;
-        let left_len = witnesses.len();
-        let right = self.pattern_witnesses(rule.rhs(), subst, &mut witnesses)?;
+        let mut left_witnesses = Vec::new();
+        let left = self.pattern_witnesses(rule.lhs(), subst, &mut left_witnesses)?;
+        let mut right_witnesses = Vec::new();
+        let right = self.pattern_witnesses(rule.rhs(), subst, &mut right_witnesses)?;
         if left != target_root || right != replacement_root {
             return None;
         }
-        Some(EGraphUnionReason::Rewrite {
-            schema,
-            arguments,
-            left_len,
-            witnesses,
+        Some(Reason::Rewrite {
+            rule: proof_rule,
+            subst: subst.clone(),
+            normalization: Some(RewriteNormalization {
+                left: left_witnesses,
+                right: right_witnesses,
+            }),
         })
     }
     fn try_instantiate_metavars_rec(
@@ -1402,13 +1404,10 @@ impl EGraph {
         // Saturation usually grows the match set, so retain each rule's
         // allocation across rounds while preserving search-then-apply.
         let mut matches_by_rule: Vec<Vec<(Id, Subst)>> = vec![Vec::new(); rules.len()];
-        let proof_schemas = if let Some(proofs) = &mut self.proofs {
+        let proof_rules = if let Some(proofs) = &mut self.proofs {
             rules
                 .iter()
-                .map(|rule| {
-                    rule.name()
-                        .and_then(|name| proofs.rewrite_schema(name, rule.lhs(), rule.rhs()))
-                })
+                .map(|rule| proofs.register_rule(rule))
                 .collect::<Vec<_>>()
         } else {
             vec![None; rules.len()]
@@ -1441,12 +1440,12 @@ impl EGraph {
                             continue;
                         }
                         let unioned = if self.proofs.is_some() && rule.name().is_some() {
-                            let Some(schema) = proof_schemas[rule_index] else {
+                            let Some(proof_rule) = proof_rules[rule_index] else {
                                 continue;
                             };
                             let Some(reason) = self.named_rewrite_reason(
                                 rule,
-                                schema,
+                                proof_rule,
                                 &target,
                                 &replacement,
                                 &subst,
