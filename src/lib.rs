@@ -29,7 +29,7 @@ use web_time::{Duration, Instant};
 
 mod proof;
 mod terms;
-use proof::{EGraphProofState, EGraphProofTerm, EGraphTermId};
+use proof::{EGraphProofState, EGraphProofTerm, EGraphTermId, EGraphUnionReason};
 pub use proof::{EGraphProofStats, ProofError, ProofId, ProofUnionFind};
 use terms::pattern_occurrence_lift;
 pub use terms::{DeBruijnIndex, DeBruijnLevel, NamedTerm, Pattern, Rewrite, Term, TermCtx};
@@ -503,16 +503,6 @@ impl EGraph {
             let next = self.parent[edge.raw() as usize];
             debug_assert_eq!(next.raw(), root_raw);
             debug_assert_eq!(next.ctx(), edge.lift().dom());
-            if let Some(proofs) = &mut self.proofs {
-                if edge.ctx() != 0 || !edge.lift().is_identity() || !next.lift().is_identity() {
-                    proofs.unsupported("path compression through a nonidentity lift");
-                } else {
-                    let prefix = proofs.parent_proof(raw);
-                    let suffix = proofs.parent_proof(edge.raw());
-                    let proof = proofs.trans(prefix, suffix);
-                    proofs.set_parent_proof(raw, proof);
-                }
-            }
             self.parent[raw as usize] = Id::new(edge.lift().compose(&next.lift()), root_raw);
         }
         let root = self.parent[id.raw() as usize];
@@ -644,21 +634,10 @@ impl EGraph {
     /// Link two union-find roots, updating the reverse e-class index when a
     /// constructive rewrite has requested it. Congruence may still be dirty,
     /// but class-local traversals then remain cheap until the next rebuild.
-    fn link_root(&mut self, child: RawId, parent: Id, proof: Option<ProofId>) {
+    fn link_root(&mut self, child: RawId, parent: Id) {
         debug_assert_eq!(self.parent[child as usize].raw(), child);
         debug_assert_ne!(child, parent.raw());
         debug_assert_eq!(self.parent[child as usize].ctx(), parent.ctx());
-        if let Some(proofs) = &mut self.proofs {
-            if parent.ctx() == 0 && parent.lift().is_identity() {
-                if let Some(proof) = proof {
-                    proofs.set_parent_proof(child, proof);
-                } else {
-                    proofs.unsupported("union-find link has no proof reason");
-                }
-            } else {
-                proofs.unsupported("union-find link uses a nonidentity lift");
-            }
-        }
         self.parent[child as usize] = parent;
         if self.rev_tracked
             && let Some(nodes) = self.rev.swap_remove(&child)
@@ -674,13 +653,12 @@ impl EGraph {
         self.union_assuming(a, b, "input equality")
     }
     pub fn union_assuming(&mut self, a: &Id, b: &Id, label: impl Into<String>) -> bool {
-        let reason = self
-            .proofs
-            .as_mut()
-            .map(|proofs| proofs.assumption(a.raw(), b.raw(), label.into()));
-        self.union_with_proof(a, b, reason)
+        let reason = self.proofs.as_mut().map(|proofs| {
+            EGraphUnionReason::Direct(proofs.assumption(a.raw(), b.raw(), label.into()))
+        });
+        self.union_with_reason(a, b, reason)
     }
-    fn union_with_proof(&mut self, a: &Id, b: &Id, reason: Option<ProofId>) -> bool {
+    fn union_with_reason(&mut self, a: &Id, b: &Id, reason: Option<EGraphUnionReason>) -> bool {
         assert_eq!(a.ctx(), b.ctx(), "equality needs a shared context");
         let input_a = *a;
         let input_b = *b;
@@ -689,27 +667,19 @@ impl EGraph {
         if a == b {
             return false;
         }
-        let root_proof = if let Some(proofs) = &mut self.proofs {
+        if let Some(proofs) = &mut self.proofs {
             if input_a.ctx() != 0
                 || input_b.ctx() != 0
                 || !input_a.lift().is_identity()
                 || !input_b.lift().is_identity()
             {
                 proofs.unsupported("union uses a nonidentity placement");
-                None
             } else if let Some(reason) = reason {
-                let left_path = proofs.parent_proof(input_a.raw());
-                let right_path = proofs.parent_proof(input_b.raw());
-                let left_path = proofs.symm(left_path);
-                let root_to_right = proofs.trans(left_path, reason);
-                Some(proofs.trans(root_to_right, right_path))
+                proofs.link_explanation(input_a.raw(), input_b.raw(), reason);
             } else {
                 proofs.unsupported("union has no equality proof");
-                None
             }
-        } else {
-            None
-        };
+        }
         self.rev_valid = false;
         if a.raw() == b.raw() {
             // Equating two placements of one class restricts that class to
@@ -718,7 +688,7 @@ impl EGraph {
             // value rather than treating x and y themselves as equal.
             let dependency = a.lift().equalizer(&b.lift());
             let root = self.make_set(dependency.dom());
-            self.link_root(a.raw(), Id::new(dependency, root.raw()), None);
+            self.link_root(a.raw(), Id::new(dependency, root.raw()));
             return true;
         }
         let Pullback {
@@ -727,19 +697,13 @@ impl EGraph {
             from_right: to_b,
         } = a.lift().pullback(&b.lift());
         if common == b.lift() {
-            self.link_root(a.raw(), Id::new(to_a, b.raw()), root_proof);
+            self.link_root(a.raw(), Id::new(to_a, b.raw()));
         } else if common == a.lift() {
-            let proof = root_proof.map(|proof| {
-                self.proofs
-                    .as_mut()
-                    .expect("proof exists only when tracking")
-                    .symm(proof)
-            });
-            self.link_root(b.raw(), Id::new(to_b, a.raw()), proof);
+            self.link_root(b.raw(), Id::new(to_b, a.raw()));
         } else {
             let root = self.make_set(common.dom());
-            self.link_root(a.raw(), Id::new(to_a, root.raw()), None);
-            self.link_root(b.raw(), Id::new(to_b, root.raw()), None);
+            self.link_root(a.raw(), Id::new(to_a, root.raw()));
+            self.link_root(b.raw(), Id::new(to_b, root.raw()));
         }
         true
     }
@@ -747,7 +711,7 @@ impl EGraph {
         self.find(a) == self.find(b)
     }
 
-    fn congruence_proof(&mut self, left: RawId, right: RawId) -> Option<ProofId> {
+    fn congruence_reason(&mut self, left: RawId, right: RawId) -> Option<EGraphUnionReason> {
         let (left_definition, right_definition) = {
             let proofs = self.proofs.as_ref()?;
             (proofs.definition(left), proofs.definition(right))
@@ -756,12 +720,12 @@ impl EGraph {
             (Some(EGraphProofTerm::Atom(left_name)), Some(EGraphProofTerm::Atom(right_name)))
                 if left_name == right_name =>
             {
-                Some(
+                Some(EGraphUnionReason::Direct(
                     self.proofs
                         .as_mut()
                         .expect("checked above")
                         .refl_between(left, right),
-                )
+                ))
             }
             (
                 Some(EGraphProofTerm::App(left_function, left_argument)),
@@ -782,10 +746,12 @@ impl EGraph {
                         .unsupported("memo collision does not have congruent children");
                     return None;
                 }
-                let proofs = self.proofs.as_mut().expect("checked above");
-                let function = proofs.proof_between(left_function, right_function);
-                let argument = proofs.proof_between(left_argument, right_argument);
-                Some(proofs.congr_app(left, right, function, argument))
+                Some(EGraphUnionReason::Congruence {
+                    left_function,
+                    right_function,
+                    left_argument,
+                    right_argument,
+                })
             }
             _ => {
                 self.proofs
@@ -1353,12 +1319,12 @@ impl EGraph {
         }
         let proofs = self.proofs.as_mut()?;
         let rewrite = proofs.rewrite(left_term, right_term, name, arguments);
-        let target_path = proofs.parent_proof(target.raw());
+        let target_path = proofs.proof_between(target.raw(), left.raw());
         let left_back = proofs.symm(left_normalization);
         let proof = proofs.trans(target_path, left_back);
         let proof = proofs.trans(proof, rewrite);
         let proof = proofs.trans(proof, right_normalization);
-        let replacement_path = proofs.parent_proof(replacement.raw());
+        let replacement_path = proofs.proof_between(replacement.raw(), right.raw());
         let replacement_back = proofs.symm(replacement_path);
         Some(proofs.trans(proof, replacement_back))
     }
@@ -1440,7 +1406,7 @@ impl EGraph {
                 }
                 let (base, reason) = if let Some(&existing) = self.memo.get(&canonical) {
                     let base = Id::new(Lift::identity(lift.dom()), existing);
-                    let reason = self.congruence_proof(old.raw(), existing);
+                    let reason = self.congruence_reason(old.raw(), existing);
                     (base, reason)
                 } else if lift == Lift::identity(raw_scope) {
                     self.memo.insert(canonical, raw);
@@ -1450,7 +1416,7 @@ impl EGraph {
                     self.memo.insert(canonical, fresh.raw());
                     (fresh, None)
                 };
-                changed |= self.union_with_proof(&old, &base.weaken(&lift), reason);
+                changed |= self.union_with_reason(&old, &base.weaken(&lift), reason);
             }
             any_changed |= changed;
             if !changed {
@@ -1502,7 +1468,11 @@ impl EGraph {
                             else {
                                 continue;
                             };
-                            self.union_with_proof(&target, &replacement, Some(proof))
+                            self.union_with_reason(
+                                &target,
+                                &replacement,
+                                Some(EGraphUnionReason::Direct(proof)),
+                            )
                         } else {
                             self.union(&target, &replacement)
                         };

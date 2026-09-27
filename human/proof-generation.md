@@ -38,11 +38,19 @@ easy to inspect.
 The context-zero fragment is now integrated into `EGraph`: atoms and binary applications, without
 variables, binders, or non-identity lifts. `EGraph::new_with_proofs` allocates parallel proof state;
 ordinary `EGraph::new` pays no proof-arena cost. Each raw e-class retains its immutable defining
-node. Rebuild justifies application memo collisions with Lean's application congruence combinators,
-and unions carry those proofs through parent links and path compression. `EGraph::lean_proof` traverses the proof
-backwards and prints only live term and proof bindings, preserving their arena IDs rather than
-densely renumbering them. `examples/proof_egraph.rs` demonstrates `a = b` producing `f a = f b` and
-the test suite asks Lean to check the result.
+node. The e-graph uses the same separation as the standalone union-find: operational parent links
+are compressed freely, while a size-balanced proof forest retains one reason for each successful
+union. `EGraph::lean_proof` selects the unique forest path and prints only live term and proof
+bindings, preserving their arena IDs rather than densely renumbering them.
+
+Application memo collisions are lazy proof-forest reasons. They retain the corresponding function
+and argument pairs rather than constructing their proofs. Those pairs were already connected before
+the congruence edge was inserted; because every later successful union only connects two trees,
+their unique paths can never acquire that edge. Recursive explanation is therefore acyclic without
+capturing eager child proofs. A congruence proof and its child proofs enter the term arena only if
+final path selection reaches that reason. `examples/proof_egraph.rs` demonstrates `a = b` producing
+`f a = f b`, and the test suite checks both the delayed allocation and the resulting certificate
+with Lean.
 
 Application congruence uses the direct core Lean combinator for each shape: `congrArg` when only the
 argument changes, `congrFun` when only the function changes, and `congr` when both
@@ -149,7 +157,29 @@ slowed AC3 and expanding AC4 did not finish within 30 seconds. The next scaling 
 smaller explanation after saturation, or invoke a larger proved normalization rule, rather than
 eliding the memo tables.
 
-A paired AC4 measurement of this definitional-reduction fast path reduced the checked certificate
+A paired AC4 measurement of the definitional-reduction fast path reduced the checked certificate
 from 47,864 bytes and 1,279 lines to 43,106 bytes and 1,159 lines. Thirteen of the 48 live rewrite
-applications used the direct form. Across nine alternating runs, Lean checking averaged 0.858 seconds
-before and 0.772 seconds after; peak memory fell from roughly 575 MB to 557 MB.
+applications used the direct form.
+
+The proof forest and lazy congruence reasons then reduce the same AC4 and AC5 certificates as
+follows. Lean times and memory are means of five fresh processes; they include process startup.
+
+| Example | Metric | Eager parent proofs | Proof forest |
+| --- | --- | ---: | ---: |
+| AC4 | bytes | 43,106 | 11,823 |
+|  | lines | 1,159 | 345 |
+|  | live proof bindings | 851 | 225 |
+|  | live rewrite applications | 48 | 16 |
+|  | Lean time | 0.858 s | 0.382 s |
+|  | peak memory | 546 MB | 480 MB |
+| AC5 | bytes | 244,277 | 17,771 |
+|  | lines | 6,011 | 510 |
+|  | live proof bindings | 4,566 | 334 |
+|  | live rewrite applications | 239 | 22 |
+|  | Lean time | 6.262 s | 0.464 s |
+|  | peak memory | 1,800 MB | 493 MB |
+
+The post-saturation arena also shrinks, from 1,236 to 972 nodes for AC4 and from 6,452 to 4,872 for
+AC5. This is a smaller reduction than the live certificate because non-definitional named rewrites
+still build their normalization proofs eagerly. The generated certificates are kept in
+`proofs/AC4.lean` and `proofs/AC5.lean`.

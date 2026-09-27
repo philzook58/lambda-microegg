@@ -16,6 +16,8 @@ pub struct EGraphProofStats {
     pub rewrites: usize,
     pub assumptions: usize,
     pub expression_terms: usize,
+    pub explanation_edges: usize,
+    pub explanation_reasons: usize,
 }
 
 type Id = u32;
@@ -280,6 +282,57 @@ enum EGraphTermNode {
     App(EGraphTermId, EGraphTermId),
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct EGraphReasonId(u32);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct EGraphReasonUse {
+    reason: EGraphReasonId,
+    reversed: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct EGraphExplanationPath {
+    left: RawId,
+    right: RawId,
+    reasons: Vec<EGraphReasonUse>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum EGraphReasonKind {
+    Direct(ProofId),
+    Congruence {
+        left_function: RawId,
+        right_function: RawId,
+        left_argument: RawId,
+        right_argument: RawId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct EGraphReasonNode {
+    left: RawId,
+    right: RawId,
+    kind: EGraphReasonKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EGraphExplainEdge {
+    reason: EGraphReasonId,
+    reversed: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum EGraphUnionReason {
+    Direct(ProofId),
+    Congruence {
+        left_function: RawId,
+        right_function: RawId,
+        left_argument: RawId,
+        right_argument: RawId,
+    },
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EGraphProofState {
     arena: Vec<EGraphProofNode>,
@@ -288,7 +341,11 @@ pub(crate) struct EGraphProofState {
     term_memo: HashMap<EGraphTermNode, EGraphTermId>,
     raw_terms: Vec<EGraphTermId>,
     definitions: Vec<Option<EGraphProofTerm>>,
-    parent_proofs: Vec<ProofId>,
+    explain_parents: Vec<RawId>,
+    explain_edges: Vec<Option<EGraphExplainEdge>>,
+    explain_sizes: Vec<usize>,
+    reasons: Vec<EGraphReasonNode>,
+    materialized_reasons: Vec<Option<ProofId>>,
     assumptions: usize,
     unsupported: Option<String>,
 }
@@ -302,6 +359,8 @@ impl EGraphProofState {
         let mut stats = EGraphProofStats {
             steps: self.arena.len(),
             expression_terms: self.terms.len(),
+            explanation_edges: self.explain_edges.iter().flatten().count(),
+            explanation_reasons: self.reasons.len(),
             ..EGraphProofStats::default()
         };
         for node in &self.arena {
@@ -336,8 +395,9 @@ impl EGraphProofState {
         self.definitions.push(None);
         let term = self.alloc_term(EGraphTermNode::Raw(raw));
         self.raw_terms.push(term);
-        let proof = self.alloc(term, term, EGraphProofKind::Refl);
-        self.parent_proofs.push(proof);
+        self.explain_parents.push(raw);
+        self.explain_edges.push(None);
+        self.explain_sizes.push(1);
         if context != 0 {
             self.unsupported(format!("e{raw} was allocated in context {context}"));
         }
@@ -380,15 +440,6 @@ impl EGraphProofState {
 
     pub(crate) fn definition(&self, raw: RawId) -> Option<EGraphProofTerm> {
         self.definitions[raw as usize].clone()
-    }
-
-    pub(crate) fn parent_proof(&self, raw: RawId) -> ProofId {
-        self.parent_proofs[raw as usize]
-    }
-
-    pub(crate) fn set_parent_proof(&mut self, child: RawId, proof: ProofId) {
-        debug_assert_eq!(self.arena[proof.0 as usize].left, self.raw_term(child));
-        self.parent_proofs[child as usize] = proof;
     }
 
     pub(crate) fn refl_between(&mut self, left: RawId, right: RawId) -> ProofId {
@@ -529,11 +580,215 @@ impl EGraphProofState {
         Some(self.trans(unfold, normalize))
     }
 
+    fn explanation_root(&self, mut raw: RawId) -> RawId {
+        loop {
+            let parent = self.explain_parents[raw as usize];
+            if parent == raw {
+                return raw;
+            }
+            raw = parent;
+        }
+    }
+
+    fn reroot_explanation(&mut self, raw: RawId) {
+        let old_root = self.explanation_root(raw);
+        let size = self.explain_sizes[old_root as usize];
+        let mut current = raw;
+        let mut parent = self.explain_parents[current as usize];
+        let mut edge = self.explain_edges[current as usize].take();
+        self.explain_parents[current as usize] = current;
+
+        while parent != current {
+            let next_parent = self.explain_parents[parent as usize];
+            let next_edge = self.explain_edges[parent as usize].take();
+            let current_edge = edge.expect("a non-root explanation node has an edge");
+            self.explain_parents[parent as usize] = current;
+            self.explain_edges[parent as usize] = Some(EGraphExplainEdge {
+                reason: current_edge.reason,
+                reversed: !current_edge.reversed,
+            });
+            current = parent;
+            parent = next_parent;
+            edge = next_edge;
+        }
+
+        if old_root != raw {
+            self.explain_sizes[old_root as usize] = 0;
+            self.explain_sizes[raw as usize] = size;
+        }
+    }
+
+    fn explanation_path(&self, left: RawId, right: RawId) -> EGraphExplanationPath {
+        if left == right {
+            return EGraphExplanationPath {
+                left,
+                right,
+                reasons: Vec::new(),
+            };
+        }
+        let mut left_depths = vec![None; self.explain_parents.len()];
+        let mut left_edges = Vec::new();
+        let mut current = left;
+        loop {
+            left_depths[current as usize] = Some(left_edges.len());
+            let parent = self.explain_parents[current as usize];
+            if parent == current {
+                break;
+            }
+            left_edges.push(
+                self.explain_edges[current as usize]
+                    .expect("a non-root explanation node has an edge"),
+            );
+            current = parent;
+        }
+
+        let mut right_edges = Vec::new();
+        current = right;
+        let common_depth = loop {
+            if let Some(depth) = left_depths[current as usize] {
+                break depth;
+            }
+            let parent = self.explain_parents[current as usize];
+            assert_ne!(
+                parent, current,
+                "equivalent e-classes must share an explanation root"
+            );
+            right_edges.push(
+                self.explain_edges[current as usize]
+                    .expect("a non-root explanation node has an edge"),
+            );
+            current = parent;
+        };
+        left_edges.truncate(common_depth);
+        let mut reasons = left_edges
+            .into_iter()
+            .map(|edge| EGraphReasonUse {
+                reason: edge.reason,
+                reversed: edge.reversed,
+            })
+            .collect::<Vec<_>>();
+        reasons.extend(right_edges.into_iter().rev().map(|edge| EGraphReasonUse {
+            reason: edge.reason,
+            reversed: !edge.reversed,
+        }));
+        EGraphExplanationPath {
+            left,
+            right,
+            reasons,
+        }
+    }
+
+    fn alloc_reason(&mut self, node: EGraphReasonNode) -> EGraphReasonId {
+        assert!(
+            self.reasons.len() <= u32::MAX as usize,
+            "exhausted reason IDs"
+        );
+        let reason = EGraphReasonId(self.reasons.len() as u32);
+        self.reasons.push(node);
+        self.materialized_reasons.push(None);
+        reason
+    }
+
+    pub(crate) fn link_explanation(
+        &mut self,
+        left: RawId,
+        right: RawId,
+        reason: EGraphUnionReason,
+    ) {
+        let left_root = self.explanation_root(left);
+        let right_root = self.explanation_root(right);
+        assert_ne!(
+            left_root, right_root,
+            "a proof edge must join two components"
+        );
+        let kind = match reason {
+            EGraphUnionReason::Direct(proof) => {
+                debug_assert_eq!(self.arena[proof.0 as usize].left, self.raw_term(left));
+                debug_assert_eq!(self.arena[proof.0 as usize].right, self.raw_term(right));
+                EGraphReasonKind::Direct(proof)
+            }
+            EGraphUnionReason::Congruence {
+                left_function,
+                right_function,
+                left_argument,
+                right_argument,
+            } => EGraphReasonKind::Congruence {
+                left_function,
+                right_function,
+                left_argument,
+                right_argument,
+            },
+        };
+        let reason = self.alloc_reason(EGraphReasonNode { left, right, kind });
+
+        if self.explain_sizes[left_root as usize] <= self.explain_sizes[right_root as usize] {
+            self.reroot_explanation(left);
+            let right_root = self.explanation_root(right);
+            let left_size = self.explain_sizes[left as usize];
+            self.explain_parents[left as usize] = right;
+            self.explain_edges[left as usize] = Some(EGraphExplainEdge {
+                reason,
+                reversed: false,
+            });
+            self.explain_sizes[left as usize] = 0;
+            self.explain_sizes[right_root as usize] += left_size;
+        } else {
+            self.reroot_explanation(right);
+            let left_root = self.explanation_root(left);
+            let right_size = self.explain_sizes[right as usize];
+            self.explain_parents[right as usize] = left;
+            self.explain_edges[right as usize] = Some(EGraphExplainEdge {
+                reason,
+                reversed: true,
+            });
+            self.explain_sizes[right as usize] = 0;
+            self.explain_sizes[left_root as usize] += right_size;
+        }
+    }
+
+    fn materialize_reason(&mut self, reason: EGraphReasonId) -> ProofId {
+        if let Some(proof) = self.materialized_reasons[reason.0 as usize] {
+            return proof;
+        }
+        let node = self.reasons[reason.0 as usize].clone();
+        let proof = match node.kind {
+            EGraphReasonKind::Direct(proof) => proof,
+            EGraphReasonKind::Congruence {
+                left_function,
+                right_function,
+                left_argument,
+                right_argument,
+            } => {
+                // These pairs were already equivalent before this reason's forest edge was
+                // inserted. Later successful unions only attach other trees, so their unique
+                // paths cannot acquire this edge and recursive explanation remains acyclic.
+                let function = self.proof_between(left_function, right_function);
+                let argument = self.proof_between(left_argument, right_argument);
+                self.congr_app(node.left, node.right, function, argument)
+            }
+        };
+        self.materialized_reasons[reason.0 as usize] = Some(proof);
+        proof
+    }
+
+    fn materialize_path(&mut self, path: EGraphExplanationPath) -> ProofId {
+        let mut proof = None;
+        for reason_use in path.reasons {
+            let mut step = self.materialize_reason(reason_use.reason);
+            if reason_use.reversed {
+                step = self.symm(step);
+            }
+            proof = Some(match proof {
+                Some(prefix) => self.trans(prefix, step),
+                None => step,
+            });
+        }
+        proof.unwrap_or_else(|| self.refl_between(path.left, path.right))
+    }
+
     pub(crate) fn proof_between(&mut self, left: RawId, right: RawId) -> ProofId {
-        let left = self.parent_proof(left);
-        let right = self.parent_proof(right);
-        let right = self.symm(right);
-        self.trans(left, right)
+        let path = self.explanation_path(left, right);
+        self.materialize_path(path)
     }
 
     fn live_from(&self, conclusion: ProofId) -> Vec<bool> {
@@ -1112,6 +1367,10 @@ mod tests {
         let d = egraph.atom("d", 0);
         egraph.union_assuming(&a, &b, "input equality a = b");
         egraph.union_assuming(&c, &d, "irrelevant equality c = d");
+        egraph.rebuild();
+        let delayed = egraph.proof_stats().unwrap();
+        assert_eq!(delayed.congruence, 0);
+        assert_eq!(delayed.explanation_reasons, 3);
 
         let certificate = egraph
             .lean_proof(
@@ -1122,9 +1381,10 @@ mod tests {
             )
             .unwrap();
         assert!(certificate.contains("congrArg e0"));
+        assert!(egraph.proof_stats().unwrap().congruence > 0);
         assert!(!certificate.contains("irrelevant equality"));
         assert!(!certificate.contains("let e5"));
-        assert!(!certificate.contains("let p0"));
+        assert_eq!(certificate.matches("input equality a = b").count(), 1);
 
         let Ok(mut lean) = Command::new("lean")
             .arg("--stdin")
