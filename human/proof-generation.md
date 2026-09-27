@@ -183,3 +183,26 @@ The post-saturation arena also shrinks, from 1,236 to 972 nodes for AC4 and from
 AC5. This is a smaller reduction than the live certificate because non-definitional named rewrites
 still build their normalization proofs eagerly. The generated certificates are kept in
 `proofs/AC4.lean` and `proofs/AC5.lean`.
+
+## Proof-recording overhead
+
+`examples/acn_saturation.rs` runs the same named AC saturation with proof recording off and on,
+without constructing or checking a certificate. Release-build measurements from AC5 through AC8
+are means of three fresh processes; AC9 is one run because the proof arena had reached 1,032,246
+nodes and the scaling trend was already clear.
+
+| Size | Off time | On time | Time ratio | Off peak RSS | On peak RSS | Memory ratio |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| AC5 | 1.39 ms | 2.98 ms | 2.14× | 2.6 MiB | 3.7 MiB | 1.43× |
+| AC6 | 4.92 ms | 12.02 ms | 2.44× | 2.9 MiB | 7.2 MiB | 2.43× |
+| AC7 | 18.52 ms | 79.45 ms | 4.29× | 3.6 MiB | 21.2 MiB | 5.85× |
+| AC8 | 79.81 ms | 500.00 ms | 6.26× | 6.9 MiB | 76.2 MiB | 11.03× |
+| AC9 | 323.29 ms | 5,982.28 ms | 18.50× | 19.9 MiB | 308.6 MiB | 15.51× |
+
+AC9 spends 5,943 ms of its 6,200 ms proof-enabled saturation in the apply phase, compared with
+173 ms of 329 ms without proofs. Proof mode constructs 50,761 named rewrite nodes and reaches
+148,387 raw IDs, versus 84,634 raw IDs without proofs, even though both runs finish with exactly
+1,022 classes and 19,180 e-nodes. The main remaining recording cost is therefore eager construction
+of named-rewrite normalization proofs and the transient terms that normalization inserts. The
+proof-forest bookkeeping itself is not the dominant cost. AC10 was not run: extrapolating from the
+AC8-to-AC9 jump put it at material risk of exceeding a minute or a gigabyte.
