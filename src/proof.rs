@@ -1,5 +1,7 @@
 use rustc_hash::FxHashMap as HashMap;
 
+use crate::RawId;
+
 /// An index into the proof-expression arena.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ProofId(u32);
@@ -118,6 +120,7 @@ pub enum ProofError {
     TrackingDisabled,
     UnknownName(String),
     NotEquivalent { left: String, right: String },
+    Unsupported(String),
 }
 
 impl std::fmt::Display for ProofError {
@@ -128,7 +131,309 @@ impl std::fmt::Display for ProofError {
             Self::NotEquivalent { left, right } => {
                 write!(formatter, "{left:?} and {right:?} are not equivalent")
             }
+            Self::Unsupported(message) => {
+                write!(formatter, "unsupported proof operation: {message}")
+            }
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum EGraphProofTerm {
+    Atom(String),
+    App(RawId, RawId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EGraphProofKind {
+    Refl,
+    Symm(ProofId),
+    Trans(ProofId, ProofId),
+    CongApp(ProofId, ProofId),
+    CongFunction { argument: RawId, proof: ProofId },
+    CongArgument { function: RawId, proof: ProofId },
+    Assumption { index: usize, label: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EGraphProofNode {
+    left: RawId,
+    right: RawId,
+    kind: EGraphProofKind,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct EGraphProofState {
+    arena: Vec<EGraphProofNode>,
+    definitions: Vec<Option<EGraphProofTerm>>,
+    parent_proofs: Vec<ProofId>,
+    assumptions: usize,
+    unsupported: Option<String>,
+}
+
+impl EGraphProofState {
+    fn alloc(&mut self, left: RawId, right: RawId, kind: EGraphProofKind) -> ProofId {
+        assert!(self.arena.len() <= u32::MAX as usize, "exhausted proof IDs");
+        let proof = ProofId(self.arena.len() as u32);
+        self.arena.push(EGraphProofNode { left, right, kind });
+        proof
+    }
+
+    pub(crate) fn make_set(&mut self, raw: RawId, context: usize) {
+        assert_eq!(self.definitions.len(), raw as usize);
+        self.definitions.push(None);
+        let proof = self.alloc(raw, raw, EGraphProofKind::Refl);
+        self.parent_proofs.push(proof);
+        if context != 0 {
+            self.unsupported(format!("e{raw} was allocated in context {context}"));
+        }
+    }
+
+    pub(crate) fn define(&mut self, raw: RawId, definition: EGraphProofTerm) {
+        let slot = &mut self.definitions[raw as usize];
+        if slot.is_none() {
+            *slot = Some(definition);
+        }
+    }
+
+    pub(crate) fn unsupported(&mut self, message: impl Into<String>) {
+        if self.unsupported.is_none() {
+            self.unsupported = Some(message.into());
+        }
+    }
+
+    pub(crate) fn definition(&self, raw: RawId) -> Option<EGraphProofTerm> {
+        self.definitions[raw as usize].clone()
+    }
+
+    pub(crate) fn parent_proof(&self, raw: RawId) -> ProofId {
+        self.parent_proofs[raw as usize]
+    }
+
+    pub(crate) fn set_parent_proof(&mut self, child: RawId, proof: ProofId) {
+        debug_assert_eq!(self.arena[proof.0 as usize].left, child);
+        self.parent_proofs[child as usize] = proof;
+    }
+
+    pub(crate) fn refl_between(&mut self, left: RawId, right: RawId) -> ProofId {
+        self.alloc(left, right, EGraphProofKind::Refl)
+    }
+
+    pub(crate) fn assumption(&mut self, left: RawId, right: RawId, label: String) -> ProofId {
+        let index = self.assumptions;
+        self.assumptions += 1;
+        self.alloc(left, right, EGraphProofKind::Assumption { index, label })
+    }
+
+    pub(crate) fn symm(&mut self, proof: ProofId) -> ProofId {
+        let node = &self.arena[proof.0 as usize];
+        if node.left == node.right && matches!(node.kind, EGraphProofKind::Refl) {
+            return proof;
+        }
+        self.alloc(node.right, node.left, EGraphProofKind::Symm(proof))
+    }
+
+    pub(crate) fn trans(&mut self, left: ProofId, right: ProofId) -> ProofId {
+        let left_node = &self.arena[left.0 as usize];
+        let right_node = &self.arena[right.0 as usize];
+        assert_eq!(
+            left_node.right, right_node.left,
+            "ill-typed e-graph transitivity"
+        );
+        if left_node.left == left_node.right && matches!(left_node.kind, EGraphProofKind::Refl) {
+            return right;
+        }
+        if right_node.left == right_node.right && matches!(right_node.kind, EGraphProofKind::Refl) {
+            return left;
+        }
+        self.alloc(
+            left_node.left,
+            right_node.right,
+            EGraphProofKind::Trans(left, right),
+        )
+    }
+
+    pub(crate) fn congr_app(
+        &mut self,
+        left: RawId,
+        right: RawId,
+        function: ProofId,
+        argument: ProofId,
+    ) -> ProofId {
+        let function_node = &self.arena[function.0 as usize];
+        let argument_node = &self.arena[argument.0 as usize];
+        let function_is_refl = function_node.left == function_node.right
+            && matches!(function_node.kind, EGraphProofKind::Refl);
+        let argument_is_refl = argument_node.left == argument_node.right
+            && matches!(argument_node.kind, EGraphProofKind::Refl);
+        if function_is_refl && argument_is_refl {
+            return self.refl_between(left, right);
+        }
+        if function_is_refl {
+            return self.alloc(
+                left,
+                right,
+                EGraphProofKind::CongArgument {
+                    function: function_node.left,
+                    proof: argument,
+                },
+            );
+        }
+        if argument_is_refl {
+            return self.alloc(
+                left,
+                right,
+                EGraphProofKind::CongFunction {
+                    argument: argument_node.left,
+                    proof: function,
+                },
+            );
+        }
+        self.alloc(left, right, EGraphProofKind::CongApp(function, argument))
+    }
+
+    pub(crate) fn proof_between(&mut self, left: RawId, right: RawId) -> ProofId {
+        let left = self.parent_proof(left);
+        let right = self.parent_proof(right);
+        let right = self.symm(right);
+        self.trans(left, right)
+    }
+
+    fn live_from(&self, conclusion: ProofId) -> Vec<bool> {
+        let mut live = vec![false; self.arena.len()];
+        let mut work = vec![conclusion];
+        while let Some(proof) = work.pop() {
+            let index = proof.0 as usize;
+            if std::mem::replace(&mut live[index], true) {
+                continue;
+            }
+            match self.arena[index].kind {
+                EGraphProofKind::Refl | EGraphProofKind::Assumption { .. } => {}
+                EGraphProofKind::Symm(child) => work.push(child),
+                EGraphProofKind::CongFunction { proof, .. }
+                | EGraphProofKind::CongArgument { proof, .. } => work.push(proof),
+                EGraphProofKind::Trans(left, right) | EGraphProofKind::CongApp(left, right) => {
+                    work.push(left);
+                    work.push(right);
+                }
+            }
+        }
+        live
+    }
+
+    fn source_term(&self, raw: RawId) -> Result<String, ProofError> {
+        match self.definitions[raw as usize].as_ref() {
+            Some(EGraphProofTerm::Atom(name)) => Ok(name.clone()),
+            Some(EGraphProofTerm::App(function, argument)) => Ok(format!(
+                "app ({}) ({})",
+                self.source_term(*function)?,
+                self.source_term(*argument)?
+            )),
+            None => Err(ProofError::Unsupported(format!(
+                "e{raw} has no first-order definition"
+            ))),
+        }
+    }
+
+    fn mark_term(&self, raw: RawId, live: &mut [bool]) -> Result<(), ProofError> {
+        if std::mem::replace(&mut live[raw as usize], true) {
+            return Ok(());
+        }
+        match self.definitions[raw as usize].as_ref() {
+            Some(EGraphProofTerm::Atom(_)) => Ok(()),
+            Some(EGraphProofTerm::App(function, argument)) => {
+                self.mark_term(*function, live)?;
+                self.mark_term(*argument, live)
+            }
+            None => Err(ProofError::Unsupported(format!(
+                "e{raw} has no first-order definition"
+            ))),
+        }
+    }
+
+    pub(crate) fn render(
+        &self,
+        theorem_name: &str,
+        binders: &str,
+        left: RawId,
+        right: RawId,
+        conclusion: ProofId,
+    ) -> Result<String, ProofError> {
+        if let Some(message) = &self.unsupported {
+            return Err(ProofError::Unsupported(message.clone()));
+        }
+        let live = self.live_from(conclusion);
+        let mut output = format!("theorem {theorem_name} {binders}");
+        for (is_live, node) in live.iter().zip(&self.arena) {
+            if *is_live && let EGraphProofKind::Assumption { index, .. } = node.kind {
+                output.push_str(&format!(
+                    " (h{index} : {} = {})",
+                    self.source_term(node.left)?,
+                    self.source_term(node.right)?
+                ));
+            }
+        }
+        output.push_str(&format!(
+            " : {} = {} := by\n",
+            self.source_term(left)?,
+            self.source_term(right)?
+        ));
+
+        let mut live_terms = vec![false; self.definitions.len()];
+        self.mark_term(left, &mut live_terms)?;
+        self.mark_term(right, &mut live_terms)?;
+        for (is_live, node) in live.iter().zip(&self.arena) {
+            if *is_live {
+                self.mark_term(node.left, &mut live_terms)?;
+                self.mark_term(node.right, &mut live_terms)?;
+            }
+        }
+        for (raw, is_live) in live_terms.into_iter().enumerate() {
+            if !is_live {
+                continue;
+            }
+            let expression = match self.definitions[raw].as_ref().expect("marked above") {
+                EGraphProofTerm::Atom(name) => name.clone(),
+                EGraphProofTerm::App(function, argument) => {
+                    format!("app e{function} e{argument}")
+                }
+            };
+            output.push_str(&format!("  let e{raw} := {expression}\n"));
+        }
+        for (index, node) in self.arena.iter().enumerate() {
+            if !live[index] {
+                continue;
+            }
+            let expression = match node.kind {
+                EGraphProofKind::Refl => "rfl".to_owned(),
+                EGraphProofKind::Symm(proof) => format!("Eq.symm p{}", proof.0),
+                EGraphProofKind::Trans(first, second) => {
+                    format!("Eq.trans p{} p{}", first.0, second.0)
+                }
+                EGraphProofKind::CongApp(function, argument) => {
+                    format!("congrArg₂ app p{} p{}", function.0, argument.0)
+                }
+                EGraphProofKind::CongFunction { argument, proof } => {
+                    format!(
+                        "congrArg (fun function => app function e{argument}) p{}",
+                        proof.0
+                    )
+                }
+                EGraphProofKind::CongArgument { function, proof } => {
+                    format!("congrArg (app e{function}) p{}", proof.0)
+                }
+                EGraphProofKind::Assumption { index, ref label } => {
+                    output.push_str(&format!("  -- {label}\n"));
+                    format!("h{index}")
+                }
+            };
+            output.push_str(&format!(
+                "  let p{index} : e{} = e{} := {expression}\n",
+                node.left, node.right
+            ));
+        }
+        output.push_str(&format!("  exact p{}\n", conclusion.0));
+        Ok(output)
     }
 }
 
@@ -440,6 +745,55 @@ mod tests {
         assert!(
             output.status.success(),
             "Lean rejected the generated certificate:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn egraph_rebuild_emits_a_lean_checked_congruence_proof() {
+        let mut egraph = crate::EGraph::new_with_proofs();
+        let f = egraph.atom("f", 0);
+        let a = egraph.atom("a", 0);
+        let b = egraph.atom("b", 0);
+        let fa = egraph.app(f, a);
+        let fb = egraph.app(f, b);
+        let c = egraph.atom("c", 0);
+        let d = egraph.atom("d", 0);
+        egraph.union_assuming(&a, &b, "input equality a = b");
+        egraph.union_assuming(&c, &d, "irrelevant equality c = d");
+
+        let certificate = egraph
+            .lean_proof(
+                "first_order_congruence",
+                "{α : Type} (app : α → α → α) (f a b : α)",
+                &fa,
+                &fb,
+            )
+            .unwrap();
+        assert!(certificate.contains("congrArg (app e0)"));
+        assert!(!certificate.contains("irrelevant equality"));
+        assert!(!certificate.contains("let e5"));
+        assert!(!certificate.contains("let p0"));
+
+        let Ok(mut lean) = Command::new("lean")
+            .arg("--stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            return;
+        };
+        lean.stdin
+            .take()
+            .unwrap()
+            .write_all(certificate.as_bytes())
+            .unwrap();
+        let output = lean.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "Lean rejected the generated e-graph certificate:\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );

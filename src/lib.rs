@@ -11,7 +11,6 @@
 
 // See my EGRAPHS 2026 talk for more details.
 
-
 //! During pattern matching, `top_ctx` is the ambient context at the top of the
 //! pattern, and `current_ctx` additionally includes the variables introduced
 //! locally by binders inside the pattern. A pattern variable has to be carried
@@ -30,6 +29,7 @@ use web_time::{Duration, Instant};
 
 mod proof;
 mod terms;
+use proof::{EGraphProofState, EGraphProofTerm};
 pub use proof::{ProofError, ProofId, ProofUnionFind};
 use terms::pattern_occurrence_lift;
 pub use terms::{DeBruijnIndex, DeBruijnLevel, NamedTerm, Pattern, Rewrite, Term, TermCtx};
@@ -411,6 +411,7 @@ enum MatchMode {
 pub struct EGraph {
     parent: Vec<Id>,
     memo: IndexMap<Node, RawId, rustc_hash::FxBuildHasher>,
+    proofs: Option<EGraphProofState>,
     rev: IndexMap<RawId, Vec<(Node, Lift)>, rustc_hash::FxBuildHasher>,
     // Possible next performance experiments, deliberately not implemented:
     // cache canonical targets and root-operator buckets while rebuilding, or
@@ -427,6 +428,16 @@ impl EGraph {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Construct an e-graph that records Lean proofs for context-zero atoms and applications.
+    pub fn new_with_proofs() -> Self {
+        Self {
+            proofs: Some(EGraphProofState::default()),
+            ..Self::default()
+        }
+    }
+    pub fn proofs_enabled(&self) -> bool {
+        self.proofs.is_some()
+    }
     fn make_set(&mut self, scope: usize) -> Id {
         assert!(
             self.parent.len() <= RawId::MAX as usize,
@@ -436,6 +447,9 @@ impl EGraph {
         let raw = self.parent.len() as RawId;
         let id = Id::new(Lift::identity(scope), raw);
         self.parent.push(id);
+        if let Some(proofs) = &mut self.proofs {
+            proofs.make_set(raw, scope);
+        }
         id
     }
     /// The identity placement of a raw class in its own intrinsic context.
@@ -483,6 +497,16 @@ impl EGraph {
             let next = self.parent[edge.raw() as usize];
             debug_assert_eq!(next.raw(), root_raw);
             debug_assert_eq!(next.ctx(), edge.lift().dom());
+            if let Some(proofs) = &mut self.proofs {
+                if edge.ctx() != 0 || !edge.lift().is_identity() || !next.lift().is_identity() {
+                    proofs.unsupported("path compression through a nonidentity lift");
+                } else {
+                    let prefix = proofs.parent_proof(raw);
+                    let suffix = proofs.parent_proof(edge.raw());
+                    let proof = proofs.trans(prefix, suffix);
+                    proofs.set_parent_proof(raw, proof);
+                }
+            }
             self.parent[raw as usize] = Id::new(edge.lift().compose(&next.lift()), root_raw);
         }
         let root = self.parent[id.raw() as usize];
@@ -494,6 +518,31 @@ impl EGraph {
             return self.find_mut(&Id::new(Lift::identity(scope), raw));
         }
         let id = self.make_set(scope);
+        if let Some(proofs) = &mut self.proofs {
+            let definition = match &node {
+                Node::Atom(name) if scope == 0 => {
+                    Some(EGraphProofTerm::Atom(name.as_str().to_owned()))
+                }
+                Node::App(function, argument)
+                    if scope == 0
+                        && function.ctx() == 0
+                        && argument.ctx() == 0
+                        && function.lift().is_identity()
+                        && argument.lift().is_identity() =>
+                {
+                    Some(EGraphProofTerm::App(function.raw(), argument.raw()))
+                }
+                _ => None,
+            };
+            if let Some(definition) = definition {
+                proofs.define(id.raw(), definition);
+            } else {
+                proofs.unsupported(format!(
+                    "e{} is not a context-zero atom or application",
+                    id.raw()
+                ));
+            }
+        }
         if self.rev_tracked {
             self.rev
                 .entry(id.raw())
@@ -504,6 +553,9 @@ impl EGraph {
         id
     }
     pub fn var(&mut self, ctx: usize, index: usize) -> Id {
+        if let Some(proofs) = &mut self.proofs {
+            proofs.unsupported("variables are not supported by first-order proof mode");
+        }
         let base = self.intern(1, Node::Var);
         base.weaken(&Lift::select(ctx, index))
     }
@@ -511,6 +563,11 @@ impl EGraph {
         self.atom_symbol(name.into(), ctx)
     }
     fn atom_symbol(&mut self, name: Symbol, ctx: usize) -> Id {
+        if ctx != 0
+            && let Some(proofs) = &mut self.proofs
+        {
+            proofs.unsupported("lifted atoms are not supported by first-order proof mode");
+        }
         let base = self.intern(0, Node::Atom(name));
         base.weaken(&Lift::unused(ctx))
     }
@@ -526,6 +583,11 @@ impl EGraph {
     }
     pub fn app(&mut self, function: Id, argument: Id) -> Id {
         assert_eq!(function.ctx(), argument.ctx());
+        if function.ctx() != 0
+            && let Some(proofs) = &mut self.proofs
+        {
+            proofs.unsupported("lifted applications are not supported by first-order proof mode");
+        }
         let (common, node) = self.canonical_node(&Node::App(function, argument));
         let base = self.intern(common.dom(), node);
         base.weaken(&common)
@@ -535,6 +597,9 @@ impl EGraph {
         self.binder_symbol(op.into(), body)
     }
     fn binder_symbol(&mut self, op: Symbol, body: Id) -> Id {
+        if let Some(proofs) = &mut self.proofs {
+            proofs.unsupported("binders are not supported by first-order proof mode");
+        }
         assert!(body.ctx() > 0);
         let (outer, node) = self.canonical_node(&Node::Binder(op, body));
         let base = self.intern(outer.dom(), node);
@@ -573,10 +638,21 @@ impl EGraph {
     /// Link two union-find roots, updating the reverse e-class index when a
     /// constructive rewrite has requested it. Congruence may still be dirty,
     /// but class-local traversals then remain cheap until the next rebuild.
-    fn link_root(&mut self, child: RawId, parent: Id) {
+    fn link_root(&mut self, child: RawId, parent: Id, proof: Option<ProofId>) {
         debug_assert_eq!(self.parent[child as usize].raw(), child);
         debug_assert_ne!(child, parent.raw());
         debug_assert_eq!(self.parent[child as usize].ctx(), parent.ctx());
+        if let Some(proofs) = &mut self.proofs {
+            if parent.ctx() == 0 && parent.lift().is_identity() {
+                if let Some(proof) = proof {
+                    proofs.set_parent_proof(child, proof);
+                } else {
+                    proofs.unsupported("union-find link has no proof reason");
+                }
+            } else {
+                proofs.unsupported("union-find link uses a nonidentity lift");
+            }
+        }
         self.parent[child as usize] = parent;
         if self.rev_tracked
             && let Some(nodes) = self.rev.swap_remove(&child)
@@ -589,12 +665,45 @@ impl EGraph {
         }
     }
     pub fn union(&mut self, a: &Id, b: &Id) -> bool {
+        self.union_assuming(a, b, "input equality")
+    }
+    pub fn union_assuming(&mut self, a: &Id, b: &Id, label: impl Into<String>) -> bool {
+        let reason = self
+            .proofs
+            .as_mut()
+            .map(|proofs| proofs.assumption(a.raw(), b.raw(), label.into()));
+        self.union_with_proof(a, b, reason)
+    }
+    fn union_with_proof(&mut self, a: &Id, b: &Id, reason: Option<ProofId>) -> bool {
         assert_eq!(a.ctx(), b.ctx(), "equality needs a shared context");
+        let input_a = *a;
+        let input_b = *b;
         let a = self.find_mut(a);
         let b = self.find_mut(b);
         if a == b {
             return false;
         }
+        let root_proof = if let Some(proofs) = &mut self.proofs {
+            if input_a.ctx() != 0
+                || input_b.ctx() != 0
+                || !input_a.lift().is_identity()
+                || !input_b.lift().is_identity()
+            {
+                proofs.unsupported("union uses a nonidentity placement");
+                None
+            } else if let Some(reason) = reason {
+                let left_path = proofs.parent_proof(input_a.raw());
+                let right_path = proofs.parent_proof(input_b.raw());
+                let left_path = proofs.symm(left_path);
+                let root_to_right = proofs.trans(left_path, reason);
+                Some(proofs.trans(root_to_right, right_path))
+            } else {
+                proofs.unsupported("union has no equality proof");
+                None
+            }
+        } else {
+            None
+        };
         self.rev_valid = false;
         if a.raw() == b.raw() {
             // Equating two placements of one class restricts that class to
@@ -603,7 +712,7 @@ impl EGraph {
             // value rather than treating x and y themselves as equal.
             let dependency = a.lift().equalizer(&b.lift());
             let root = self.make_set(dependency.dom());
-            self.link_root(a.raw(), Id::new(dependency, root.raw()));
+            self.link_root(a.raw(), Id::new(dependency, root.raw()), None);
             return true;
         }
         let Pullback {
@@ -612,18 +721,108 @@ impl EGraph {
             from_right: to_b,
         } = a.lift().pullback(&b.lift());
         if common == b.lift() {
-            self.link_root(a.raw(), Id::new(to_a, b.raw()));
+            self.link_root(a.raw(), Id::new(to_a, b.raw()), root_proof);
         } else if common == a.lift() {
-            self.link_root(b.raw(), Id::new(to_b, a.raw()));
+            let proof = root_proof.map(|proof| {
+                self.proofs
+                    .as_mut()
+                    .expect("proof exists only when tracking")
+                    .symm(proof)
+            });
+            self.link_root(b.raw(), Id::new(to_b, a.raw()), proof);
         } else {
             let root = self.make_set(common.dom());
-            self.link_root(a.raw(), Id::new(to_a, root.raw()));
-            self.link_root(b.raw(), Id::new(to_b, root.raw()));
+            self.link_root(a.raw(), Id::new(to_a, root.raw()), None);
+            self.link_root(b.raw(), Id::new(to_b, root.raw()), None);
         }
         true
     }
     pub fn equivalent(&self, a: &Id, b: &Id) -> bool {
         self.find(a) == self.find(b)
+    }
+
+    fn congruence_proof(&mut self, left: RawId, right: RawId) -> Option<ProofId> {
+        let (left_definition, right_definition) = {
+            let proofs = self.proofs.as_ref()?;
+            (proofs.definition(left), proofs.definition(right))
+        };
+        match (left_definition, right_definition) {
+            (Some(EGraphProofTerm::Atom(left_name)), Some(EGraphProofTerm::Atom(right_name)))
+                if left_name == right_name =>
+            {
+                Some(
+                    self.proofs
+                        .as_mut()
+                        .expect("checked above")
+                        .refl_between(left, right),
+                )
+            }
+            (
+                Some(EGraphProofTerm::App(left_function, left_argument)),
+                Some(EGraphProofTerm::App(right_function, right_argument)),
+            ) => {
+                let left_function_root = self.find_mut(&Id::new(Lift::identity(0), left_function));
+                let right_function_root =
+                    self.find_mut(&Id::new(Lift::identity(0), right_function));
+                let left_argument_root = self.find_mut(&Id::new(Lift::identity(0), left_argument));
+                let right_argument_root =
+                    self.find_mut(&Id::new(Lift::identity(0), right_argument));
+                if left_function_root != right_function_root
+                    || left_argument_root != right_argument_root
+                {
+                    self.proofs
+                        .as_mut()
+                        .expect("checked above")
+                        .unsupported("memo collision does not have congruent children");
+                    return None;
+                }
+                let proofs = self.proofs.as_mut().expect("checked above");
+                let function = proofs.proof_between(left_function, right_function);
+                let argument = proofs.proof_between(left_argument, right_argument);
+                Some(proofs.congr_app(left, right, function, argument))
+            }
+            _ => {
+                self.proofs
+                    .as_mut()
+                    .expect("checked above")
+                    .unsupported("memo collision is outside first-order congruence");
+                None
+            }
+        }
+    }
+
+    /// Print a Lean certificate for an established context-zero equality.
+    pub fn lean_proof(
+        &mut self,
+        theorem_name: &str,
+        binders: &str,
+        left: &Id,
+        right: &Id,
+    ) -> Result<String, ProofError> {
+        if self.proofs.is_none() {
+            return Err(ProofError::TrackingDisabled);
+        }
+        if left.ctx() != 0
+            || right.ctx() != 0
+            || !left.lift().is_identity()
+            || !right.lift().is_identity()
+        {
+            return Err(ProofError::Unsupported(
+                "certificate endpoints must have context zero".to_owned(),
+            ));
+        }
+        self.rebuild();
+        let left_root = self.find_mut(left);
+        let right_root = self.find_mut(right);
+        if left_root != right_root {
+            return Err(ProofError::NotEquivalent {
+                left: left.show(),
+                right: right.show(),
+            });
+        }
+        let proofs = self.proofs.as_mut().expect("checked above");
+        let conclusion = proofs.proof_between(left.raw(), right.raw());
+        proofs.render(theorem_name, binders, left.raw(), right.raw(), conclusion)
     }
 
     // -----------------------------
@@ -1077,17 +1276,19 @@ impl EGraph {
                 if lift != Lift::identity(raw_scope) || canonical != node {
                     any_changed = true;
                 }
-                let base = if let Some(&existing) = self.memo.get(&canonical) {
-                    self.find_mut(&Id::new(Lift::identity(lift.dom()), existing))
+                let (base, reason) = if let Some(&existing) = self.memo.get(&canonical) {
+                    let base = Id::new(Lift::identity(lift.dom()), existing);
+                    let reason = self.congruence_proof(old.raw(), existing);
+                    (base, reason)
                 } else if lift == Lift::identity(raw_scope) {
                     self.memo.insert(canonical, raw);
-                    old
+                    (old, None)
                 } else {
                     let fresh = self.make_set(lift.dom());
                     self.memo.insert(canonical, fresh.raw());
-                    fresh
+                    (fresh, None)
                 };
-                changed |= self.union(&old, &base.weaken(&lift));
+                changed |= self.union_with_proof(&old, &base.weaken(&lift), reason);
             }
             any_changed |= changed;
             if !changed {

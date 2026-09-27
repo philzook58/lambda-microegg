@@ -15,11 +15,18 @@ No constructor contains rendered Lean text. Rendering happens once, when `lean_p
 and proof `let` bindings. The generated theorem is checked by Lean in the test suite when `lean` is
 available.
 
-The next stage is the context-zero fragment of `EGraph`: atoms and binary applications, without
-variables, binders, or non-identity lifts. Each raw e-class will retain its immutable defining node.
-Rebuild can then justify canonicalizing an application with `congrArg₂`, and a memo collision can
-join two definitions by transitivity. Rewrite applications initially become explicit theorem
-assumptions; instantiating named rewrite theorems can be added after congruence works.
+The context-zero fragment is now integrated into `EGraph`: atoms and binary applications, without
+variables, binders, or non-identity lifts. `EGraph::new_with_proofs` allocates parallel proof state;
+ordinary `EGraph::new` pays no proof-arena cost. Each raw e-class retains its immutable defining
+node. Rebuild justifies application memo collisions with `congrArg` or `congrArg₂`, and unions carry
+those proofs through parent links and path compression. `EGraph::lean_proof` traverses the proof
+backwards and prints only live term and proof bindings, preserving their arena IDs rather than
+densely renumbering them. `examples/proof_egraph.rs` demonstrates `a = b` producing `f a = f b` and
+the test suite asks Lean to check the result.
+
+Rewrite applications currently become explicit theorem assumptions. Instantiating named rewrite
+theorems can be added after congruence; operations involving variables, binders, dependency
+shrinking, or non-identity lifts record a precise unsupported-operation error for final printing.
 
 ## Lifts
 
