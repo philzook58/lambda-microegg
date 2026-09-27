@@ -4,7 +4,6 @@
 // These are all in a conventional de bruijn index/level style, whereas the internals of the lifting egraph use thinnings/liftings.
 // A related but more flexible concept
 
-
 /*
 
  Maybe conceptually speaking I should have a LiftTerm type here too that uses liftings.
@@ -248,19 +247,53 @@ impl Pattern {
 /// binding. The traversal flag is cached for the application phase.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Rewrite {
+    name: Option<String>,
     lhs: Pattern,
     rhs: Pattern,
+    metavariables: Vec<Symbol>,
     pub(crate) rhs_needs_traversal: bool,
 }
 
 impl Rewrite {
     pub fn new(lhs: Pattern, rhs: Pattern) -> Result<Self, String> {
+        Self::build(None, lhs, rhs)
+    }
+    pub fn named(name: impl Into<String>, lhs: Pattern, rhs: Pattern) -> Result<Self, String> {
+        Self::build(Some(name.into()), lhs, rhs)
+    }
+    fn build(name: Option<String>, lhs: Pattern, rhs: Pattern) -> Result<Self, String> {
         let metavariables = lhs.match_metavariables()?;
         rhs.validate_template(&metavariables)?;
         let rhs_needs_traversal = rhs.needs_binding_traversal(0);
+        let mut order = Vec::new();
+        fn collect(pattern: &Pattern, order: &mut Vec<Symbol>) {
+            match pattern {
+                Pattern::MetaVar(name, arguments) => {
+                    if !order.contains(name) {
+                        order.push(*name);
+                    }
+                    for argument in arguments {
+                        collect(argument, order);
+                    }
+                }
+                Pattern::App(f, a) => {
+                    collect(f, order);
+                    collect(a, order);
+                }
+                Pattern::Binder(_, body) => collect(body, order),
+                Pattern::Subst(body, replacement) => {
+                    collect(body, order);
+                    collect(replacement, order);
+                }
+                Pattern::FVar(_) | Pattern::BVar(_) | Pattern::Atom(_) => {}
+            }
+        }
+        collect(&lhs, &mut order);
         Ok(Self {
+            name,
             lhs,
             rhs,
+            metavariables: order,
             rhs_needs_traversal,
         })
     }
@@ -269,6 +302,12 @@ impl Rewrite {
     }
     pub fn rhs(&self) -> &Pattern {
         &self.rhs
+    }
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+    pub(crate) fn metavariables(&self) -> &[Symbol] {
+        &self.metavariables
     }
 }
 

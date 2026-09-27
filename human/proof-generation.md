@@ -28,9 +28,16 @@ Application congruence uses the direct core Lean combinator for each shape: `con
 argument changes, `congrFun (congrArg app ...)` when only the function changes, and
 `congr (congrArg app ...)` when both change.
 
-Rewrite applications currently become explicit theorem assumptions. Instantiating named rewrite
-theorems can be added after congruence; operations involving variables, binders, dependency
-shrinking, or non-identity lifts record a precise unsupported-operation error for final printing.
+Unnamed rewrite applications become explicit theorem assumptions. Operations involving variables,
+binders, dependency shrinking, or non-identity lifts record a precise unsupported-operation error
+for final printing.
+
+Context-zero rewrites may instead be constructed with `Rewrite::named`. In proof mode, the apply
+phase first builds the operational RHS and checks that it would create a new union. Only then does
+it normalize both instantiated sides and allocate a compact `Rewrite(name, substitutions)` proof
+node. The Lean printer applies the named rule and uses the already-recorded parent equalities to
+normalize it to the union endpoints. A failed RHS, unsupported normalization, or already-equal pair
+allocates no rewrite proof and performs no proof-producing union.
 
 ## Lifts
 

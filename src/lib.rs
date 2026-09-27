@@ -438,6 +438,9 @@ impl EGraph {
     pub fn proofs_enabled(&self) -> bool {
         self.proofs.is_some()
     }
+    pub fn proof_step_count(&self) -> usize {
+        self.proofs.as_ref().map_or(0, EGraphProofState::step_count)
+    }
     fn make_set(&mut self, scope: usize) -> Id {
         assert!(
             self.parent.len() <= RawId::MAX as usize,
@@ -1200,6 +1203,125 @@ impl EGraph {
     ) -> Option<Id> {
         self.try_instantiate_metavars_rec(pattern, ctx, ctx, subst)
     }
+
+    fn collect_raw_normalizers(&mut self, raw: RawId, out: &mut Vec<ProofId>) -> Option<()> {
+        match self.proofs.as_ref()?.definition(raw)? {
+            EGraphProofTerm::Atom(_) => {}
+            EGraphProofTerm::App(function, argument) => {
+                self.collect_raw_normalizers(function, out)?;
+                self.collect_raw_normalizers(argument, out)?;
+            }
+        }
+        let root = self.find_mut(&Id::new(Lift::identity(0), raw));
+        let proof = self.proofs.as_mut()?.proof_between(raw, root.raw());
+        if !self.proofs.as_ref()?.is_refl(proof) {
+            out.push(proof);
+        }
+        Some(())
+    }
+
+    fn collect_pattern_normalizers(
+        &mut self,
+        pattern: &Pattern,
+        subst: &Subst,
+        out: &mut Vec<ProofId>,
+    ) -> Option<Id> {
+        match pattern {
+            Pattern::MetaVar(name, arguments) if arguments.is_empty() => {
+                let original = *subst.get(name)?;
+                if original.ctx() != 0 || !original.lift().is_identity() {
+                    return None;
+                }
+                let normalized = self.find_mut(&original);
+                let proof = self
+                    .proofs
+                    .as_mut()?
+                    .proof_between(original.raw(), normalized.raw());
+                if !self.proofs.as_ref()?.is_refl(proof) {
+                    out.push(proof);
+                }
+                Some(normalized)
+            }
+            Pattern::Atom(name) => {
+                let node = Node::Atom(*name);
+                let normalized = self.atom_symbol(*name, 0);
+                let witness = *self.memo.get(&node)?;
+                self.collect_raw_normalizers(witness, out)?;
+                Some(normalized)
+            }
+            Pattern::App(function, argument) => {
+                let function = self.collect_pattern_normalizers(function, subst, out)?;
+                let argument = self.collect_pattern_normalizers(argument, subst, out)?;
+                let normalized = self.app(function, argument);
+                let node = Node::App(function, argument);
+                let witness = *self.memo.get(&node)?;
+                self.collect_raw_normalizers(witness, out)?;
+                Some(normalized)
+            }
+            _ => None,
+        }
+    }
+
+    fn named_rewrite_proof(
+        &mut self,
+        rule: &Rewrite,
+        target: &Id,
+        replacement: &Id,
+        subst: &Subst,
+    ) -> Option<ProofId> {
+        let name = rule.name()?.to_owned();
+        fn supported(pattern: &Pattern) -> bool {
+            match pattern {
+                Pattern::MetaVar(_, arguments) => arguments.is_empty(),
+                Pattern::Atom(_) => true,
+                Pattern::App(function, argument) => supported(function) && supported(argument),
+                _ => false,
+            }
+        }
+        if target.ctx() != 0
+            || replacement.ctx() != 0
+            || !supported(rule.lhs())
+            || !supported(rule.rhs())
+        {
+            return None;
+        }
+        let left_check = self.try_instantiate_metavars(rule.lhs(), 0, subst)?;
+        let target_root = self.find_mut(target);
+        let replacement_root = self.find_mut(replacement);
+        if self.find_mut(&left_check) != target_root {
+            return None;
+        }
+        let arguments: Option<Vec<_>> = rule
+            .metavariables()
+            .iter()
+            .map(|name| {
+                let id = *subst.get(name)?;
+                (id.ctx() == 0 && id.lift().is_identity()).then_some(id.raw())
+            })
+            .collect();
+        let arguments = arguments?;
+
+        // Everything that can fail has now been checked. Only now allocate
+        // normalization and rewrite proof nodes for this new union.
+        let mut normalizers = Vec::new();
+        let left = self.collect_pattern_normalizers(rule.lhs(), subst, &mut normalizers)?;
+        let right = self.collect_pattern_normalizers(rule.rhs(), subst, &mut normalizers)?;
+        if left != target_root || right != replacement_root {
+            return None;
+        }
+        self.collect_raw_normalizers(target.raw(), &mut normalizers)?;
+        self.collect_raw_normalizers(replacement.raw(), &mut normalizers)?;
+        normalizers.sort_unstable();
+        normalizers.dedup();
+        let proofs = self.proofs.as_mut()?;
+        Some(proofs.rewrite_normalized(
+            target.raw(),
+            replacement.raw(),
+            name,
+            arguments,
+            normalizers,
+        ))
+    }
     fn try_instantiate_metavars_rec(
         &mut self,
         pattern: &Pattern,
@@ -1331,7 +1453,19 @@ impl EGraph {
                     if let Some(replacement) =
                         self.try_instantiate_metavars(rule.rhs(), target.ctx(), &subst)
                     {
-                        let unioned = self.union(&target, &replacement);
+                        if self.equivalent(&target, &replacement) {
+                            continue;
+                        }
+                        let unioned = if self.proofs.is_some() && rule.name().is_some() {
+                            let Some(proof) =
+                                self.named_rewrite_proof(rule, &target, &replacement, &subst)
+                            else {
+                                continue;
+                            };
+                            self.union_with_proof(&target, &replacement, Some(proof))
+                        } else {
+                            self.union(&target, &replacement)
+                        };
                         stats.unions += usize::from(unioned);
                         changed |= unioned;
                     }

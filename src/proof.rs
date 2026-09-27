@@ -3,7 +3,7 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::RawId;
 
 /// An index into the proof-expression arena.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProofId(u32);
 
 type Id = u32;
@@ -144,27 +144,53 @@ pub(crate) enum EGraphProofTerm {
     App(RawId, RawId),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum EGraphProofKind {
     Refl,
     Symm(ProofId),
     Trans(ProofId, ProofId),
     CongApp(ProofId, ProofId),
-    CongFunction { argument: RawId, proof: ProofId },
-    CongArgument { function: RawId, proof: ProofId },
-    Assumption { index: usize, label: String },
+    CongFunction {
+        argument: EGraphTermId,
+        proof: ProofId,
+    },
+    CongArgument {
+        function: EGraphTermId,
+        proof: ProofId,
+    },
+    Rewrite {
+        name: String,
+        arguments: Vec<RawId>,
+        normalizers: Vec<ProofId>,
+    },
+    Assumption {
+        index: usize,
+        label: String,
+    },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct EGraphProofNode {
-    left: RawId,
-    right: RawId,
+    left: EGraphTermId,
+    right: EGraphTermId,
     kind: EGraphProofKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct EGraphTermId(u32);
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum EGraphTermNode {
+    Raw(RawId),
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EGraphProofState {
     arena: Vec<EGraphProofNode>,
+    proof_memo: HashMap<EGraphProofNode, ProofId>,
+    terms: Vec<EGraphTermNode>,
+    term_memo: HashMap<EGraphTermNode, EGraphTermId>,
+    raw_terms: Vec<EGraphTermId>,
     definitions: Vec<Option<EGraphProofTerm>>,
     parent_proofs: Vec<ProofId>,
     assumptions: usize,
@@ -172,21 +198,46 @@ pub(crate) struct EGraphProofState {
 }
 
 impl EGraphProofState {
-    fn alloc(&mut self, left: RawId, right: RawId, kind: EGraphProofKind) -> ProofId {
+    pub(crate) fn step_count(&self) -> usize {
+        self.arena.len()
+    }
+
+    fn alloc(&mut self, left: EGraphTermId, right: EGraphTermId, kind: EGraphProofKind) -> ProofId {
+        let node = EGraphProofNode { left, right, kind };
+        if let Some(&proof) = self.proof_memo.get(&node) {
+            return proof;
+        }
         assert!(self.arena.len() <= u32::MAX as usize, "exhausted proof IDs");
         let proof = ProofId(self.arena.len() as u32);
-        self.arena.push(EGraphProofNode { left, right, kind });
+        self.arena.push(node.clone());
+        self.proof_memo.insert(node, proof);
         proof
     }
 
     pub(crate) fn make_set(&mut self, raw: RawId, context: usize) {
         assert_eq!(self.definitions.len(), raw as usize);
         self.definitions.push(None);
-        let proof = self.alloc(raw, raw, EGraphProofKind::Refl);
+        let term = self.alloc_term(EGraphTermNode::Raw(raw));
+        self.raw_terms.push(term);
+        let proof = self.alloc(term, term, EGraphProofKind::Refl);
         self.parent_proofs.push(proof);
         if context != 0 {
             self.unsupported(format!("e{raw} was allocated in context {context}"));
         }
+    }
+
+    fn alloc_term(&mut self, node: EGraphTermNode) -> EGraphTermId {
+        if let Some(&term) = self.term_memo.get(&node) {
+            return term;
+        }
+        let term = EGraphTermId(self.terms.len() as u32);
+        self.terms.push(node.clone());
+        self.term_memo.insert(node, term);
+        term
+    }
+
+    pub(crate) fn raw_term(&self, raw: RawId) -> EGraphTermId {
+        self.raw_terms[raw as usize]
     }
 
     pub(crate) fn define(&mut self, raw: RawId, definition: EGraphProofTerm) {
@@ -211,18 +262,26 @@ impl EGraphProofState {
     }
 
     pub(crate) fn set_parent_proof(&mut self, child: RawId, proof: ProofId) {
-        debug_assert_eq!(self.arena[proof.0 as usize].left, child);
+        debug_assert_eq!(self.arena[proof.0 as usize].left, self.raw_term(child));
         self.parent_proofs[child as usize] = proof;
     }
 
     pub(crate) fn refl_between(&mut self, left: RawId, right: RawId) -> ProofId {
+        self.refl_terms(self.raw_term(left), self.raw_term(right))
+    }
+
+    pub(crate) fn refl_terms(&mut self, left: EGraphTermId, right: EGraphTermId) -> ProofId {
         self.alloc(left, right, EGraphProofKind::Refl)
     }
 
     pub(crate) fn assumption(&mut self, left: RawId, right: RawId, label: String) -> ProofId {
         let index = self.assumptions;
         self.assumptions += 1;
-        self.alloc(left, right, EGraphProofKind::Assumption { index, label })
+        self.alloc(
+            self.raw_term(left),
+            self.raw_term(right),
+            EGraphProofKind::Assumption { index, label },
+        )
     }
 
     pub(crate) fn symm(&mut self, proof: ProofId) -> ProofId {
@@ -260,6 +319,18 @@ impl EGraphProofState {
         function: ProofId,
         argument: ProofId,
     ) -> ProofId {
+        let left = self.raw_term(left);
+        let right = self.raw_term(right);
+        self.congr_terms_with_endpoints(left, right, function, argument)
+    }
+
+    fn congr_terms_with_endpoints(
+        &mut self,
+        left: EGraphTermId,
+        right: EGraphTermId,
+        function: ProofId,
+        argument: ProofId,
+    ) -> ProofId {
         let function_node = &self.arena[function.0 as usize];
         let argument_node = &self.arena[argument.0 as usize];
         let function_is_refl = function_node.left == function_node.right
@@ -267,7 +338,7 @@ impl EGraphProofState {
         let argument_is_refl = argument_node.left == argument_node.right
             && matches!(argument_node.kind, EGraphProofKind::Refl);
         if function_is_refl && argument_is_refl {
-            return self.refl_between(left, right);
+            return self.refl_terms(left, right);
         }
         if function_is_refl {
             return self.alloc(
@@ -292,11 +363,35 @@ impl EGraphProofState {
         self.alloc(left, right, EGraphProofKind::CongApp(function, argument))
     }
 
+    pub(crate) fn rewrite_normalized(
+        &mut self,
+        left: RawId,
+        right: RawId,
+        name: String,
+        arguments: Vec<RawId>,
+        normalizers: Vec<ProofId>,
+    ) -> ProofId {
+        self.alloc(
+            self.raw_term(left),
+            self.raw_term(right),
+            EGraphProofKind::Rewrite {
+                name,
+                arguments,
+                normalizers,
+            },
+        )
+    }
+
     pub(crate) fn proof_between(&mut self, left: RawId, right: RawId) -> ProofId {
         let left = self.parent_proof(left);
         let right = self.parent_proof(right);
         let right = self.symm(right);
         self.trans(left, right)
+    }
+
+    pub(crate) fn is_refl(&self, proof: ProofId) -> bool {
+        let node = &self.arena[proof.0 as usize];
+        node.left == node.right && matches!(node.kind, EGraphProofKind::Refl)
     }
 
     fn live_from(&self, conclusion: ProofId) -> Vec<bool> {
@@ -309,6 +404,9 @@ impl EGraphProofState {
             }
             match self.arena[index].kind {
                 EGraphProofKind::Refl | EGraphProofKind::Assumption { .. } => {}
+                EGraphProofKind::Rewrite {
+                    ref normalizers, ..
+                } => work.extend(normalizers),
                 EGraphProofKind::Symm(child) => work.push(child),
                 EGraphProofKind::CongFunction { proof, .. }
                 | EGraphProofKind::CongArgument { proof, .. } => work.push(proof),
@@ -332,6 +430,32 @@ impl EGraphProofState {
             None => Err(ProofError::Unsupported(format!(
                 "e{raw} has no first-order definition"
             ))),
+        }
+    }
+
+    fn raw_endpoint(&self, term: EGraphTermId) -> Result<RawId, ProofError> {
+        match self.terms[term.0 as usize] {
+            EGraphTermNode::Raw(raw) => Ok(raw),
+        }
+    }
+
+    fn term_name(&self, term: EGraphTermId) -> String {
+        match self.terms[term.0 as usize] {
+            EGraphTermNode::Raw(raw) => format!("e{raw}"),
+        }
+    }
+
+    fn mark_endpoint(
+        &self,
+        term: EGraphTermId,
+        live_terms: &mut [bool],
+        live_exprs: &mut [bool],
+    ) -> Result<(), ProofError> {
+        if std::mem::replace(&mut live_exprs[term.0 as usize], true) {
+            return Ok(());
+        }
+        match self.terms[term.0 as usize] {
+            EGraphTermNode::Raw(raw) => self.mark_term(raw, live_terms),
         }
     }
 
@@ -366,10 +490,12 @@ impl EGraphProofState {
         let mut output = format!("theorem {theorem_name} {binders}");
         for (is_live, node) in live.iter().zip(&self.arena) {
             if *is_live && let EGraphProofKind::Assumption { index, .. } = node.kind {
+                let left = self.raw_endpoint(node.left)?;
+                let right = self.raw_endpoint(node.right)?;
                 output.push_str(&format!(
                     " (h{index} : {} = {})",
-                    self.source_term(node.left)?,
-                    self.source_term(node.right)?
+                    self.source_term(left)?,
+                    self.source_term(right)?
                 ));
             }
         }
@@ -380,12 +506,18 @@ impl EGraphProofState {
         ));
 
         let mut live_terms = vec![false; self.definitions.len()];
+        let mut live_exprs = vec![false; self.terms.len()];
         self.mark_term(left, &mut live_terms)?;
         self.mark_term(right, &mut live_terms)?;
         for (is_live, node) in live.iter().zip(&self.arena) {
             if *is_live {
-                self.mark_term(node.left, &mut live_terms)?;
-                self.mark_term(node.right, &mut live_terms)?;
+                self.mark_endpoint(node.left, &mut live_terms, &mut live_exprs)?;
+                self.mark_endpoint(node.right, &mut live_terms, &mut live_exprs)?;
+                if let EGraphProofKind::Rewrite { ref arguments, .. } = node.kind {
+                    for &raw in arguments {
+                        self.mark_term(raw, &mut live_terms)?;
+                    }
+                }
             }
         }
         for (raw, is_live) in live_terms.into_iter().enumerate() {
@@ -414,10 +546,32 @@ impl EGraphProofState {
                     format!("congr (congrArg app p{}) p{}", function.0, argument.0)
                 }
                 EGraphProofKind::CongFunction { argument, proof } => {
-                    format!("congrFun (congrArg app p{}) e{argument}", proof.0)
+                    format!(
+                        "congrFun (congrArg app p{}) {}",
+                        proof.0,
+                        self.term_name(argument)
+                    )
                 }
                 EGraphProofKind::CongArgument { function, proof } => {
-                    format!("congrArg (app e{function}) p{}", proof.0)
+                    format!("congrArg (app {}) p{}", self.term_name(function), proof.0)
+                }
+                EGraphProofKind::Rewrite {
+                    ref name,
+                    ref arguments,
+                    ref normalizers,
+                } => {
+                    let rules = normalizers
+                        .iter()
+                        .map(|proof| format!("p{}", proof.0))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "by simpa only [{rules}] using {name}{}",
+                        arguments
+                            .iter()
+                            .map(|raw| format!(" e{raw}"))
+                            .collect::<String>()
+                    )
                 }
                 EGraphProofKind::Assumption { index, ref label } => {
                     output.push_str(&format!("  -- {label}\n"));
@@ -425,8 +579,9 @@ impl EGraphProofState {
                 }
             };
             output.push_str(&format!(
-                "  let p{index} : e{} = e{} := {expression}\n",
-                node.left, node.right
+                "  let p{index} : {} = {} := {expression}\n",
+                self.term_name(node.left),
+                self.term_name(node.right)
             ));
         }
         output.push_str(&format!("  exact p{}\n", conclusion.0));
@@ -877,6 +1032,61 @@ mod tests {
         assert!(
             output.status.success(),
             "Lean rejected function congruence:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn named_rewrite_records_only_a_union_that_changes_the_graph() {
+        let mut egraph = crate::EGraph::new_with_proofs();
+        let x = egraph.atom("x", 0);
+        let zero = egraph.atom("zero", 0);
+        let inner = egraph.apps("plus", vec![x, zero]);
+        let outer = egraph.apps("plus", vec![inner, zero]);
+        let rule = crate::Rewrite::named(
+            "r1",
+            crate::Pattern::apps(
+                "plus",
+                vec![crate::Pattern::meta("?a"), crate::Pattern::atom("zero")],
+            ),
+            crate::Pattern::meta("?a"),
+        )
+        .unwrap();
+        egraph.saturate(std::slice::from_ref(&rule));
+        let settled_steps = egraph.proof_step_count();
+        egraph.saturate(std::slice::from_ref(&rule));
+        assert_eq!(egraph.proof_step_count(), settled_steps);
+
+        let certificate = egraph
+            .lean_proof(
+                "two_rewrites",
+                "{α : Type} (app : α → α → α) (plus zero x : α) \
+                 (r1 : ∀ a, app (app plus a) zero = a)",
+                &outer,
+                &x,
+            )
+            .unwrap();
+        assert_eq!(certificate.matches("using r1").count(), 1);
+
+        let Ok(mut lean) = Command::new("lean")
+            .arg("--stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            return;
+        };
+        lean.stdin
+            .take()
+            .unwrap()
+            .write_all(certificate.as_bytes())
+            .unwrap();
+        let output = lean.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "Lean rejected the named rewrite certificate:\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
