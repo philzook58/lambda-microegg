@@ -906,7 +906,7 @@ impl ProofUnionFind {
         if arity == 0 {
             equality
         } else {
-            format!("∀ {}, {equality}", Self::variables(arity).join(" "))
+            format!("∀ ({} : α), {equality}", Self::variables(arity).join(" "))
         }
     }
 
@@ -1020,6 +1020,28 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::process::{Command, Stdio};
+
+    fn next_random(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state
+    }
+
+    fn random_below(state: &mut u64, limit: usize) -> usize {
+        (next_random(state) as usize) % limit
+    }
+
+    fn random_positions(state: &mut u64, count: usize, ambient: usize) -> Vec<usize> {
+        let mut positions = (0..ambient).collect::<Vec<_>>();
+        for index in 0..count {
+            let selected = index + random_below(state, ambient - index);
+            positions.swap(index, selected);
+        }
+        positions.truncate(count);
+        positions.sort_unstable();
+        positions
+    }
 
     #[test]
     fn partial_lift_reverses_by_swapping_its_two_lifts() {
@@ -1203,7 +1225,7 @@ mod tests {
         assert!(certificate.contains("default"));
         assert!(!certificate.contains("funext"));
         assert!(!certificate.contains("congrFun"));
-        assert!(certificate.contains("∀ x0, (f) x0 = (g) x0"));
+        assert!(certificate.contains("∀ (x0 : α), (f) x0 = (g) x0"));
 
         let Ok(mut lean) = Command::new("lean")
             .arg("--stdin")
@@ -1223,6 +1245,102 @@ mod tests {
         assert!(
             output.status.success(),
             "Lean rejected the thinning certificate:\n{certificate}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn deterministic_randomized_thinning_certificates_check_in_lean() {
+        const SEED: u64 = 0x7a11_0f1d_cafe_babe;
+        const CASES: usize = 12;
+        const TERMS: usize = 8;
+
+        let mut state = SEED;
+        let mut certificates = String::new();
+        for case in 0..CASES {
+            let arity = 1 + random_below(&mut state, 3);
+            let names = (0..TERMS)
+                .map(|index| format!("f{index}"))
+                .collect::<Vec<_>>();
+            let mut union_find = ProofUnionFind::new(true);
+            let ids = names
+                .iter()
+                .map(|name| union_find.make_set_with_arity(name, arity))
+                .collect::<Vec<_>>();
+
+            let mut order = (0..TERMS).collect::<Vec<_>>();
+            for index in 0..TERMS {
+                let selected = index + random_below(&mut state, TERMS - index);
+                order.swap(index, selected);
+            }
+            for step in 1..TERMS {
+                let ambient = arity + random_below(&mut state, 4);
+                let left_positions = random_positions(&mut state, arity, ambient);
+                let right_positions = random_positions(&mut state, arity, ambient);
+                let left = union_find.place(ids[order[step - 1]], ambient, &left_positions);
+                let right = union_find.place(ids[order[step]], ambient, &right_positions);
+                union_find.union(left, right, format!("case {case}, tree edge {step}"));
+            }
+
+            for step in 0..16 {
+                let left_index = random_below(&mut state, TERMS);
+                let mut right_index = random_below(&mut state, TERMS - 1);
+                if right_index >= left_index {
+                    right_index += 1;
+                }
+                let ambient = arity + random_below(&mut state, 4);
+                let left_positions = random_positions(&mut state, arity, ambient);
+                let right_positions = random_positions(&mut state, arity, ambient);
+                let left = union_find.place(ids[left_index], ambient, &left_positions);
+                let right = union_find.place(ids[right_index], ambient, &right_positions);
+                union_find.union(left, right, format!("case {case}, extra edge {step}"));
+            }
+
+            let function_type = format!("{}α", "α → ".repeat(arity));
+            let binders = format!(
+                "{{α : Type}} [Inhabited α] ({} : {function_type})",
+                names.join(" ")
+            );
+            for query in 0..2 {
+                let left_index = random_below(&mut state, TERMS);
+                let mut right_index = random_below(&mut state, TERMS - 1);
+                if right_index >= left_index {
+                    right_index += 1;
+                }
+                assert!(union_find.equivalent(ids[left_index], ids[right_index]));
+                certificates.push_str(
+                    &union_find
+                        .lean_proof(
+                            &format!("random_thinning_{case}_{query}"),
+                            &binders,
+                            &names[left_index],
+                            &names[right_index],
+                        )
+                        .unwrap(),
+                );
+                certificates.push('\n');
+            }
+        }
+
+        let Ok(mut lean) = Command::new("lean")
+            .arg("--stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            return;
+        };
+        lean.stdin
+            .take()
+            .unwrap()
+            .write_all(certificates.as_bytes())
+            .unwrap();
+        let output = lean.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "Lean rejected a deterministic randomized certificate (seed {SEED:#x}):\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
