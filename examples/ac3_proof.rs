@@ -31,8 +31,7 @@ fn main() {
     egraph.saturate(&rules);
     let saturation = saturation_started.elapsed();
     assert!(egraph.equivalent(&input, &goal));
-    let arena_steps = egraph.proof_step_count();
-    let arena = egraph.proof_stats().unwrap();
+    let trace = egraph.proof_stats().unwrap();
     let render_started = Instant::now();
     let certificate = egraph
         .lean_proof(
@@ -46,7 +45,7 @@ fn main() {
         .unwrap();
     let render = render_started.elapsed();
     eprintln!(
-        "saturation={saturation:?} render={render:?} arena_steps={arena_steps} arena={arena:?} bytes={}",
+        "saturation={saturation:?} render={render:?} trace={trace:?} bytes={}",
         certificate.len()
     );
     print!("{certificate}");

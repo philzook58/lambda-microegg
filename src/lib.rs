@@ -31,8 +31,8 @@ mod proof;
 mod proof_union_find;
 mod terms;
 use proof::{
-    EGraphPatternWitness, EGraphProofState, EGraphProofTerm, EGraphRewriteSchemaId,
-    EGraphUnionReason,
+    EGraphPatternWitness, EGraphProofTerm, EGraphProofTrace, EGraphRewriteSchemaId,
+    EGraphUnionReason, render_egraph_proof,
 };
 pub use proof::{EGraphProofStats, ProofError, ProofId};
 pub use proof_union_find::ProofUnionFind;
@@ -416,7 +416,7 @@ enum MatchMode {
 pub struct EGraph {
     parent: Vec<Id>,
     memo: IndexMap<Node, RawId, rustc_hash::FxBuildHasher>,
-    proofs: Option<EGraphProofState>,
+    proofs: Option<EGraphProofTrace>,
     rev: IndexMap<RawId, Vec<(Node, Lift)>, rustc_hash::FxBuildHasher>,
     // Possible next performance experiments, deliberately not implemented:
     // cache canonical targets and root-operator buckets while rebuilding, or
@@ -436,18 +436,15 @@ impl EGraph {
     /// Construct an e-graph that records Lean proofs for context-zero atoms and applications.
     pub fn new_with_proofs() -> Self {
         Self {
-            proofs: Some(EGraphProofState::default()),
+            proofs: Some(EGraphProofTrace::default()),
             ..Self::default()
         }
     }
     pub fn proofs_enabled(&self) -> bool {
         self.proofs.is_some()
     }
-    pub fn proof_step_count(&self) -> usize {
-        self.proofs.as_ref().map_or(0, EGraphProofState::step_count)
-    }
     pub fn proof_stats(&self) -> Option<EGraphProofStats> {
-        self.proofs.as_ref().map(EGraphProofState::stats)
+        self.proofs.as_ref().map(EGraphProofTrace::stats)
     }
     fn make_set(&mut self, scope: usize) -> Id {
         assert!(
@@ -793,9 +790,13 @@ impl EGraph {
                 right: right.show(),
             });
         }
-        let proofs = self.proofs.as_mut().expect("checked above");
-        let conclusion = proofs.proof_between(left.raw(), right.raw());
-        proofs.render(theorem_name, binders, left.raw(), right.raw(), conclusion)
+        render_egraph_proof(
+            self.proofs.as_ref().expect("checked above"),
+            theorem_name,
+            binders,
+            left.raw(),
+            right.raw(),
+        )
     }
 
     // -----------------------------

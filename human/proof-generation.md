@@ -4,7 +4,7 @@ Proof data should be parallel to the operational e-graph data rather than part o
 `Id` already carries a lift, and proof tracking should be removable without changing its size or the
 hot paths that pass it around.
 
-The implementation starts with `ProofUnionFind` in `src/proof.rs`. Its ordinary data is a
+The implementation starts with `ProofUnionFind` in `src/proof_union_find.rs`. Its ordinary data is a
 size-balanced, path-compressed parent array and a name memo. With proofs enabled, an optional state
 adds a second, uncompressed explanation forest in the style of
 [Nieuwenhuis and Oliveras](https://www.cs.upc.edu/~oliveras/rta05.pdf):
@@ -181,12 +181,13 @@ includes process startup.
 |  | Lean time | 6.262 s | 0.464 s | 0.38 s |
 |  | peak memory | 1,800 MB | 493 MB | 489 MB |
 
-Lazy rewrites leave both certificate arenas empty after saturation. Rendering AC4 materializes 264 proof
-nodes, and rendering AC5 materializes 275; the previous eager-rewrite version held 972 and 4,872
-nodes respectively before rendering. Each successful rewrite now records a compact instantiated
-pattern recipe. Only recipes reached by the requested explanation are expanded into normalization,
-rule, congruence, symmetry, and transitivity nodes. The generated certificates are kept in
-`proofs/AC4.lean` and `proofs/AC5.lean`.
+Lazy rewrites leave certificate arenas absent during saturation. `EGraphProofTrace` retains only
+definitions, the explanation forest, and compact reasons. `render_egraph_proof` creates a local
+`EGraphProofArena`, materializes the requested explanation, prints it, and drops the arena. Each
+successful rewrite records a shared pattern schema plus its substitutions and witnesses. Only
+reasons reached by the requested explanation are expanded into normalization, rule, congruence,
+symmetry, and transitivity nodes. The generated certificates are kept in `proofs/AC4.lean` and
+`proofs/AC5.lean`.
 
 ## Proof-recording overhead
 
