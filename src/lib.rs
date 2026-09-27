@@ -28,7 +28,9 @@ use smallvec::SmallVec;
 use symbol_table::GlobalSymbol as Symbol;
 use web_time::{Duration, Instant};
 
+mod proof;
 mod terms;
+pub use proof::{ProofError, ProofId, ProofUnionFind};
 use terms::pattern_occurrence_lift;
 pub use terms::{DeBruijnIndex, DeBruijnLevel, NamedTerm, Pattern, Rewrite, Term, TermCtx};
 
