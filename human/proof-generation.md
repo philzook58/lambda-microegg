@@ -105,3 +105,18 @@ factored would give a simpler invariant at the cost of a more demanding user int
 The proof arena should store the instantiated span rather than folding it immediately into a plain
 equality. Keeping the mediator makes later equalizer and pullback operations compositional and lets
 final Lean printing destructure the rule witness only when it is actually used.
+
+## First-order scaling checkpoint
+
+The named first-order AC examples use explicit rule, congruence, symmetry, and transitivity proof
+objects. AC3 checks in about 0.32 seconds, AC4 in 0.95 seconds, and AC5 in 6.95 seconds on the same
+machine; an empty Lean invocation takes about 0.22 seconds. AC5's live certificate contains 4,854
+proof bindings and 237 named-rule applications, so the union-find explanation rather than e-graph
+saturation dominates.
+
+Local term and proof `let` bindings are valuable sharing, not merely printer noise. Recursively
+inlining term bindings grew AC4 from 51 KB to 151 KB and doubled checking time; for AC5 it grew 276
+KB to 943 KB and increased checking from 6.95 to about 17.4 seconds. Inlining the proof DAG already
+slowed AC3 and expanding AC4 did not finish within 30 seconds. The next scaling step should select a
+smaller explanation after saturation, or invoke a larger proved normalization rule, rather than
+eliding the memo tables.
