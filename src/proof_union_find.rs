@@ -210,6 +210,8 @@ enum ProofKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProofNode {
+    /// A node proves pointwise equality of these contextual terms. It proves
+    /// ordinary equality when their ambient context has arity zero.
     left: Endpoint,
     right: Endpoint,
     kind: ProofKind,
@@ -822,7 +824,7 @@ impl ProofUnionFind {
         Ok(proofs.trans(left_to_right_raw, right_raw_to_name))
     }
 
-    /// Print a complete Lean theorem proving the requested equality.
+    /// Print a complete Lean theorem proving pointwise equality in the terms' context.
     ///
     /// `binders` is inserted after the theorem name, for example
     /// `"{α : Type} (a b c : α)"`.
@@ -843,13 +845,24 @@ impl ProofUnionFind {
             }
             if let ProofKind::Assumption { index, .. } = node.kind {
                 output.push_str(&format!(
-                    " (h{index} : {} = {})",
-                    self.endpoint_source(&node.left),
-                    self.endpoint_source(&node.right)
+                    " (h{index} : {})",
+                    self.relation_type(&node.left, &node.right, false)
                 ));
             }
         }
-        output.push_str(&format!(" : {left} = {right} := by\n"));
+        let arity = self.arities[self.memo[left] as usize];
+        let left_endpoint = Endpoint::Named {
+            name: left.to_owned(),
+            map: ContextMap::identity(arity),
+        };
+        let right_endpoint = Endpoint::Named {
+            name: right.to_owned(),
+            map: ContextMap::identity(arity),
+        };
+        output.push_str(&format!(
+            " : {} := by\n",
+            self.relation_type(&left_endpoint, &right_endpoint, false)
+        ));
         let mut live_terms = vec![false; self.definitions.len()];
         for (is_live, node) in live.iter().zip(&proofs.arena) {
             if *is_live {
@@ -871,20 +884,36 @@ impl ProofUnionFind {
                 continue;
             }
             let expression = match node.kind {
-                ProofKind::Refl => "rfl".to_owned(),
-                ProofKind::Symm(proof) => format!("Eq.symm p{}", proof.0),
-                ProofKind::Trans(first, second) => {
-                    format!("Eq.trans p{} p{}", first.0, second.0)
+                ProofKind::Refl => {
+                    Self::pointwise(Self::endpoint_arity(&node.left), "rfl".to_owned())
                 }
-                ProofKind::Map { proof, ref map } => self.pointwise_proof(
+                ProofKind::Symm(proof) => {
+                    let arguments = Self::variables(Self::endpoint_arity(&node.left));
+                    Self::pointwise(
+                        arguments.len(),
+                        format!("Eq.symm ({})", Self::apply_proof(proof, &arguments)),
+                    )
+                }
+                ProofKind::Trans(first, second) => {
+                    let arguments = Self::variables(Self::endpoint_arity(&node.left));
+                    Self::pointwise(
+                        arguments.len(),
+                        format!(
+                            "Eq.trans ({}) ({})",
+                            Self::apply_proof(first, &arguments),
+                            Self::apply_proof(second, &arguments)
+                        ),
+                    )
+                }
+                ProofKind::Map { proof, ref map } => Self::pointwise(
                     map.ambient_arity,
                     Self::apply_proof(proof, &Self::map_arguments(map)),
                 ),
-                ProofKind::SpecializeLeft { equality, left } => self.pointwise_proof(
+                ProofKind::SpecializeLeft { equality, left } => Self::pointwise(
                     left.dom(),
                     Self::apply_proof(equality, &Self::filled_arguments(left)),
                 ),
-                ProofKind::SpecializeRight { equality, right } => self.pointwise_proof(
+                ProofKind::SpecializeRight { equality, right } => Self::pointwise(
                     right.dom(),
                     format!(
                         "Eq.symm ({})",
@@ -899,12 +928,12 @@ impl ProofUnionFind {
                     let original = Self::apply_proof(equality, &Self::filled_arguments(left));
                     let restricted =
                         Self::apply_proof(equality, &Self::subset_arguments(left, common));
-                    self.pointwise_proof(
+                    Self::pointwise(
                         left.dom(),
                         format!("Eq.trans ({original}) (Eq.symm ({restricted}))"),
                     )
                 }
-                ProofKind::FactorRight { equality, right } => self.pointwise_proof(
+                ProofKind::FactorRight { equality, right } => Self::pointwise(
                     right.dom(),
                     format!(
                         "Eq.symm ({})",
@@ -917,34 +946,58 @@ impl ProofUnionFind {
                 }
             };
             output.push_str(&format!(
-                "  let p{index} : {} = {} := {expression}\n",
-                self.endpoint_local(&node.left),
-                self.endpoint_local(&node.right)
+                "  let p{index} : {} := {expression}\n",
+                self.relation_type(&node.left, &node.right, true)
             ));
         }
         output.push_str(&format!("  exact p{}\n", conclusion.0));
         Ok(output)
     }
 
-    fn endpoint_local(&self, endpoint: &Endpoint) -> String {
+    fn endpoint_value(&self, endpoint: &Endpoint, local: bool) -> String {
         match endpoint {
-            Endpoint::Named { name, map } => Self::map_expression(name, map),
-            Endpoint::Raw { raw, map } => Self::map_expression(&format!("e{raw}"), map),
+            Endpoint::Named { name, map } => {
+                let arguments = Self::map_arguments(map);
+                if arguments.is_empty() {
+                    name.clone()
+                } else {
+                    Self::apply(&format!("({name})"), &arguments)
+                }
+            }
+            Endpoint::Raw { raw, map } => {
+                let source = if local {
+                    format!("e{raw}")
+                } else {
+                    self.definition_expression(*raw, false)
+                };
+                let arguments = Self::map_arguments(map);
+                if arguments.is_empty() {
+                    source
+                } else {
+                    Self::apply(&format!("({source})"), &arguments)
+                }
+            }
         }
     }
 
-    fn endpoint_source(&self, endpoint: &Endpoint) -> String {
+    fn endpoint_arity(endpoint: &Endpoint) -> usize {
         match endpoint {
-            Endpoint::Named { name, map } => Self::map_expression(name, map),
-            Endpoint::Raw { raw, map } => {
-                let source = self.definition_expression(*raw, false);
-                let source = if map.is_identity() {
-                    source
-                } else {
-                    format!("({source})")
-                };
-                Self::map_expression(&source, map)
-            }
+            Endpoint::Named { map, .. } | Endpoint::Raw { map, .. } => map.ambient_arity,
+        }
+    }
+
+    fn relation_type(&self, left: &Endpoint, right: &Endpoint, local: bool) -> String {
+        let arity = Self::endpoint_arity(left);
+        assert_eq!(arity, Self::endpoint_arity(right));
+        let equality = format!(
+            "{} = {}",
+            self.endpoint_value(left, local),
+            self.endpoint_value(right, local)
+        );
+        if arity == 0 {
+            equality
+        } else {
+            format!("∀ {}, {equality}", Self::variables(arity).join(" "))
         }
     }
 
@@ -970,14 +1023,6 @@ impl ProofUnionFind {
                 Self::lambda(thinning.dom(), &body)
             }
         }
-    }
-
-    fn map_expression(base: &str, map: &ContextMap) -> String {
-        if map.is_identity() {
-            return base.to_owned();
-        }
-        let body = Self::apply(base, &Self::map_arguments(map));
-        Self::lambda(map.ambient_arity, &body)
     }
 
     fn map_arguments(map: &ContextMap) -> Vec<String> {
@@ -1035,8 +1080,12 @@ impl ProofUnionFind {
         arguments
             .iter()
             .fold(format!("p{}", proof.0), |term, argument| {
-                format!("congrFun ({term}) {argument}")
+                format!("{term} {argument}")
             })
+    }
+
+    fn variables(arity: usize) -> Vec<String> {
+        (0..arity).map(|index| format!("x{index}")).collect()
     }
 
     fn lambda(arity: usize, body: &str) -> String {
@@ -1051,15 +1100,11 @@ impl ProofUnionFind {
         }
     }
 
-    fn pointwise_proof(&self, arity: usize, body: String) -> String {
+    fn pointwise(arity: usize, body: String) -> String {
         if arity == 0 {
             body
         } else {
-            let variables = (0..arity)
-                .map(|index| format!("x{index}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("by\n    funext {variables}\n    exact {body}")
+            format!("fun {} => {body}", Self::variables(arity).join(" "))
         }
     }
 }
@@ -1226,7 +1271,9 @@ mod tests {
             )
             .unwrap();
         assert!(certificate.contains("default"));
-        assert!(certificate.contains("funext"));
+        assert!(!certificate.contains("funext"));
+        assert!(!certificate.contains("congrFun"));
+        assert!(certificate.contains("∀ x0, (f) x0 = (g) x0"));
 
         let Ok(mut lean) = Command::new("lean")
             .arg("--stdin")
