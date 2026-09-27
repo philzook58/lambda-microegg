@@ -224,3 +224,17 @@ eager version. No proof nodes are allocated during saturation: the remaining ove
 raw term definitions, the explanation forest, and the stored rewrite recipes. AC10 now completes
 comfortably, although its roughly 499,000 explanation reasons show that compacting or sharing the
 recipes is the next memory target.
+
+Sharing each rule's pattern shape and name, flattening each successful rewrite to one witness
+array, moving rewrite and assumption payloads out of the common reason node, and keeping
+certificate caches sparse reduces that target further:
+
+| Size | Boxed recipes | Shared flat recipes | Reduction |
+| ---: | ---: | ---: | ---: |
+| AC8 | 17.5 MiB | 12.4 MiB | 29% |
+| AC9 | 67.6 MiB | 44.7 MiB | 34% |
+| AC10 | 253.2 MiB | 168.9 MiB | 33% |
+
+These are means of three fresh processes. Saturation time did not improve measurably: AC9 remained
+about 0.59 seconds and AC10 remained about 3.2 seconds. The change removes repeated representation
+rather than work on the matching and rebuilding hot paths.

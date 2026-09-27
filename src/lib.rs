@@ -30,7 +30,10 @@ use web_time::{Duration, Instant};
 mod proof;
 mod proof_union_find;
 mod terms;
-use proof::{EGraphPatternRecipe, EGraphProofState, EGraphProofTerm, EGraphUnionReason};
+use proof::{
+    EGraphPatternWitness, EGraphProofState, EGraphProofTerm, EGraphRewriteSchemaId,
+    EGraphUnionReason,
+};
 pub use proof::{EGraphProofStats, ProofError, ProofId};
 pub use proof_union_find::ProofUnionFind;
 use terms::pattern_occurrence_lift;
@@ -1171,11 +1174,12 @@ impl EGraph {
         self.try_instantiate_metavars_rec(pattern, ctx, ctx, subst)
     }
 
-    fn pattern_recipe(
+    fn pattern_witnesses(
         &mut self,
         pattern: &Pattern,
         subst: &Subst,
-    ) -> Option<(Id, EGraphPatternRecipe)> {
+        out: &mut Vec<EGraphPatternWitness>,
+    ) -> Option<Id> {
         match pattern {
             Pattern::MetaVar(name, arguments) if arguments.is_empty() => {
                 let original = *subst.get(name)?;
@@ -1183,41 +1187,33 @@ impl EGraph {
                     return None;
                 }
                 let normalized = self.find_mut(&original);
-                Some((
-                    normalized,
-                    EGraphPatternRecipe::Raw {
-                        raw: original.raw(),
-                        normal: normalized.raw(),
-                    },
-                ))
+                out.push(EGraphPatternWitness {
+                    raw: original.raw(),
+                    normal: normalized.raw(),
+                });
+                Some(normalized)
             }
             Pattern::Atom(name) => {
                 let node = Node::Atom(*name);
                 let witness = *self.memo.get(&node)?;
                 let normalized = self.find_mut(&Id::new(Lift::identity(0), witness));
-                Some((
-                    normalized,
-                    EGraphPatternRecipe::Raw {
-                        raw: witness,
-                        normal: normalized.raw(),
-                    },
-                ))
+                out.push(EGraphPatternWitness {
+                    raw: witness,
+                    normal: normalized.raw(),
+                });
+                Some(normalized)
             }
             Pattern::App(function, argument) => {
-                let (function, function_recipe) = self.pattern_recipe(function, subst)?;
-                let (argument, argument_recipe) = self.pattern_recipe(argument, subst)?;
+                let function = self.pattern_witnesses(function, subst, out)?;
+                let argument = self.pattern_witnesses(argument, subst, out)?;
                 let node = Node::App(function, argument);
                 let witness = *self.memo.get(&node)?;
                 let normalized = self.find_mut(&Id::new(Lift::identity(0), witness));
-                Some((
-                    normalized,
-                    EGraphPatternRecipe::App {
-                        witness,
-                        normal: normalized.raw(),
-                        function: Box::new(function_recipe),
-                        argument: Box::new(argument_recipe),
-                    },
-                ))
+                out.push(EGraphPatternWitness {
+                    raw: witness,
+                    normal: normalized.raw(),
+                });
+                Some(normalized)
             }
             _ => None,
         }
@@ -1250,29 +1246,17 @@ impl EGraph {
     fn named_rewrite_reason(
         &mut self,
         rule: &Rewrite,
+        schema: EGraphRewriteSchemaId,
         target: &Id,
         replacement: &Id,
         subst: &Subst,
     ) -> Option<EGraphUnionReason> {
-        let name = rule.name()?.to_owned();
-        fn supported(pattern: &Pattern) -> bool {
-            match pattern {
-                Pattern::MetaVar(_, arguments) => arguments.is_empty(),
-                Pattern::Atom(_) => true,
-                Pattern::App(function, argument) => supported(function) && supported(argument),
-                _ => false,
-            }
-        }
-        if target.ctx() != 0
-            || replacement.ctx() != 0
-            || !supported(rule.lhs())
-            || !supported(rule.rhs())
-        {
+        if target.ctx() != 0 || replacement.ctx() != 0 {
             return None;
         }
         let target_root = self.find_mut(target);
         let replacement_root = self.find_mut(replacement);
-        let arguments: Option<Vec<_>> = rule
+        let arguments: Option<SmallVec<[RawId; 4]>> = rule
             .metavariables()
             .iter()
             .map(|name| {
@@ -1289,22 +1273,24 @@ impl EGraph {
         if self.pattern_is_definitionally(rule.lhs(), subst, target.raw())
             && self.pattern_is_definitionally(rule.rhs(), subst, replacement.raw())
         {
-            return Some(EGraphUnionReason::RewriteDirect { name, arguments });
+            return Some(EGraphUnionReason::RewriteDirect { schema, arguments });
         }
 
         // Retain only the raw witnesses needed to reconstruct normalization.
         // The Lean proof arena is populated later, and only for rewrite edges
         // selected by the final explanation.
-        let (left, left_recipe) = self.pattern_recipe(rule.lhs(), subst)?;
-        let (right, right_recipe) = self.pattern_recipe(rule.rhs(), subst)?;
+        let mut witnesses = Vec::new();
+        let left = self.pattern_witnesses(rule.lhs(), subst, &mut witnesses)?;
+        let left_len = witnesses.len();
+        let right = self.pattern_witnesses(rule.rhs(), subst, &mut witnesses)?;
         if left != target_root || right != replacement_root {
             return None;
         }
         Some(EGraphUnionReason::Rewrite {
-            name,
+            schema,
             arguments,
-            left: left_recipe,
-            right: right_recipe,
+            left_len,
+            witnesses,
         })
     }
     fn try_instantiate_metavars_rec(
@@ -1415,6 +1401,17 @@ impl EGraph {
         // Saturation usually grows the match set, so retain each rule's
         // allocation across rounds while preserving search-then-apply.
         let mut matches_by_rule: Vec<Vec<(Id, Subst)>> = vec![Vec::new(); rules.len()];
+        let proof_schemas = if let Some(proofs) = &mut self.proofs {
+            rules
+                .iter()
+                .map(|rule| {
+                    rule.name()
+                        .and_then(|name| proofs.rewrite_schema(name, rule.lhs(), rule.rhs()))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![None; rules.len()]
+        };
         while stats.rounds < limit {
             let before_nodes = self.memo.len();
 
@@ -1433,7 +1430,8 @@ impl EGraph {
             let rebuild_before = self.rebuild_time_total;
             self.rev_tracked = rules.iter().any(|rule| rule.rhs_needs_traversal);
             let mut changed = false;
-            for (rule, matches) in rules.iter().zip(&mut matches_by_rule) {
+            for (rule_index, (rule, matches)) in rules.iter().zip(&mut matches_by_rule).enumerate()
+            {
                 for (target, subst) in matches.drain(..) {
                     if let Some(replacement) =
                         self.try_instantiate_metavars(rule.rhs(), target.ctx(), &subst)
@@ -1442,9 +1440,16 @@ impl EGraph {
                             continue;
                         }
                         let unioned = if self.proofs.is_some() && rule.name().is_some() {
-                            let Some(reason) =
-                                self.named_rewrite_reason(rule, &target, &replacement, &subst)
-                            else {
+                            let Some(schema) = proof_schemas[rule_index] else {
+                                continue;
+                            };
+                            let Some(reason) = self.named_rewrite_reason(
+                                rule,
+                                schema,
+                                &target,
+                                &replacement,
+                                &subst,
+                            ) else {
                                 continue;
                             };
                             self.union_with_reason(&target, &replacement, Some(reason))

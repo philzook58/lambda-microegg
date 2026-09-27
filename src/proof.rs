@@ -1,34 +1,11 @@
 use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
 
-use crate::RawId;
+use crate::{Pattern, RawId};
 
 /// An index into the proof-expression arena.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProofId(pub(crate) u32);
-
-/// Errors returned when asking a proof-disabled or disconnected union-find for a certificate.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ProofError {
-    TrackingDisabled,
-    UnknownName(String),
-    NotEquivalent { left: String, right: String },
-    Unsupported(String),
-}
-
-impl std::fmt::Display for ProofError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TrackingDisabled => write!(formatter, "proof tracking is disabled"),
-            Self::UnknownName(name) => write!(formatter, "unknown term {name:?}"),
-            Self::NotEquivalent { left, right } => {
-                write!(formatter, "{left:?} and {right:?} are not equivalent")
-            }
-            Self::Unsupported(message) => {
-                write!(formatter, "unsupported proof operation: {message}")
-            }
-        }
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum EGraphProofTerm {
@@ -95,20 +72,8 @@ struct EGraphExplanationPath {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum EGraphReasonKind {
     Definitional,
-    Assumption {
-        index: usize,
-        label: String,
-    },
-    RewriteDirect {
-        name: String,
-        arguments: Vec<RawId>,
-    },
-    Rewrite {
-        name: String,
-        arguments: Vec<RawId>,
-        left: EGraphPatternRecipe,
-        right: EGraphPatternRecipe,
-    },
+    Assumption(u32),
+    Rewrite(EGraphRewriteReasonId),
     Congruence {
         left_function: RawId,
         right_function: RawId,
@@ -118,25 +83,33 @@ enum EGraphReasonKind {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum EGraphPatternRecipe {
-    Raw {
-        raw: RawId,
-        normal: RawId,
-    },
-    App {
-        witness: RawId,
-        normal: RawId,
-        function: Box<EGraphPatternRecipe>,
-        argument: Box<EGraphPatternRecipe>,
-    },
+/// One entry in a rule's postfix pattern shape, resolved at a successful union.
+pub(crate) struct EGraphPatternWitness {
+    pub(crate) raw: RawId,
+    pub(crate) normal: RawId,
 }
 
-impl EGraphPatternRecipe {
-    fn normal(&self) -> RawId {
-        match self {
-            Self::Raw { normal, .. } | Self::App { normal, .. } => *normal,
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct EGraphRewriteSchemaId(u32);
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct EGraphRewriteSchema {
+    name: String,
+    // `false` is a leaf and `true` combines the top two stack entries as an application.
+    left_apps: Vec<bool>,
+    right_apps: Vec<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct EGraphRewriteReasonId(u32);
+
+#[derive(Clone, Debug)]
+struct EGraphRewriteReason {
+    schema: EGraphRewriteSchemaId,
+    arguments: SmallVec<[RawId; 4]>,
+    left_len: usize,
+    // Left witnesses followed by right witnesses, each aligned with its shared schema.
+    witnesses: Vec<EGraphPatternWitness>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -160,14 +133,14 @@ pub(crate) enum EGraphUnionReason {
         label: String,
     },
     RewriteDirect {
-        name: String,
-        arguments: Vec<RawId>,
+        schema: EGraphRewriteSchemaId,
+        arguments: SmallVec<[RawId; 4]>,
     },
     Rewrite {
-        name: String,
-        arguments: Vec<RawId>,
-        left: EGraphPatternRecipe,
-        right: EGraphPatternRecipe,
+        schema: EGraphRewriteSchemaId,
+        arguments: SmallVec<[RawId; 4]>,
+        left_len: usize,
+        witnesses: Vec<EGraphPatternWitness>,
     },
     Congruence {
         left_function: RawId,
@@ -185,6 +158,11 @@ pub(crate) struct EGraphProofState {
     explain_edges: Vec<Option<EGraphExplainEdge>>,
     explain_sizes: Vec<usize>,
     reasons: Vec<EGraphReasonNode>,
+    assumption_reasons: Vec<(usize, String)>,
+    // Rewrite payloads are out of line so ordinary congruence reasons remain small.
+    rewrite_reasons: Vec<EGraphRewriteReason>,
+    rewrite_schemas: Vec<EGraphRewriteSchema>,
+    rewrite_schema_memo: HashMap<EGraphRewriteSchema, EGraphRewriteSchemaId>,
     assumptions: usize,
     unsupported: Option<String>,
 
@@ -193,11 +171,48 @@ pub(crate) struct EGraphProofState {
     proof_memo: HashMap<EGraphProofNode, ProofId>,
     terms: Vec<EGraphTermNode>,
     term_memo: HashMap<EGraphTermNode, EGraphTermId>,
-    raw_terms: Vec<Option<EGraphTermId>>,
+    raw_terms: HashMap<RawId, EGraphTermId>,
     materialized_reasons: Vec<Option<ProofId>>,
 }
 
 impl EGraphProofState {
+    pub(crate) fn rewrite_schema(
+        &mut self,
+        name: &str,
+        left: &Pattern,
+        right: &Pattern,
+    ) -> Option<EGraphRewriteSchemaId> {
+        fn shape(pattern: &Pattern, out: &mut Vec<bool>) -> Option<()> {
+            match pattern {
+                Pattern::MetaVar(_, arguments) if arguments.is_empty() => out.push(false),
+                Pattern::Atom(_) => out.push(false),
+                Pattern::App(function, argument) => {
+                    shape(function, out)?;
+                    shape(argument, out)?;
+                    out.push(true);
+                }
+                _ => return None,
+            }
+            Some(())
+        }
+        let mut left_apps = Vec::new();
+        let mut right_apps = Vec::new();
+        shape(left, &mut left_apps)?;
+        shape(right, &mut right_apps)?;
+        let schema = EGraphRewriteSchema {
+            name: name.to_owned(),
+            left_apps,
+            right_apps,
+        };
+        if let Some(&id) = self.rewrite_schema_memo.get(&schema) {
+            return Some(id);
+        }
+        let id = EGraphRewriteSchemaId(self.rewrite_schemas.len() as u32);
+        self.rewrite_schemas.push(schema.clone());
+        self.rewrite_schema_memo.insert(schema, id);
+        Some(id)
+    }
+
     pub(crate) fn step_count(&self) -> usize {
         self.arena.len()
     }
@@ -240,7 +255,6 @@ impl EGraphProofState {
     pub(crate) fn make_set(&mut self, raw: RawId, context: usize) {
         assert_eq!(self.definitions.len(), raw as usize);
         self.definitions.push(None);
-        self.raw_terms.push(None);
         self.explain_parents.push(raw);
         self.explain_edges.push(None);
         self.explain_sizes.push(1);
@@ -260,11 +274,11 @@ impl EGraphProofState {
     }
 
     pub(crate) fn raw_term(&mut self, raw: RawId) -> EGraphTermId {
-        if let Some(term) = self.raw_terms[raw as usize] {
+        if let Some(&term) = self.raw_terms.get(&raw) {
             return term;
         }
         let term = self.alloc_term(EGraphTermNode::Raw(raw));
-        self.raw_terms[raw as usize] = Some(term);
+        self.raw_terms.insert(raw, term);
         term
     }
 
@@ -537,7 +551,6 @@ impl EGraphProofState {
         );
         let reason = EGraphReasonId(self.reasons.len() as u32);
         self.reasons.push(node);
-        self.materialized_reasons.push(None);
         reason
     }
 
@@ -556,22 +569,35 @@ impl EGraphProofState {
         let kind = match reason {
             EGraphUnionReason::Definitional => EGraphReasonKind::Definitional,
             EGraphUnionReason::Assumption { index, label } => {
-                EGraphReasonKind::Assumption { index, label }
+                let id = self.assumption_reasons.len() as u32;
+                self.assumption_reasons.push((index, label));
+                EGraphReasonKind::Assumption(id)
             }
-            EGraphUnionReason::RewriteDirect { name, arguments } => {
-                EGraphReasonKind::RewriteDirect { name, arguments }
+            EGraphUnionReason::RewriteDirect { schema, arguments } => {
+                let id = EGraphRewriteReasonId(self.rewrite_reasons.len() as u32);
+                self.rewrite_reasons.push(EGraphRewriteReason {
+                    schema,
+                    arguments,
+                    left_len: 0,
+                    witnesses: Vec::new(),
+                });
+                EGraphReasonKind::Rewrite(id)
             }
             EGraphUnionReason::Rewrite {
-                name,
+                schema,
                 arguments,
-                left,
-                right,
-            } => EGraphReasonKind::Rewrite {
-                name,
-                arguments,
-                left,
-                right,
-            },
+                left_len,
+                witnesses,
+            } => {
+                let id = EGraphRewriteReasonId(self.rewrite_reasons.len() as u32);
+                self.rewrite_reasons.push(EGraphRewriteReason {
+                    schema,
+                    arguments,
+                    left_len,
+                    witnesses,
+                });
+                EGraphReasonKind::Rewrite(id)
+            }
             EGraphUnionReason::Congruence {
                 left_function,
                 right_function,
@@ -618,30 +644,36 @@ impl EGraphProofState {
         let node = self.reasons[reason.0 as usize].clone();
         let proof = match node.kind {
             EGraphReasonKind::Definitional => self.refl_between(node.left, node.right),
-            EGraphReasonKind::Assumption { index, label } => {
+            EGraphReasonKind::Assumption(assumption) => {
+                let (index, label) = self.assumption_reasons[assumption as usize].clone();
                 let left = self.raw_term(node.left);
                 let right = self.raw_term(node.right);
                 self.alloc(left, right, EGraphProofKind::Assumption { index, label })
             }
-            EGraphReasonKind::RewriteDirect { name, arguments } => {
-                let left = self.raw_term(node.left);
-                let right = self.raw_term(node.right);
-                self.rewrite(left, right, name, arguments)
-            }
-            EGraphReasonKind::Rewrite {
-                name,
-                arguments,
-                left,
-                right,
-            } => {
-                let left_normal = left.normal();
-                let right_normal = right.normal();
-                let (left_term, left_normalization) = self.materialize_pattern_recipe(&left);
-                let (right_term, right_normalization) = self.materialize_pattern_recipe(&right);
+            EGraphReasonKind::Rewrite(rewrite) => {
+                let rewrite = self.rewrite_reasons[rewrite.0 as usize].clone();
+                let schema = rewrite.schema;
+                let arguments = rewrite.arguments;
+                let schema = self.rewrite_schemas[schema.0 as usize].clone();
+                if rewrite.left_len == 0 {
+                    let left = self.raw_term(node.left);
+                    let right = self.raw_term(node.right);
+                    let proof = self.rewrite(left, right, schema.name, arguments.into_vec());
+                    self.materialized_reasons[reason.0 as usize] = Some(proof);
+                    return proof;
+                }
+                let (left, right) = rewrite.witnesses.split_at(rewrite.left_len);
+                let left_normal = left.last().expect("nonempty left pattern").normal;
+                let right_normal = right.last().expect("nonempty right pattern").normal;
+                let (left_term, left_normalization) =
+                    self.materialize_pattern(&schema.left_apps, left);
+                let (right_term, right_normalization) =
+                    self.materialize_pattern(&schema.right_apps, right);
                 let target_path = self.proof_between(node.left, left_normal);
                 let left_back = self.symm(left_normalization);
                 let proof = self.trans(target_path, left_back);
-                let rewrite = self.rewrite(left_term, right_term, name, arguments);
+                let rewrite =
+                    self.rewrite(left_term, right_term, schema.name, arguments.into_vec());
                 let proof = self.trans(proof, rewrite);
                 let proof = self.trans(proof, right_normalization);
                 let replacement_path = self.proof_between(node.right, right_normal);
@@ -666,36 +698,37 @@ impl EGraphProofState {
         proof
     }
 
-    fn materialize_pattern_recipe(
+    fn materialize_pattern(
         &mut self,
-        recipe: &EGraphPatternRecipe,
+        apps: &[bool],
+        witnesses: &[EGraphPatternWitness],
     ) -> (EGraphTermId, ProofId) {
-        match recipe {
-            EGraphPatternRecipe::Raw { raw, normal } => {
-                let term = self.raw_term(*raw);
-                let proof = self.proof_between(*raw, *normal);
-                (term, proof)
-            }
-            EGraphPatternRecipe::App {
-                witness,
-                normal,
-                function,
-                argument,
-            } => {
-                let (function_term, function_proof) = self.materialize_pattern_recipe(function);
-                let (argument_term, argument_proof) = self.materialize_pattern_recipe(argument);
+        let mut stack = Vec::new();
+        for (&is_app, witness) in apps.iter().zip(witnesses) {
+            if is_app {
+                let (argument_term, argument_proof, argument_normal) =
+                    stack.pop().expect("application argument");
+                let (function_term, function_proof, function_normal) =
+                    stack.pop().expect("application function");
                 let expression = self.app_term(function_term, argument_term);
                 let expression_to_normal = self.congr_terms(function_proof, argument_proof);
                 let witness_to_normal = self
-                    .raw_app_to(*witness, function.normal(), argument.normal())
+                    .raw_app_to(witness.raw, function_normal, argument_normal)
                     .expect("a rewrite application recipe retains an application witness");
                 let normal_to_witness = self.symm(witness_to_normal);
                 let expression_to_witness = self.trans(expression_to_normal, normal_to_witness);
-                let witness_to_root = self.proof_between(*witness, *normal);
+                let witness_to_root = self.proof_between(witness.raw, witness.normal);
                 let proof = self.trans(expression_to_witness, witness_to_root);
-                (expression, proof)
+                stack.push((expression, proof, witness.normal));
+            } else {
+                let term = self.raw_term(witness.raw);
+                let proof = self.proof_between(witness.raw, witness.normal);
+                stack.push((term, proof, witness.normal));
             }
         }
+        assert_eq!(stack.len(), 1, "well-formed pattern schema");
+        let (term, proof, _) = stack.pop().unwrap();
+        (term, proof)
     }
 
     fn materialize_path(&mut self, path: EGraphExplanationPath) -> ProofId {
@@ -714,6 +747,9 @@ impl EGraphProofState {
     }
 
     pub(crate) fn proof_between(&mut self, left: RawId, right: RawId) -> ProofId {
+        if self.materialized_reasons.len() < self.reasons.len() {
+            self.materialized_reasons.resize(self.reasons.len(), None);
+        }
         let path = self.explanation_path(left, right);
         self.materialize_path(path)
     }
@@ -940,6 +976,30 @@ pub struct EGraphProofStats {
     pub expression_terms: usize,
     pub explanation_edges: usize,
     pub explanation_reasons: usize,
+}
+
+/// Errors returned when asking a proof-disabled or disconnected union-find for a certificate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProofError {
+    TrackingDisabled,
+    UnknownName(String),
+    NotEquivalent { left: String, right: String },
+    Unsupported(String),
+}
+
+impl std::fmt::Display for ProofError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TrackingDisabled => write!(formatter, "proof tracking is disabled"),
+            Self::UnknownName(name) => write!(formatter, "unknown term {name:?}"),
+            Self::NotEquivalent { left, right } => {
+                write!(formatter, "{left:?} and {right:?} are not equivalent")
+            }
+            Self::Unsupported(message) => {
+                write!(formatter, "unsupported proof operation: {message}")
+            }
+        }
+    }
 }
 
 #[cfg(test)]
