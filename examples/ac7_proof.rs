@@ -34,7 +34,7 @@ fn main() {
     let certificate = egraph
         .lean_proof(
             "ac7",
-            "{α : Type} (app : α → α → α) (plus x0 x1 x2 x3 x4 x5 x6 : α)",
+            "{α : Type} (plus : α → α → α) (x0 x1 x2 x3 x4 x5 x6 : α)",
             &input,
             &goal,
         )

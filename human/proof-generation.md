@@ -18,15 +18,17 @@ available.
 The context-zero fragment is now integrated into `EGraph`: atoms and binary applications, without
 variables, binders, or non-identity lifts. `EGraph::new_with_proofs` allocates parallel proof state;
 ordinary `EGraph::new` pays no proof-arena cost. Each raw e-class retains its immutable defining
-node. Rebuild justifies application memo collisions with `congrArg`, and unions carry
-those proofs through parent links and path compression. `EGraph::lean_proof` traverses the proof
+node. Rebuild justifies application memo collisions with Lean's application congruence combinators,
+and unions carry those proofs through parent links and path compression. `EGraph::lean_proof` traverses the proof
 backwards and prints only live term and proof bindings, preserving their arena IDs rather than
 densely renumbering them. `examples/proof_egraph.rs` demonstrates `a = b` producing `f a = f b` and
 the test suite asks Lean to check the result.
 
 Application congruence uses the direct core Lean combinator for each shape: `congrArg` when only the
-argument changes, `congrFun (congrArg app ...)` when only the function changes, and
-`congr (congrArg app ...)` when both change.
+argument changes, `congrFun` when only the function changes, and `congr` when both
+change. Generated Lean uses native function application, so the certificate context gives symbols
+their actual function types instead of supplying an untyped `app` symbol. This also makes Lean reject
+any certificate in which the otherwise-untyped e-graph has combined applications inconsistently.
 
 Unnamed rewrite applications become explicit theorem assumptions. Operations involving variables,
 binders, dependency shrinking, or non-identity lifts record a precise unsupported-operation error

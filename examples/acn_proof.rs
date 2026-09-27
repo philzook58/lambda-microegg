@@ -47,9 +47,9 @@ fn main() {
         .collect::<Vec<_>>()
         .join(" ");
     let binders = format!(
-        "{{α : Type}} (app : α → α → α) (plus {atom_binders} : α) \
-         (assoc : ∀ a b c, app (app plus (app (app plus a) b)) c = app (app plus a) (app (app plus b) c)) \
-         (comm : ∀ a b, app (app plus a) b = app (app plus b) a)"
+        "{{α : Type}} (plus : α → α → α) ({atom_binders} : α) \
+         (assoc : ∀ a b c, plus (plus a b) c = plus a (plus b c)) \
+         (comm : ∀ a b, plus a b = plus b a)"
     );
     let render_started = Instant::now();
     let certificate = egraph

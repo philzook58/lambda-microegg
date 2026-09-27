@@ -37,9 +37,9 @@ fn main() {
     let certificate = egraph
         .lean_proof(
             "ac3",
-            "{α : Type} (app : α → α → α) (plus x0 x1 x2 : α) \
-             (assoc : ∀ a b c, app (app plus (app (app plus a) b)) c = app (app plus a) (app (app plus b) c)) \
-             (comm : ∀ a b, app (app plus a) b = app (app plus b) a)",
+            "{α : Type} (plus : α → α → α) (x0 x1 x2 : α) \
+             (assoc : ∀ a b c, plus (plus a b) c = plus a (plus b c)) \
+             (comm : ∀ a b, plus a b = plus b a)",
             &input,
             &goal,
         )

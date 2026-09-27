@@ -478,11 +478,15 @@ impl EGraphProofState {
     fn source_term(&self, raw: RawId) -> Result<String, ProofError> {
         match self.definitions[raw as usize].as_ref() {
             Some(EGraphProofTerm::Atom(name)) => Ok(name.clone()),
-            Some(EGraphProofTerm::App(function, argument)) => Ok(format!(
-                "app ({}) ({})",
-                self.source_term(*function)?,
-                self.source_term(*argument)?
-            )),
+            Some(EGraphProofTerm::App(function, argument)) => {
+                let function = self.source_term(*function)?;
+                let argument_text = self.source_term(*argument)?;
+                let argument = match self.definitions[*argument as usize].as_ref() {
+                    Some(EGraphProofTerm::App(_, _)) => format!("({argument_text})"),
+                    _ => argument_text,
+                };
+                Ok(format!("{function} {argument}"))
+            }
             None => Err(ProofError::Unsupported(format!(
                 "e{raw} has no first-order definition"
             ))),
@@ -591,7 +595,7 @@ impl EGraphProofState {
             let expression = match self.definitions[raw].as_ref().expect("marked above") {
                 EGraphProofTerm::Atom(name) => name.clone(),
                 EGraphProofTerm::App(function, argument) => {
-                    format!("app e{function} e{argument}")
+                    format!("e{function} e{argument}")
                 }
             };
             output.push_str(&format!("  let e{raw} := {expression}\n"));
@@ -604,7 +608,7 @@ impl EGraphProofState {
                 unreachable!()
             };
             output.push_str(&format!(
-                "  let t{index} := app {} {}\n",
+                "  let t{index} := {} {}\n",
                 self.term_name(*function),
                 self.term_name(*argument)
             ));
@@ -620,17 +624,13 @@ impl EGraphProofState {
                     format!("Eq.trans p{} p{}", first.0, second.0)
                 }
                 EGraphProofKind::CongApp(function, argument) => {
-                    format!("congr (congrArg app p{}) p{}", function.0, argument.0)
+                    format!("congr p{} p{}", function.0, argument.0)
                 }
                 EGraphProofKind::CongFunction { argument, proof } => {
-                    format!(
-                        "congrFun (congrArg app p{}) {}",
-                        proof.0,
-                        self.term_name(argument)
-                    )
+                    format!("congrFun p{} {}", proof.0, self.term_name(argument))
                 }
                 EGraphProofKind::CongArgument { function, proof } => {
-                    format!("congrArg (app {}) p{}", self.term_name(function), proof.0)
+                    format!("congrArg {} p{}", self.term_name(function), proof.0)
                 }
                 EGraphProofKind::Rewrite {
                     ref name,
@@ -989,12 +989,12 @@ mod tests {
         let certificate = egraph
             .lean_proof(
                 "first_order_congruence",
-                "{α : Type} (app : α → α → α) (f a b : α)",
+                "{α : Type} (f : α → α) (a b : α)",
                 &fa,
                 &fb,
             )
             .unwrap();
-        assert!(certificate.contains("congrArg (app e0)"));
+        assert!(certificate.contains("congrArg e0"));
         assert!(!certificate.contains("irrelevant equality"));
         assert!(!certificate.contains("let e5"));
         assert!(!certificate.contains("let p0"));
@@ -1036,7 +1036,7 @@ mod tests {
         let certificate = egraph
             .lean_proof(
                 "two_child_congruence",
-                "{α : Type} (app : α → α → α) (f g a b : α)",
+                "{α β : Type} (f g : α → β) (a b : α)",
                 &fa,
                 &gb,
             )
@@ -1078,12 +1078,12 @@ mod tests {
         let certificate = egraph
             .lean_proof(
                 "function_congruence",
-                "{α : Type} (app : α → α → α) (f g a : α)",
+                "{α β : Type} (f g : α → β) (a : α)",
                 &fa,
                 &ga,
             )
             .unwrap();
-        assert!(certificate.contains("congrFun (congrArg app"));
+        assert!(certificate.contains("congrFun"));
 
         let Ok(mut lean) = Command::new("lean")
             .arg("--stdin")
@@ -1132,8 +1132,8 @@ mod tests {
         let certificate = egraph
             .lean_proof(
                 "two_rewrites",
-                "{α : Type} (app : α → α → α) (plus zero x : α) \
-                 (r1 : ∀ a, app (app plus a) zero = a)",
+                "{α : Type} (plus : α → α → α) (zero x : α) \
+                 (r1 : ∀ a, plus a zero = a)",
                 &outer,
                 &x,
             )

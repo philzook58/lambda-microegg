@@ -19,8 +19,8 @@ fn main() {
         egraph
             .lean_proof(
                 "two_rewrites",
-                "{α : Type} (app : α → α → α) (plus zero x : α) \
-                 (r1 : ∀ a, app (app plus a) zero = a)",
+                "{α : Type} (plus : α → α → α) (zero x : α) \
+                 (r1 : ∀ a, plus a zero = a)",
                 &outer,
                 &x,
             )

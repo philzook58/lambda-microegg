@@ -20,7 +20,7 @@ fn main() {
         egraph
             .lean_proof(
                 "first_order_congruence",
-                "{α : Type} (app : α → α → α) (f a b : α)",
+                "{α : Type} (f : α → α) (a b : α)",
                 &fa,
                 &fb,
             )
