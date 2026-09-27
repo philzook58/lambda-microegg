@@ -4,16 +4,36 @@ Proof data should be parallel to the operational e-graph data rather than part o
 `Id` already carries a lift, and proof tracking should be removable without changing its size or the
 hot paths that pass it around.
 
-The implementation starts with `ProofUnionFind` in `src/proof.rs`. Its ordinary data is a parent
-array and a name memo. With proofs enabled, an optional state adds three parallel structures:
+The implementation starts with `ProofUnionFind` in `src/proof.rs`. Its ordinary data is a
+size-balanced, path-compressed parent array and a name memo. With proofs enabled, an optional state
+adds a second, uncompressed explanation forest in the style of
+[Nieuwenhuis and Oliveras](https://www.cs.upc.edu/~oliveras/rta05.pdf):
 
 - an arena of typed proof constructors (`Refl`, `Symm`, `Trans`, and external assumptions);
-- one proof ID per parent edge;
+- a proof parent and an atomic union reason per explanation-forest edge;
 - one proof ID per memo entry, relating the external term to its allocated e-class name.
 
-No constructor contains rendered Lean text. Rendering happens once, when `lean_proof` emits term
-and proof `let` bindings. The generated theorem is checked by Lean in the test suite when `lean` is
-available.
+Successful unions reroot the smaller component's explanation tree at the union endpoint and connect
+it to the other endpoint. Rerooting flips edge directions without allocating proof terms. Ordinary
+`find` can therefore compress paths freely without changing explanations. At print time, the unique
+path between the requested terms selects the nonredundant union assumptions before dead-code
+traversal selects the proof-arena nodes. No constructor contains rendered Lean text. Rendering
+happens once, when `lean_proof` emits term and proof `let` bindings. The generated theorem is checked
+by Lean in the test suite when `lean` is available.
+
+For a fixed pseudorandom spanning tree, asking for `x0 = x(n-1)` gives the following standalone
+certificate sizes. “Eager” is the earlier design that stored composed proofs on compressed
+union-find parent edges; “double” is the separate explanation forest.
+
+| Nodes | Eager arena | Double arena | Eager assumptions | Double assumptions | Eager bytes | Double bytes |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 | 46 | 22 | 4 | 1 | 1,010 | 363 |
+| 20 | 93 | 49 | 11 | 5 | 2,120 | 1,040 |
+| 30 | 138 | 65 | 16 | 4 | 3,192 | 844 |
+
+`examples/proof_union_find_random.rs` reproduces the workload. The checked three-, four-, and
+five-node certificates are kept in `proofs/UnionFindRandom{3,4,5}.lean` so the selected paths are
+easy to inspect.
 
 The context-zero fragment is now integrated into `EGraph`: atoms and binary applications, without
 variables, binders, or non-identity lifts. `EGraph::new_with_proofs` allocates parallel proof state;

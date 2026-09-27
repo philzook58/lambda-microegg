@@ -41,11 +41,24 @@ struct ProofNode {
     kind: ProofKind,
 }
 
+/// One directed edge in the explanation forest.
+///
+/// `reason` is the equality supplied to the successful union. `reversed` says that the forest
+/// edge is currently directed opposite to that equality. Rerooting only flips this bit; it does
+/// not eagerly allocate `Eq.symm` nodes in the proof arena.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExplainEdge {
+    reason: ProofId,
+    reversed: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 struct ProofState {
     arena: Vec<ProofNode>,
-    /// Proof that each union-find entry equals its current parent entry.
-    parent_proofs: Vec<ProofId>,
+    /// The separate, uncompressed proof forest used to select explanations.
+    explain_parents: Vec<Id>,
+    /// The equality justifying each edge to `explain_parents`; roots have no edge.
+    explain_edges: Vec<Option<ExplainEdge>>,
     /// Proof that each named term equals the e-class allocated for it.
     memo_proofs: HashMap<String, ProofId>,
     assumptions: usize,
@@ -57,10 +70,6 @@ impl ProofState {
         let id = ProofId(self.arena.len() as u32);
         self.arena.push(ProofNode { left, right, kind });
         id
-    }
-
-    fn refl(&mut self, endpoint: Endpoint) -> ProofId {
-        self.alloc(endpoint.clone(), endpoint, ProofKind::Refl)
     }
 
     fn symm(&mut self, proof: ProofId) -> ProofId {
@@ -103,6 +112,81 @@ impl ProofState {
             Endpoint::Id(right),
             ProofKind::Assumption { index, label },
         )
+    }
+
+    fn reroot_explanation(&mut self, node: Id) {
+        let mut current = node;
+        let mut parent = self.explain_parents[current as usize];
+        let mut edge = self.explain_edges[current as usize].take();
+        self.explain_parents[current as usize] = current;
+
+        while parent != current {
+            let next_parent = self.explain_parents[parent as usize];
+            let next_edge = self.explain_edges[parent as usize].take();
+            let current_edge = edge.expect("a non-root explanation node has an edge");
+            self.explain_parents[parent as usize] = current;
+            self.explain_edges[parent as usize] = Some(ExplainEdge {
+                reason: current_edge.reason,
+                reversed: !current_edge.reversed,
+            });
+            current = parent;
+            parent = next_parent;
+            edge = next_edge;
+        }
+    }
+
+    fn link_explanations(&mut self, child: Id, parent: Id, reason: ProofId, reversed: bool) {
+        self.reroot_explanation(child);
+        debug_assert_eq!(self.explain_parents[child as usize], child);
+        debug_assert!(self.explain_edges[child as usize].is_none());
+        self.explain_parents[child as usize] = parent;
+        self.explain_edges[child as usize] = Some(ExplainEdge { reason, reversed });
+    }
+
+    fn oriented_edge(&mut self, edge: ExplainEdge) -> ProofId {
+        if edge.reversed {
+            self.symm(edge.reason)
+        } else {
+            edge.reason
+        }
+    }
+
+    fn explanation_paths(&self, left: Id, right: Id) -> (Vec<ExplainEdge>, Vec<ExplainEdge>) {
+        let mut left_depths = vec![None; self.explain_parents.len()];
+        let mut left_edges = Vec::new();
+        let mut current = left;
+        loop {
+            left_depths[current as usize] = Some(left_edges.len());
+            let parent = self.explain_parents[current as usize];
+            if parent == current {
+                break;
+            }
+            left_edges.push(
+                self.explain_edges[current as usize]
+                    .expect("a non-root explanation node has an edge"),
+            );
+            current = parent;
+        }
+
+        let mut right_edges = Vec::new();
+        current = right;
+        let common_depth = loop {
+            if let Some(depth) = left_depths[current as usize] {
+                break depth;
+            }
+            let parent = self.explain_parents[current as usize];
+            assert_ne!(
+                parent, current,
+                "equivalent entries must share an explanation root"
+            );
+            right_edges.push(
+                self.explain_edges[current as usize]
+                    .expect("a non-root explanation node has an edge"),
+            );
+            current = parent;
+        };
+        left_edges.truncate(common_depth);
+        (left_edges, right_edges)
     }
 
     fn live_from(&self, conclusion: ProofId) -> Vec<bool> {
@@ -670,6 +754,7 @@ impl std::error::Error for ProofError {}
 #[derive(Clone, Debug)]
 pub struct ProofUnionFind {
     parents: Vec<Id>,
+    sizes: Vec<usize>,
     memo: HashMap<String, Id>,
     names: Vec<String>,
     proofs: Option<ProofState>,
@@ -679,6 +764,7 @@ impl ProofUnionFind {
     pub fn new(track_proofs: bool) -> Self {
         Self {
             parents: Vec::new(),
+            sizes: Vec::new(),
             memo: HashMap::default(),
             names: Vec::new(),
             proofs: track_proofs.then(ProofState::default),
@@ -700,6 +786,7 @@ impl ProofUnionFind {
         );
         let id = self.parents.len() as Id;
         self.parents.push(id);
+        self.sizes.push(1);
         self.names.push(name.clone());
         self.memo.insert(name.clone(), id);
         if let Some(proofs) = &mut self.proofs {
@@ -708,9 +795,9 @@ impl ProofUnionFind {
                 Endpoint::Id(id),
                 ProofKind::Refl,
             );
-            let parent_proof = proofs.refl(Endpoint::Id(id));
             proofs.memo_proofs.insert(name, memo_proof);
-            proofs.parent_proofs.push(parent_proof);
+            proofs.explain_parents.push(id);
+            proofs.explain_edges.push(None);
         }
         id
     }
@@ -721,11 +808,6 @@ impl ProofUnionFind {
             return id;
         }
         let root = self.find(parent);
-        if let Some(proofs) = &mut self.proofs {
-            let edge = proofs.parent_proofs[id as usize];
-            let suffix = proofs.parent_proofs[parent as usize];
-            proofs.parent_proofs[id as usize] = proofs.trans(edge, suffix);
-        }
         self.parents[id as usize] = root;
         root
     }
@@ -740,16 +822,22 @@ impl ProofUnionFind {
         if left_root == right_root {
             return false;
         }
+        let left_is_smaller = self.sizes[left_root as usize] <= self.sizes[right_root as usize];
         if let Some(proofs) = &mut self.proofs {
-            let left_path = proofs.parent_proofs[left as usize];
-            let right_path = proofs.parent_proofs[right as usize];
             let assumption = proofs.assumption(left, right, label.into());
-            let left_path = proofs.symm(left_path);
-            let root_to_right = proofs.trans(left_path, assumption);
-            let root_to_root = proofs.trans(root_to_right, right_path);
-            proofs.parent_proofs[left_root as usize] = root_to_root;
+            if left_is_smaller {
+                proofs.link_explanations(left, right, assumption, false);
+            } else {
+                proofs.link_explanations(right, left, assumption, true);
+            }
         }
-        self.parents[left_root as usize] = right_root;
+        let (small_root, large_root) = if left_is_smaller {
+            (left_root, right_root)
+        } else {
+            (right_root, left_root)
+        };
+        self.parents[small_root as usize] = large_root;
+        self.sizes[large_root as usize] += self.sizes[small_root as usize];
         true
     }
 
@@ -783,13 +871,30 @@ impl ProofUnionFind {
         }
         let proofs = self.proofs.as_mut().expect("checked above");
         let left_memo = proofs.memo_proofs[left];
-        let left_path = proofs.parent_proofs[left_id as usize];
         let right_memo = proofs.memo_proofs[right];
-        let right_path = proofs.parent_proofs[right_id as usize];
-        let left_to_root = proofs.trans(left_memo, left_path);
-        let right_to_root = proofs.trans(right_memo, right_path);
-        let root_to_right = proofs.symm(right_to_root);
-        Ok(proofs.trans(left_to_root, root_to_right))
+        let (left_path, right_path) = proofs.explanation_paths(left_id, right_id);
+        let mut left_to_common = left_memo;
+        for edge in left_path {
+            let edge = proofs.oriented_edge(edge);
+            left_to_common = proofs.trans(left_to_common, edge);
+        }
+        let mut common_to_right = None;
+        for edge in right_path.into_iter().rev() {
+            let edge = proofs.oriented_edge(ExplainEdge {
+                reason: edge.reason,
+                reversed: !edge.reversed,
+            });
+            common_to_right = Some(match common_to_right {
+                Some(path) => proofs.trans(path, edge),
+                None => edge,
+            });
+        }
+        let right_memo = proofs.symm(right_memo);
+        let common_to_right = match common_to_right {
+            Some(path) => proofs.trans(path, right_memo),
+            None => right_memo,
+        };
+        Ok(proofs.trans(left_to_common, common_to_right))
     }
 
     /// Print a complete Lean theorem proving the requested equality.
@@ -896,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn prints_a_path_compressed_transitivity_proof() {
+    fn prints_an_explanation_path_transitivity_proof() {
         let mut union_find = ProofUnionFind::new(true);
         let a = union_find.make_set("a");
         let b = union_find.make_set("b");
@@ -911,6 +1016,28 @@ mod tests {
         assert!(lean.contains("Eq.trans"));
         assert!(!lean.contains("e0 = e0"));
         assert!(lean.ends_with('\n'));
+    }
+
+    #[test]
+    fn explanation_forest_omits_unions_beyond_the_requested_path() {
+        let mut union_find = ProofUnionFind::new(true);
+        let a = union_find.make_set("a");
+        let b = union_find.make_set("b");
+        let c = union_find.make_set("c");
+        let d = union_find.make_set("d");
+        union_find.union(a, b, "needed a-to-b");
+        union_find.union(c, d, "irrelevant c-to-d");
+        union_find.union(b, c, "irrelevant bridge");
+
+        let lean = union_find
+            .lean_proof("uf_direct", "{α : Type} (a b c d : α)", "a", "b")
+            .unwrap();
+        assert!(lean.contains("(h0 : a = b)"));
+        assert!(lean.contains("needed a-to-b"));
+        assert!(!lean.contains("irrelevant c-to-d"));
+        assert!(!lean.contains("irrelevant bridge"));
+        assert!(!lean.contains("(h1"));
+        assert!(!lean.contains("(h2"));
     }
 
     #[test]
