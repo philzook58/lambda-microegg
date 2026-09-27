@@ -1263,6 +1263,30 @@ impl EGraph {
         }
     }
 
+    fn pattern_is_definitionally(&self, pattern: &Pattern, subst: &Subst, raw: RawId) -> bool {
+        match pattern {
+            Pattern::MetaVar(name, arguments) if arguments.is_empty() => {
+                subst.get(name).is_some_and(|id| id.raw() == raw)
+            }
+            Pattern::Atom(name) => matches!(
+                self.proofs.as_ref().and_then(|proofs| proofs.definition(raw)),
+                Some(EGraphProofTerm::Atom(actual)) if actual == name.as_str()
+            ),
+            Pattern::App(function, argument) => {
+                let Some(EGraphProofTerm::App(function_raw, argument_raw)) = self
+                    .proofs
+                    .as_ref()
+                    .and_then(|proofs| proofs.definition(raw))
+                else {
+                    return false;
+                };
+                self.pattern_is_definitionally(function, subst, function_raw)
+                    && self.pattern_is_definitionally(argument, subst, argument_raw)
+            }
+            _ => false,
+        }
+    }
+
     fn named_rewrite_proof(
         &mut self,
         rule: &Rewrite,
@@ -1301,6 +1325,22 @@ impl EGraph {
             })
             .collect();
         let arguments = arguments?;
+
+        // When both stored terms unfold to this exact rule instance, Lean can
+        // check the theorem application at the raw endpoints by definitional
+        // reduction. This avoids manufacturing reflexivity and congruence
+        // steps merely to normalize the instantiated pattern.
+        if self.pattern_is_definitionally(rule.lhs(), subst, target.raw())
+            && self.pattern_is_definitionally(rule.rhs(), subst, replacement.raw())
+        {
+            let proofs = self.proofs.as_mut()?;
+            return Some(proofs.rewrite(
+                proofs.raw_term(target.raw()),
+                proofs.raw_term(replacement.raw()),
+                name,
+                arguments,
+            ));
+        }
 
         // Everything that can fail has now been checked. Only now allocate
         // normalization and rewrite proof nodes for this new union.

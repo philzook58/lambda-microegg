@@ -1140,6 +1140,8 @@ mod tests {
             .unwrap();
         assert_eq!(certificate.matches("r1 e").count(), 1);
         assert!(!certificate.contains("simpa"));
+        assert!(!certificate.contains("  let t"));
+        assert!(!certificate.contains(" := rfl"));
 
         let Ok(mut lean) = Command::new("lean")
             .arg("--stdin")

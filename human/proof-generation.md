@@ -41,6 +41,12 @@ node. The Lean printer applies the named rule and uses the already-recorded pare
 normalize it to the union endpoints. A failed RHS, unsupported normalization, or already-equal pair
 allocates no rewrite proof and performs no proof-producing union.
 
+When the stored endpoint definitions are exactly the instantiated rule sides, the rewrite node uses
+those raw endpoints directly and lets Lean unfold their local `let` bindings. If prior unions have
+made an equivalent but differently defined term the representative, the printer retains the explicit
+normalization path. This removes all synthetic normalization from the `(x + 0) + 0` example while
+remaining valid for later AC saturation rounds.
+
 ## Lifts
 
 An `n`-argument term can be interpreted as a function of its context. A lift is precomposition with
@@ -122,3 +128,8 @@ KB to 943 KB and increased checking from 6.95 to about 17.4 seconds. Inlining th
 slowed AC3 and expanding AC4 did not finish within 30 seconds. The next scaling step should select a
 smaller explanation after saturation, or invoke a larger proved normalization rule, rather than
 eliding the memo tables.
+
+A paired AC4 measurement of this definitional-reduction fast path reduced the checked certificate
+from 47,864 bytes and 1,279 lines to 43,106 bytes and 1,159 lines. Thirteen of the 48 live rewrite
+applications used the direct form. Across nine alternating runs, Lean checking averaged 0.858 seconds
+before and 0.772 seconds after; peak memory fell from roughly 575 MB to 557 MB.
