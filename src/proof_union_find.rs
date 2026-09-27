@@ -15,165 +15,80 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::proof::{ProofError, ProofId};
 use crate::{Id, Lift, RawId};
 
-/// Substitution of a smaller ambient context into a term's intrinsic context.
+/// A partial, order-preserving wiring from one context to another.
 ///
-/// `arguments[i] = Some(j)` sends source argument `i` to ambient variable `j`;
-/// `None` fills it with `default`. This is closed under compositions of lift and
-/// dump, unlike either operation by itself.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ContextMap {
-    ambient_arity: usize,
-    arguments: Vec<Option<usize>>,
+/// The two lifts share a domain. Their selected positions are connected; source
+/// positions not selected by `source` are dumped to `default`, and target positions
+/// not selected by `target` are ignored. Swapping them reverses the partial wiring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PartialThinning {
+    source: Lift,
+    target: Lift,
 }
 
-impl ContextMap {
+impl PartialThinning {
+    fn new(source: Lift, target: Lift) -> Self {
+        assert_eq!(source.dom(), target.dom());
+        Self { source, target }
+    }
+
     fn identity(arity: usize) -> Self {
-        Self {
-            ambient_arity: arity,
-            arguments: (0..arity).map(Some).collect(),
-        }
+        Self::new(Lift::identity(arity), Lift::identity(arity))
     }
 
     fn lift(thinning: Lift) -> Self {
-        Self {
-            ambient_arity: thinning.cod(),
-            arguments: (0..thinning.cod())
-                .filter(|&index| thinning.get(index))
-                .map(Some)
-                .collect(),
-        }
+        Self::new(Lift::identity(thinning.dom()), thinning)
+    }
+
+    fn dump(thinning: Lift) -> Self {
+        Self::lift(thinning).reverse()
     }
 
     fn is_identity(&self) -> bool {
-        self.arguments.len() == self.ambient_arity
-            && self
-                .arguments
-                .iter()
-                .enumerate()
-                .all(|(index, argument)| *argument == Some(index))
+        self.source == self.target && self.source.is_identity()
     }
 
-    /// Apply `outer` after this map.
+    fn reverse(&self) -> Self {
+        Self::new(self.target, self.source)
+    }
+
+    /// Apply `outer` after this partial wiring.
     fn then(&self, outer: &Self) -> Self {
-        assert_eq!(self.ambient_arity, outer.arguments.len());
-        Self {
-            ambient_arity: outer.ambient_arity,
-            arguments: self
-                .arguments
-                .iter()
-                .map(|argument| argument.and_then(|index| outer.arguments[index]))
-                .collect(),
+        assert_eq!(self.target.cod(), outer.source.cod());
+        let pullback = self.target.pullback(&outer.source);
+        Self::new(
+            self.source.compose(&pullback.from_left),
+            outer.target.compose(&pullback.from_right),
+        )
+    }
+
+    /// Combine compatible partial wirings between the same two contexts.
+    fn merge(&self, other: &Self) -> Self {
+        assert_eq!(self.source.cod(), other.source.cod());
+        assert_eq!(self.target.cod(), other.target.cod());
+        let source = self.source.union(&other.source).lift;
+        let target = self.target.union(&other.target).lift;
+        let merged = Self::new(source, target);
+        for map in [self, other] {
+            let source_positions = source.factor(&map.source).unwrap();
+            let target_positions = target.factor(&map.target).unwrap();
+            assert_eq!(
+                source_positions, target_positions,
+                "incompatible partial thinnings"
+            );
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum MapArgument {
-    Known(Option<usize>),
-    /// A coordinate discarded by a reversed lift. The path from the other
-    /// endpoint may determine it; otherwise certificate printing uses `default`.
-    Hole(usize),
-}
-
-#[derive(Clone, Debug)]
-struct MapTemplate {
-    ambient_arity: usize,
-    arguments: Vec<MapArgument>,
-}
-
-impl MapTemplate {
-    fn known(map: ContextMap) -> Self {
-        Self {
-            ambient_arity: map.ambient_arity,
-            arguments: map.arguments.into_iter().map(MapArgument::Known).collect(),
-        }
+        merged
     }
 
-    fn resolve(&self, holes: &mut HoleAssignments) -> ContextMap {
-        ContextMap {
-            ambient_arity: self.ambient_arity,
-            arguments: self
-                .arguments
-                .iter()
-                .map(|argument| match *argument {
-                    MapArgument::Known(value) => value,
-                    MapArgument::Hole(hole) => holes.value(hole),
-                })
-                .collect(),
-        }
-    }
-}
-
-#[derive(Default)]
-struct HoleAssignments {
-    parents: Vec<usize>,
-    values: Vec<Option<Option<usize>>>,
-}
-
-impl HoleAssignments {
-    fn fresh(&mut self) -> MapArgument {
-        let hole = self.parents.len();
-        self.parents.push(hole);
-        self.values.push(None);
-        MapArgument::Hole(hole)
-    }
-
-    fn root(&mut self, hole: usize) -> usize {
-        let parent = self.parents[hole];
-        if parent == hole {
-            hole
-        } else {
-            let root = self.root(parent);
-            self.parents[hole] = root;
-            root
-        }
-    }
-
-    fn assign(&mut self, hole: usize, value: Option<usize>) {
-        let root = self.root(hole);
-        if let Some(old) = self.values[root] {
-            assert_eq!(old, value, "incompatible explanation context maps");
-        } else {
-            self.values[root] = Some(value);
-        }
-    }
-
-    fn unify(&mut self, left: MapArgument, right: MapArgument) {
-        match (left, right) {
-            (MapArgument::Known(left), MapArgument::Known(right)) => {
-                assert_eq!(left, right, "incompatible explanation context maps");
-            }
-            (MapArgument::Hole(hole), MapArgument::Known(value))
-            | (MapArgument::Known(value), MapArgument::Hole(hole)) => self.assign(hole, value),
-            (MapArgument::Hole(left), MapArgument::Hole(right)) => {
-                let left = self.root(left);
-                let right = self.root(right);
-                if left != right {
-                    let left_value = self.values[left];
-                    let right_value = self.values[right];
-                    self.parents[right] = left;
-                    match (left_value, right_value) {
-                        (Some(left), Some(right)) => {
-                            assert_eq!(left, right, "incompatible explanation context maps")
-                        }
-                        (None, Some(value)) => self.values[left] = Some(value),
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    fn value(&mut self, hole: usize) -> Option<usize> {
-        let root = self.root(hole);
-        self.values[root].unwrap_or(None)
+    fn target_arity(&self) -> usize {
+        self.target.cod()
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Endpoint {
-    Named { name: String, map: ContextMap },
-    Raw { raw: RawId, map: ContextMap },
+    Named { name: String, map: PartialThinning },
+    Raw { raw: RawId, map: PartialThinning },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,7 +98,7 @@ enum ProofKind {
     Trans(ProofId, ProofId),
     Map {
         proof: ProofId,
-        map: ContextMap,
+        map: PartialThinning,
     },
     SpecializeLeft {
         equality: ProofId,
@@ -294,17 +209,17 @@ impl ProofState {
         self.alloc(
             Endpoint::Raw {
                 raw: left.raw(),
-                map: ContextMap::lift(left.lift()),
+                map: PartialThinning::lift(left.lift()),
             },
             Endpoint::Raw {
                 raw: right.raw(),
-                map: ContextMap::lift(right.lift()),
+                map: PartialThinning::lift(right.lift()),
             },
             ProofKind::Assumption { index, label },
         )
     }
 
-    fn map_endpoint(endpoint: &Endpoint, outer: &ContextMap) -> Endpoint {
+    fn map_endpoint(endpoint: &Endpoint, outer: &PartialThinning) -> Endpoint {
         match endpoint {
             Endpoint::Named { name, map } => Endpoint::Named {
                 name: name.clone(),
@@ -317,7 +232,7 @@ impl ProofState {
         }
     }
 
-    fn map_proof(&mut self, proof: ProofId, map: ContextMap) -> ProofId {
+    fn map_proof(&mut self, proof: ProofId, map: PartialThinning) -> ProofId {
         if map.is_identity() {
             return proof;
         }
@@ -408,61 +323,58 @@ impl ProofState {
 
     fn explain(&mut self, left: Id, right: Id) -> ProofId {
         let (left_path, right_path) = self.explanation_paths(left.raw(), right.raw());
-        let mut holes = HoleAssignments::default();
-        let left_maps = Self::plan_path(left, &left_path, &mut holes);
-        let right_maps = Self::plan_path(right, &right_path, &mut holes);
-        let left_common = left_maps.last().unwrap();
-        let right_common = right_maps.last().unwrap();
-        assert_eq!(left_common.ambient_arity, right_common.ambient_arity);
-        assert_eq!(left_common.arguments.len(), right_common.arguments.len());
-        for (&left, &right) in left_common.arguments.iter().zip(&right_common.arguments) {
-            holes.unify(left, right);
-        }
+        let mut left_maps = Self::plan_path(left, &left_path);
+        let mut right_maps = Self::plan_path(right, &right_path);
+        Self::complete_paths(&mut left_maps, &left_path, &mut right_maps, &right_path);
 
-        let left_to_common = self.materialize_path(left, &left_path, &left_maps, &mut holes);
-        let right_to_common = self.materialize_path(right, &right_path, &right_maps, &mut holes);
+        let left_to_common = self.materialize_path(left, &left_path, &left_maps);
+        let right_to_common = self.materialize_path(right, &right_path, &right_maps);
         let common_to_right = self.symm(right_to_common);
         let proof = self.trans(left_to_common, common_to_right);
         debug_assert_eq!(
             self.arena[proof.0 as usize].right,
             Endpoint::Raw {
                 raw: right.raw(),
-                map: ContextMap::lift(right.lift()),
+                map: PartialThinning::lift(right.lift()),
             },
             "explanation forest disagrees with operational thinning"
         );
         proof
     }
 
-    fn plan_path(start: Id, path: &[ExplainEdge], holes: &mut HoleAssignments) -> Vec<MapTemplate> {
-        let mut maps = vec![MapTemplate::known(ContextMap::lift(start.lift()))];
+    fn complete_paths(
+        left: &mut [PartialThinning],
+        left_edges: &[ExplainEdge],
+        right: &mut [PartialThinning],
+        right_edges: &[ExplainEdge],
+    ) {
+        let common = left.last().unwrap().merge(right.last().unwrap());
+        *left.last_mut().unwrap() = common;
+        *right.last_mut().unwrap() = common;
+        Self::complete_path(left, left_edges);
+        Self::complete_path(right, right_edges);
+    }
+
+    fn complete_path(maps: &mut [PartialThinning], edges: &[ExplainEdge]) {
+        for index in (0..edges.len()).rev() {
+            let edge = edges[index];
+            let required = if edge.reversed {
+                PartialThinning::lift(edge.thinning).then(&maps[index + 1])
+            } else {
+                PartialThinning::dump(edge.thinning).then(&maps[index + 1])
+            };
+            maps[index] = maps[index].merge(&required);
+        }
+    }
+
+    fn plan_path(start: Id, path: &[ExplainEdge]) -> Vec<PartialThinning> {
+        let mut maps = vec![PartialThinning::lift(start.lift())];
         for &edge in path {
             let current = maps.last().unwrap();
             let next = if edge.reversed {
-                assert_eq!(current.arguments.len(), edge.thinning.dom());
-                let mut arguments = Vec::with_capacity(edge.thinning.cod());
-                let mut selected = 0;
-                for index in 0..edge.thinning.cod() {
-                    if edge.thinning.get(index) {
-                        arguments.push(current.arguments[selected]);
-                        selected += 1;
-                    } else {
-                        arguments.push(holes.fresh());
-                    }
-                }
-                MapTemplate {
-                    ambient_arity: current.ambient_arity,
-                    arguments,
-                }
+                PartialThinning::dump(edge.thinning).then(current)
             } else {
-                assert_eq!(current.arguments.len(), edge.thinning.cod());
-                MapTemplate {
-                    ambient_arity: current.ambient_arity,
-                    arguments: (0..edge.thinning.cod())
-                        .filter(|&index| edge.thinning.get(index))
-                        .map(|index| current.arguments[index])
-                        .collect(),
-                }
+                PartialThinning::lift(edge.thinning).then(current)
             };
             maps.push(next);
         }
@@ -473,22 +385,19 @@ impl ProofState {
         &mut self,
         start: Id,
         path: &[ExplainEdge],
-        maps: &[MapTemplate],
-        holes: &mut HoleAssignments,
+        maps: &[PartialThinning],
     ) -> ProofId {
         let endpoint = Endpoint::Raw {
             raw: start.raw(),
-            map: maps[0].resolve(holes),
+            map: maps[0],
         };
         let mut proof = self.alloc(endpoint.clone(), endpoint, ProofKind::Refl);
         for (index, &edge) in path.iter().enumerate() {
             let mapped = if edge.reversed {
-                let outer = maps[index + 1].resolve(holes);
-                let mapped = self.map_proof(edge.forward, outer);
+                let mapped = self.map_proof(edge.forward, maps[index + 1]);
                 self.symm(mapped)
             } else {
-                let current = maps[index].resolve(holes);
-                self.map_proof(edge.forward, current)
+                self.map_proof(edge.forward, maps[index])
             };
             proof = self.trans(proof, mapped);
         }
@@ -574,11 +483,11 @@ impl ProofUnionFind {
             let memo_proof = proofs.alloc(
                 Endpoint::Named {
                     name: name.clone(),
-                    map: ContextMap::identity(arity),
+                    map: PartialThinning::identity(arity),
                 },
                 Endpoint::Raw {
                     raw,
-                    map: ContextMap::identity(arity),
+                    map: PartialThinning::identity(arity),
                 },
                 ProofKind::Refl,
             );
@@ -656,11 +565,11 @@ impl ProofUnionFind {
                 let proof = proofs.alloc(
                     Endpoint::Raw {
                         raw: root.raw(),
-                        map: ContextMap::lift(root.lift()),
+                        map: PartialThinning::lift(root.lift()),
                     },
                     Endpoint::Raw {
                         raw: parent.raw(),
-                        map: ContextMap::lift(parent.lift()),
+                        map: PartialThinning::lift(parent.lift()),
                     },
                     ProofKind::FactorLeft {
                         equality,
@@ -681,11 +590,11 @@ impl ProofUnionFind {
                 let proof = proofs.alloc(
                     Endpoint::Raw {
                         raw: left.raw(),
-                        map: ContextMap::lift(left.lift()),
+                        map: PartialThinning::lift(left.lift()),
                     },
                     Endpoint::Raw {
                         raw: parent.raw(),
-                        map: ContextMap::lift(parent.lift()),
+                        map: PartialThinning::lift(parent.lift()),
                     },
                     ProofKind::SpecializeLeft {
                         equality,
@@ -707,11 +616,11 @@ impl ProofUnionFind {
                 let proof = proofs.alloc(
                     Endpoint::Raw {
                         raw: right.raw(),
-                        map: ContextMap::lift(right.lift()),
+                        map: PartialThinning::lift(right.lift()),
                     },
                     Endpoint::Raw {
                         raw: parent.raw(),
-                        map: ContextMap::lift(parent.lift()),
+                        map: PartialThinning::lift(parent.lift()),
                     },
                     ProofKind::SpecializeRight {
                         equality,
@@ -736,11 +645,11 @@ impl ProofUnionFind {
                 let left_proof = proofs.alloc(
                     Endpoint::Raw {
                         raw: left.raw(),
-                        map: ContextMap::lift(left.lift()),
+                        map: PartialThinning::lift(left.lift()),
                     },
                     Endpoint::Raw {
                         raw: left_parent.raw(),
-                        map: ContextMap::lift(left_parent.lift()),
+                        map: PartialThinning::lift(left_parent.lift()),
                     },
                     ProofKind::FactorLeft {
                         equality,
@@ -752,11 +661,11 @@ impl ProofUnionFind {
                 let right_proof = proofs.alloc(
                     Endpoint::Raw {
                         raw: right.raw(),
-                        map: ContextMap::lift(right.lift()),
+                        map: PartialThinning::lift(right.lift()),
                     },
                     Endpoint::Raw {
                         raw: right_parent.raw(),
-                        map: ContextMap::lift(right_parent.lift()),
+                        map: PartialThinning::lift(right_parent.lift()),
                     },
                     ProofKind::FactorRight {
                         equality,
@@ -853,11 +762,11 @@ impl ProofUnionFind {
         let arity = self.arities[self.memo[left] as usize];
         let left_endpoint = Endpoint::Named {
             name: left.to_owned(),
-            map: ContextMap::identity(arity),
+            map: PartialThinning::identity(arity),
         };
         let right_endpoint = Endpoint::Named {
             name: right.to_owned(),
-            map: ContextMap::identity(arity),
+            map: PartialThinning::identity(arity),
         };
         output.push_str(&format!(
             " : {} := by\n",
@@ -906,7 +815,7 @@ impl ProofUnionFind {
                     )
                 }
                 ProofKind::Map { proof, ref map } => Self::pointwise(
-                    map.ambient_arity,
+                    map.target_arity(),
                     Self::apply_proof(proof, &Self::map_arguments(map)),
                 ),
                 ProofKind::SpecializeLeft { equality, left } => Self::pointwise(
@@ -982,7 +891,7 @@ impl ProofUnionFind {
 
     fn endpoint_arity(endpoint: &Endpoint) -> usize {
         match endpoint {
-            Endpoint::Named { map, .. } | Endpoint::Raw { map, .. } => map.ambient_arity,
+            Endpoint::Named { map, .. } | Endpoint::Raw { map, .. } => map.target_arity(),
         }
     }
 
@@ -1025,12 +934,15 @@ impl ProofUnionFind {
         }
     }
 
-    fn map_arguments(map: &ContextMap) -> Vec<String> {
-        map.arguments
-            .iter()
-            .map(|argument| match argument {
-                Some(index) => format!("x{index}"),
-                None => "default".to_owned(),
+    fn map_arguments(map: &PartialThinning) -> Vec<String> {
+        let mut targets = (0..map.target.cod()).filter(|&index| map.target.get(index));
+        (0..map.source.cod())
+            .map(|source| {
+                if map.source.get(source) {
+                    format!("x{}", targets.next().unwrap())
+                } else {
+                    "default".to_owned()
+                }
             })
             .collect()
     }
@@ -1114,6 +1026,27 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn partial_thinning_is_a_pair_of_lifts() {
+        let map = PartialThinning::new(Lift::selected(3, &[0, 2]), Lift::selected(4, &[1, 3]));
+        assert_eq!(std::mem::size_of::<PartialThinning>(), 8);
+        assert_eq!(ProofUnionFind::map_arguments(&map), ["x1", "default", "x3"]);
+        assert_eq!(map.reverse().reverse(), map);
+    }
+
+    #[test]
+    fn partial_thinning_composition_uses_the_middle_pullback() {
+        let first = PartialThinning::new(Lift::selected(3, &[0, 2]), Lift::selected(4, &[1, 3]));
+        let second = PartialThinning::new(Lift::selected(4, &[1, 3]), Lift::selected(3, &[0, 2]));
+        let composite = first.then(&second);
+        assert_eq!(composite.source, Lift::selected(3, &[0, 2]));
+        assert_eq!(composite.target, Lift::selected(3, &[0, 2]));
+        assert_eq!(
+            ProofUnionFind::map_arguments(&composite),
+            ["x0", "default", "x2"]
+        );
+    }
 
     #[test]
     fn proof_tracking_has_no_arena_when_disabled() {
