@@ -433,7 +433,7 @@ impl EGraph {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Construct an e-graph that records Lean proofs for context-zero atoms and applications.
+    /// Construct an e-graph that records Lean proofs.
     pub fn new_with_proofs() -> Self {
         Self {
             proofs: Some(EGraphProofTrace::default()),
@@ -518,27 +518,17 @@ impl EGraph {
         let id = self.make_set(scope);
         if let Some(proofs) = &mut self.proofs {
             let definition = match &node {
-                Node::Atom(name) if scope == 0 => {
-                    Some(EGraphTermDefinition::Atom(name.as_str().to_owned()))
-                }
-                Node::App(function, argument)
-                    if scope == 0
-                        && function.ctx() == 0
-                        && argument.ctx() == 0
-                        && function.lift().is_identity()
-                        && argument.lift().is_identity() =>
-                {
-                    Some(EGraphTermDefinition::App(function.raw(), argument.raw()))
+                Node::Var => Some(EGraphTermDefinition::Var),
+                Node::Atom(name) => Some(EGraphTermDefinition::Atom(name.as_str().to_owned())),
+                Node::App(function, argument) => {
+                    Some(EGraphTermDefinition::App(*function, *argument))
                 }
                 _ => None,
             };
             if let Some(definition) = definition {
                 proofs.define(id.raw(), definition);
             } else {
-                proofs.unsupported(format!(
-                    "e{} is not a context-zero atom or application",
-                    id.raw()
-                ));
+                proofs.unsupported(format!("e{} has an unsupported term definition", id.raw()));
             }
         }
         if self.rev_tracked {
@@ -551,9 +541,6 @@ impl EGraph {
         id
     }
     pub fn var(&mut self, ctx: usize, index: usize) -> Id {
-        if let Some(proofs) = &mut self.proofs {
-            proofs.unsupported("variables are not supported by first-order proof mode");
-        }
         let base = self.intern(1, Node::Var);
         base.weaken(&Lift::select(ctx, index))
     }
@@ -561,11 +548,6 @@ impl EGraph {
         self.atom_symbol(name.into(), ctx)
     }
     fn atom_symbol(&mut self, name: Symbol, ctx: usize) -> Id {
-        if ctx != 0
-            && let Some(proofs) = &mut self.proofs
-        {
-            proofs.unsupported("lifted atoms are not supported by first-order proof mode");
-        }
         let base = self.intern(0, Node::Atom(name));
         base.weaken(&Lift::unused(ctx))
     }
@@ -581,11 +563,6 @@ impl EGraph {
     }
     pub fn app(&mut self, function: Id, argument: Id) -> Id {
         assert_eq!(function.ctx(), argument.ctx());
-        if function.ctx() != 0
-            && let Some(proofs) = &mut self.proofs
-        {
-            proofs.unsupported("lifted applications are not supported by first-order proof mode");
-        }
         let (common, node) = self.canonical_node(&Node::App(function, argument));
         let base = self.intern(common.dom(), node);
         base.weaken(&common)
@@ -670,19 +647,16 @@ impl EGraph {
         if a == b {
             return false;
         }
-        if let Some(proofs) = &mut self.proofs {
-            if input_a.ctx() != 0
-                || input_b.ctx() != 0
-                || !input_a.lift().is_identity()
-                || !input_b.lift().is_identity()
-            {
-                proofs.unsupported("union uses a nonidentity placement");
-            } else if let Some(reason) = reason {
-                proofs.link_explanation(input_a.raw(), input_b.raw(), reason);
-            } else {
-                proofs.unsupported("union has no equality proof");
+        let root_equality = match (&mut self.proofs, reason) {
+            (Some(proofs), Some(reason)) => {
+                Some(proofs.root_equality(input_a, input_b, a, b, reason))
             }
-        }
+            (Some(proofs), None) => {
+                proofs.unsupported("union has no equality proof");
+                None
+            }
+            (None, _) => None,
+        };
         self.rev_valid = false;
         if a.raw() == b.raw() {
             // Equating two placements of one class restricts that class to
@@ -690,8 +664,22 @@ impl EGraph {
             // f(x) = f(y) turns the result of f into a context-independent
             // value rather than treating x and y themselves as equal.
             let dependency = a.lift().equalizer(&b.lift());
+            let common_ambient = a.lift().compose(&dependency);
             let root = self.make_set(dependency.dom());
+            if let Some(proofs) = &mut self.proofs {
+                proofs.define_restriction(root.raw(), a.raw(), dependency);
+            }
             self.link_root(a.raw(), Id::new(dependency, root.raw()));
+            if let (Some(proofs), Some(equality)) = (&mut self.proofs, root_equality) {
+                proofs.link_factor_left(
+                    a.raw(),
+                    root.raw(),
+                    dependency,
+                    equality,
+                    a.lift(),
+                    common_ambient,
+                );
+            }
             return true;
         }
         let Pullback {
@@ -701,12 +689,25 @@ impl EGraph {
         } = a.lift().pullback(&b.lift());
         if common == b.lift() {
             self.link_root(a.raw(), Id::new(to_a, b.raw()));
+            if let (Some(proofs), Some(equality)) = (&mut self.proofs, root_equality) {
+                proofs.link_specialize_left(a.raw(), b.raw(), to_a, equality, a.lift());
+            }
         } else if common == a.lift() {
             self.link_root(b.raw(), Id::new(to_b, a.raw()));
+            if let (Some(proofs), Some(equality)) = (&mut self.proofs, root_equality) {
+                proofs.link_specialize_right(b.raw(), a.raw(), to_b, equality, b.lift());
+            }
         } else {
             let root = self.make_set(common.dom());
+            if let Some(proofs) = &mut self.proofs {
+                proofs.define_restriction(root.raw(), a.raw(), to_a);
+            }
             self.link_root(a.raw(), Id::new(to_a, root.raw()));
             self.link_root(b.raw(), Id::new(to_b, root.raw()));
+            if let (Some(proofs), Some(equality)) = (&mut self.proofs, root_equality) {
+                proofs.link_factor_left(a.raw(), root.raw(), to_a, equality, a.lift(), common);
+                proofs.link_factor_right(b.raw(), root.raw(), to_b, equality, b.lift());
+            }
         }
         true
     }
@@ -728,12 +729,10 @@ impl EGraph {
                 Some(EGraphTermDefinition::App(left_function, left_argument)),
                 Some(EGraphTermDefinition::App(right_function, right_argument)),
             ) => {
-                let left_function_root = self.find_mut(&Id::new(Lift::identity(0), left_function));
-                let right_function_root =
-                    self.find_mut(&Id::new(Lift::identity(0), right_function));
-                let left_argument_root = self.find_mut(&Id::new(Lift::identity(0), left_argument));
-                let right_argument_root =
-                    self.find_mut(&Id::new(Lift::identity(0), right_argument));
+                let left_function_root = self.find_mut(&left_function);
+                let right_function_root = self.find_mut(&right_function);
+                let left_argument_root = self.find_mut(&left_argument);
+                let right_argument_root = self.find_mut(&right_argument);
                 if left_function_root != right_function_root
                     || left_argument_root != right_argument_root
                 {
@@ -760,7 +759,7 @@ impl EGraph {
         }
     }
 
-    /// Print a Lean certificate for an established context-zero equality.
+    /// Print a Lean certificate for an established pointwise equality.
     pub fn lean_proof(
         &mut self,
         theorem_name: &str,
@@ -771,13 +770,9 @@ impl EGraph {
         if self.proofs.is_none() {
             return Err(ProofError::TrackingDisabled);
         }
-        if left.ctx() != 0
-            || right.ctx() != 0
-            || !left.lift().is_identity()
-            || !right.lift().is_identity()
-        {
+        if left.ctx() != right.ctx() {
             return Err(ProofError::Unsupported(
-                "certificate endpoints must have context zero".to_owned(),
+                "certificate endpoints have different contexts".to_owned(),
             ));
         }
         self.rebuild();
@@ -793,8 +788,8 @@ impl EGraph {
             self.proofs.as_ref().expect("checked above"),
             theorem_name,
             binders,
-            left.raw(),
-            right.raw(),
+            *left,
+            *right,
         )
     }
 
@@ -1188,8 +1183,8 @@ impl EGraph {
                 }
                 let normalized = self.find_mut(&original);
                 out.push(PatternNodeWitness {
-                    raw: original.raw(),
-                    normal: normalized.raw(),
+                    raw: original,
+                    normal: normalized,
                 });
                 Some(normalized)
             }
@@ -1198,8 +1193,8 @@ impl EGraph {
                 let witness = *self.memo.get(&node)?;
                 let normalized = self.find_mut(&Id::new(Lift::identity(0), witness));
                 out.push(PatternNodeWitness {
-                    raw: witness,
-                    normal: normalized.raw(),
+                    raw: Id::new(Lift::identity(0), witness),
+                    normal: normalized,
                 });
                 Some(normalized)
             }
@@ -1210,8 +1205,8 @@ impl EGraph {
                 let witness = *self.memo.get(&node)?;
                 let normalized = self.find_mut(&Id::new(Lift::identity(0), witness));
                 out.push(PatternNodeWitness {
-                    raw: witness,
-                    normal: normalized.raw(),
+                    raw: Id::new(Lift::identity(0), witness),
+                    normal: normalized,
                 });
                 Some(normalized)
             }
@@ -1236,8 +1231,10 @@ impl EGraph {
                 else {
                     return false;
                 };
-                self.pattern_is_definitionally(function, subst, function_raw)
-                    && self.pattern_is_definitionally(argument, subst, argument_raw)
+                function_raw.lift().is_identity()
+                    && argument_raw.lift().is_identity()
+                    && self.pattern_is_definitionally(function, subst, function_raw.raw())
+                    && self.pattern_is_definitionally(argument, subst, argument_raw.raw())
             }
             _ => false,
         }
