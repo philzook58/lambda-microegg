@@ -1173,17 +1173,18 @@ impl EGraph {
         &mut self,
         pattern: &Pattern,
         subst: &Subst,
+        ctx: usize,
         out: &mut Vec<PatternNodeWitness>,
     ) -> Option<Id> {
         match pattern {
             Pattern::MetaVar(name, arguments) if arguments.is_empty() => {
                 let original = *subst.get(name)?;
-                if original.ctx() != 0 || !original.lift().is_identity() {
+                if original.ctx() != ctx {
                     return None;
                 }
                 let normalized = self.find_mut(&original);
                 out.push(PatternNodeWitness {
-                    raw: original,
+                    original,
                     normal: normalized,
                 });
                 Some(normalized)
@@ -1191,21 +1192,23 @@ impl EGraph {
             Pattern::Atom(name) => {
                 let node = Node::Atom(*name);
                 let witness = *self.memo.get(&node)?;
-                let normalized = self.find_mut(&Id::new(Lift::identity(0), witness));
+                let original = Id::new(Lift::unused(ctx), witness);
+                let normalized = self.find_mut(&original);
                 out.push(PatternNodeWitness {
-                    raw: Id::new(Lift::identity(0), witness),
+                    original,
                     normal: normalized,
                 });
                 Some(normalized)
             }
             Pattern::App(function, argument) => {
-                let function = self.pattern_witnesses(function, subst, out)?;
-                let argument = self.pattern_witnesses(argument, subst, out)?;
-                let node = Node::App(function, argument);
+                let function = self.pattern_witnesses(function, subst, ctx, out)?;
+                let argument = self.pattern_witnesses(argument, subst, ctx, out)?;
+                let (placement, node) = self.canonical_node(&Node::App(function, argument));
                 let witness = *self.memo.get(&node)?;
-                let normalized = self.find_mut(&Id::new(Lift::identity(0), witness));
+                let original = Id::new(placement, witness);
+                let normalized = self.find_mut(&original);
                 out.push(PatternNodeWitness {
-                    raw: Id::new(Lift::identity(0), witness),
+                    original,
                     normal: normalized,
                 });
                 Some(normalized)
@@ -1261,7 +1264,6 @@ impl EGraph {
             }
         }
 
-        // When both stored terms unfold to this exact rule instance, Lean can
         // If both placed endpoints are the direct rule instance, the theorem
         // application is already the whole proof. Avoid manufacturing
         // reflexivity and congruence steps just to normalize the pattern.
@@ -1275,17 +1277,14 @@ impl EGraph {
             });
         }
 
-        if target.ctx() != 0 {
-            return None;
-        }
-
-        // Retain only the raw witnesses needed to reconstruct normalization.
+        // Retain only the placed witnesses needed to reconstruct normalization.
         // The Lean proof arena is populated later, and only for rewrite edges
         // selected by the final explanation.
         let mut left_witnesses = Vec::new();
-        let left = self.pattern_witnesses(rule.lhs(), subst, &mut left_witnesses)?;
+        let left = self.pattern_witnesses(rule.lhs(), subst, target.ctx(), &mut left_witnesses)?;
         let mut right_witnesses = Vec::new();
-        let right = self.pattern_witnesses(rule.rhs(), subst, &mut right_witnesses)?;
+        let right =
+            self.pattern_witnesses(rule.rhs(), subst, target.ctx(), &mut right_witnesses)?;
         if left != target_root || right != replacement_root {
             return None;
         }

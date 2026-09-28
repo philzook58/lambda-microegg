@@ -17,7 +17,7 @@ pub(crate) struct ReasonId(u32);
 /// One instantiated pattern node and its current representative.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PatternNodeWitness {
-    pub(crate) raw: Id,
+    pub(crate) original: Id,
     pub(crate) normal: Id,
 }
 
@@ -886,6 +886,8 @@ impl EGraphProofArena {
         else {
             return None;
         };
+        let old_function = Id::new(raw.lift().compose(&old_function.lift()), old_function.raw());
+        let old_argument = Id::new(raw.lift().compose(&old_argument.lift()), old_argument.raw());
         let fp = self.proof_between(trace, old_function, function);
         let ap = self.proof_between(trace, old_argument, argument);
         let old_function = self.placed(old_function);
@@ -1050,8 +1052,8 @@ impl EGraphProofArena {
             match pattern {
                 Pattern::MetaVar(_, _) | Pattern::Atom(_) => {
                     let witness = witnesses.next().expect("pattern leaf witness");
-                    let term = arena.placed(witness.raw);
-                    let proof = arena.proof_between(trace, witness.raw, witness.normal);
+                    let term = arena.placed(witness.original);
+                    let proof = arena.proof_between(trace, witness.original, witness.normal);
                     (term, proof, witness.normal)
                 }
                 Pattern::App(function, argument) => {
@@ -1063,12 +1065,13 @@ impl EGraphProofArena {
                     let expression = arena.app_term(function_term, argument_term);
                     let expression_to_normal = arena.congr_terms(function_proof, argument_proof);
                     let witness_to_normal = arena
-                        .raw_app_to(trace, witness.raw, function_normal, argument_normal)
+                        .raw_app_to(trace, witness.original, function_normal, argument_normal)
                         .expect("an application pattern retains an application witness");
                     let normal_to_witness = arena.symm(witness_to_normal);
                     let expression_to_witness =
                         arena.trans(expression_to_normal, normal_to_witness);
-                    let witness_to_root = arena.proof_between(trace, witness.raw, witness.normal);
+                    let witness_to_root =
+                        arena.proof_between(trace, witness.original, witness.normal);
                     let proof = arena.trans(expression_to_witness, witness_to_root);
                     (expression, proof, witness.normal)
                 }
@@ -2025,6 +2028,64 @@ mod tests {
         assert!(
             output.status.success(),
             "Lean rejected contextual commutativity:\n{certificate}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn contextual_rewrite_normalizes_an_equivalent_match_in_lean() {
+        let mut egraph = crate::EGraph::new_with_proofs();
+        let plus = egraph.atom("plus", 2);
+        let zero = egraph.atom("zero", 2);
+        let h = egraph.atom("h", 2);
+        let x = egraph.var(2, 0);
+        let plus_x = egraph.app(plus, x);
+        let plus_x_zero = egraph.app(plus_x, zero);
+        let hx = egraph.app(h, x);
+        egraph.union_assuming(&plus_x_zero, &hx, "plus x zero = h x");
+
+        let rule = crate::Rewrite::named(
+            "r1",
+            crate::Pattern::apps(
+                "plus",
+                vec![crate::Pattern::meta("?a"), crate::Pattern::atom("zero")],
+            ),
+            crate::Pattern::meta("?a"),
+        )
+        .unwrap();
+        egraph.saturate(std::slice::from_ref(&rule));
+        assert!(egraph.equivalent(&hx, &x));
+
+        let certificate = egraph
+            .lean_proof(
+                "normalized_contextual_rewrite",
+                "{α : Type} [Inhabited α] (plus : α → α → α) (zero : α) (h : α → α) \
+                 (r1 : ∀ a, plus a zero = a)",
+                &hx,
+                &x,
+            )
+            .unwrap();
+        assert!(certificate.contains("r1"), "{certificate}");
+
+        let Ok(mut lean) = Command::new("lean")
+            .arg("--stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            return;
+        };
+        lean.stdin
+            .take()
+            .unwrap()
+            .write_all(certificate.as_bytes())
+            .unwrap();
+        let output = lean.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "Lean rejected normalized contextual rewrite:\n{certificate}\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
