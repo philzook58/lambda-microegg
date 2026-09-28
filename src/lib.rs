@@ -1214,27 +1214,31 @@ impl EGraph {
         }
     }
 
-    fn pattern_is_definitionally(&self, pattern: &Pattern, subst: &Subst, raw: RawId) -> bool {
+    fn pattern_is_definitionally(&self, pattern: &Pattern, subst: &Subst, id: Id) -> bool {
         match pattern {
             Pattern::MetaVar(name, arguments) if arguments.is_empty() => {
-                subst.get(name).is_some_and(|id| id.raw() == raw)
+                subst.get(name).is_some_and(|binding| *binding == id)
             }
-            Pattern::Atom(name) => matches!(
-                self.proofs.as_ref().and_then(|proofs| proofs.definition(raw)),
-                Some(EGraphTermDefinition::Atom(actual)) if actual == name.as_str()
-            ),
+            Pattern::Atom(name) => {
+                matches!(
+                    self.proofs.as_ref().and_then(|proofs| proofs.definition(id.raw())),
+                    Some(EGraphTermDefinition::Atom(actual)) if actual == name.as_str()
+                ) && id.lift().dom() == 0
+            }
             Pattern::App(function, argument) => {
                 let Some(EGraphTermDefinition::App(function_raw, argument_raw)) = self
                     .proofs
                     .as_ref()
-                    .and_then(|proofs| proofs.definition(raw))
+                    .and_then(|proofs| proofs.definition(id.raw()))
                 else {
                     return false;
                 };
-                function_raw.lift().is_identity()
-                    && argument_raw.lift().is_identity()
-                    && self.pattern_is_definitionally(function, subst, function_raw.raw())
-                    && self.pattern_is_definitionally(argument, subst, argument_raw.raw())
+                let function_id =
+                    Id::new(id.lift().compose(&function_raw.lift()), function_raw.raw());
+                let argument_id =
+                    Id::new(id.lift().compose(&argument_raw.lift()), argument_raw.raw());
+                self.pattern_is_definitionally(function, subst, function_id)
+                    && self.pattern_is_definitionally(argument, subst, argument_id)
             }
             _ => false,
         }
@@ -1248,30 +1252,31 @@ impl EGraph {
         replacement: &Id,
         subst: &Subst,
     ) -> Option<Reason> {
-        if target.ctx() != 0 || replacement.ctx() != 0 {
-            return None;
-        }
         let target_root = self.find_mut(target);
         let replacement_root = self.find_mut(replacement);
         for name in rule.metavariables() {
             let id = *subst.get(name)?;
-            if id.ctx() != 0 || !id.lift().is_identity() {
+            if id.ctx() != target.ctx() {
                 return None;
             }
         }
 
         // When both stored terms unfold to this exact rule instance, Lean can
-        // check the theorem application at the raw endpoints by definitional
-        // reduction. This avoids manufacturing reflexivity and congruence
-        // steps merely to normalize the instantiated pattern.
-        if self.pattern_is_definitionally(rule.lhs(), subst, target.raw())
-            && self.pattern_is_definitionally(rule.rhs(), subst, replacement.raw())
+        // If both placed endpoints are the direct rule instance, the theorem
+        // application is already the whole proof. Avoid manufacturing
+        // reflexivity and congruence steps just to normalize the pattern.
+        if self.pattern_is_definitionally(rule.lhs(), subst, *target)
+            && self.pattern_is_definitionally(rule.rhs(), subst, *replacement)
         {
             return Some(Reason::Rewrite {
                 rule: proof_rule,
                 subst: subst.clone(),
                 normalization: None,
             });
+        }
+
+        if target.ctx() != 0 {
+            return None;
         }
 
         // Retain only the raw witnesses needed to reconstruct normalization.

@@ -1421,7 +1421,10 @@ impl EGraphProofArena {
                     let arity = node.left.lift.cod();
                     let values = arguments
                         .iter()
-                        .map(|&argument| self.term_value(trace, argument, true))
+                        .map(|&argument| {
+                            self.term_value(trace, argument, true)
+                                .map(|value| format!("({value})"))
+                        })
                         .collect::<Result<Vec<_>, _>>()?;
                     Self::pointwise(arity, EGraphProofTrace::apply(name, &values))
                 }
@@ -1907,6 +1910,121 @@ mod tests {
         assert!(
             output.status.success(),
             "Lean rejected the named rewrite certificate:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn thinned_named_rewrite_checks_in_lean() {
+        let mut egraph = crate::EGraph::new_with_proofs();
+        let plus = egraph.atom("plus", 2);
+        let zero = egraph.atom("zero", 2);
+        let x = egraph.var(2, 0);
+        let plus_x = egraph.app(plus, x);
+        let plus_x_zero = egraph.app(plus_x, zero);
+        let rule = crate::Rewrite::named(
+            "r1",
+            crate::Pattern::apps(
+                "plus",
+                vec![crate::Pattern::meta("?a"), crate::Pattern::atom("zero")],
+            ),
+            crate::Pattern::meta("?a"),
+        )
+        .unwrap();
+        egraph.saturate(std::slice::from_ref(&rule));
+        assert!(egraph.equivalent(&plus_x_zero, &x));
+
+        let certificate = egraph
+            .lean_proof(
+                "thinned_rewrite",
+                "{α : Type} (plus : α → α → α) (zero : α) \
+                 (r1 : ∀ a, plus a zero = a)",
+                &plus_x_zero,
+                &x,
+            )
+            .unwrap();
+        assert!(certificate.contains("r1 ((e2) x0)"), "{certificate}");
+
+        let Ok(mut lean) = Command::new("lean")
+            .arg("--stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            return;
+        };
+        lean.stdin
+            .take()
+            .unwrap()
+            .write_all(certificate.as_bytes())
+            .unwrap();
+        let output = lean.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "Lean rejected the thinned rewrite certificate:\n{certificate}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn contextual_commutativity_rewrite_checks_in_lean() {
+        let mut egraph = crate::EGraph::new_with_proofs();
+        let plus = egraph.atom("plus", 3);
+        let x = egraph.var(3, 0);
+        let z = egraph.var(3, 2);
+        let plus_x = egraph.app(plus, x);
+        let plus_z = egraph.app(plus, z);
+        let left = egraph.app(plus_x, z);
+        let right = egraph.app(plus_z, x);
+        let rule = crate::Rewrite::named(
+            "comm",
+            crate::Pattern::apps(
+                "plus",
+                vec![crate::Pattern::meta("?a"), crate::Pattern::meta("?b")],
+            ),
+            crate::Pattern::apps(
+                "plus",
+                vec![crate::Pattern::meta("?b"), crate::Pattern::meta("?a")],
+            ),
+        )
+        .unwrap();
+        egraph.saturate(std::slice::from_ref(&rule));
+        assert!(egraph.equivalent(&left, &right));
+
+        let certificate = egraph
+            .lean_proof(
+                "contextual_commutativity",
+                "{α : Type} (plus : α → α → α) (comm : ∀ a b, plus a b = plus b a)",
+                &left,
+                &right,
+            )
+            .unwrap();
+        assert!(
+            certificate.contains("comm ((e1) x0) ((e1) x1)"),
+            "{certificate}"
+        );
+
+        let Ok(mut lean) = Command::new("lean")
+            .arg("--stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            return;
+        };
+        lean.stdin
+            .take()
+            .unwrap()
+            .write_all(certificate.as_bytes())
+            .unwrap();
+        let output = lean.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "Lean rejected contextual commutativity:\n{certificate}\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
