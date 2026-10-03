@@ -1554,6 +1554,77 @@ fn egg_math_associate_adds() {
     }
     assert!(eg.equivalent(&input, &goal));
 }
+
+fn ac_counting_rules() -> [Rewrite; 2] {
+    let var = Pattern::meta;
+    let plus = |left, right| Pattern::apps("+", vec![left, right]);
+    [
+        Rewrite::new(
+            plus(plus(var("?a"), var("?b")), var("?c")),
+            plus(var("?a"), plus(var("?b"), var("?c"))),
+        )
+        .unwrap(),
+        Rewrite::new(plus(var("?a"), var("?b")), plus(var("?b"), var("?a"))).unwrap(),
+    ]
+}
+
+#[test]
+fn symbol_leaf_ac_counts_match_the_combinatorics() {
+    for n in 3..=6 {
+        let mut eg = EGraph::new();
+        let leaves: Vec<_> = (0..n)
+            .map(|index| eg.atom(&format!("x{index}"), 0))
+            .collect();
+        let mut input = leaves[0];
+        for leaf in &leaves[1..] {
+            input = eg.apps("+", vec![input, *leaf]);
+        }
+        let mut goal = leaves[n - 1];
+        for leaf in leaves[..n - 1].iter().rev() {
+            goal = eg.apps("+", vec![goal, *leaf]);
+        }
+
+        eg.saturate(&ac_counting_rules());
+
+        assert!(eg.equivalent(&input, &goal), "symbol AC{n} goal");
+        assert_eq!(
+            eg.class_count(),
+            2 * (1 << n) - 2,
+            "symbol AC{n} class count"
+        );
+        assert_eq!(
+            eg.node_count(),
+            3usize.pow(n as u32) - (1 << n) + n,
+            "symbol AC{n} node count"
+        );
+    }
+}
+
+#[test]
+fn variable_leaf_ac_counts_match_the_combinatorics() {
+    for n in 3..=6 {
+        let mut eg = EGraph::new();
+        let leaves: Vec<_> = (0..n).map(|index| eg.var(n, index)).collect();
+        let mut input = leaves[0];
+        for leaf in &leaves[1..] {
+            input = eg.apps("+", vec![input, *leaf]);
+        }
+        let mut goal = leaves[n - 1];
+        for leaf in leaves[..n - 1].iter().rev() {
+            goal = eg.apps("+", vec![goal, *leaf]);
+        }
+
+        eg.saturate(&ac_counting_rules());
+
+        assert!(eg.equivalent(&input, &goal), "variable AC{n} goal");
+        assert_eq!(eg.class_count(), 2 * n, "variable AC{n} class count");
+        assert_eq!(
+            eg.node_count(),
+            (1 << (n + 1)) - n - 1,
+            "variable AC{n} node count"
+        );
+    }
+}
 #[test]
 fn egg_lambda_under() {
     let mut eg = EGraph::new();

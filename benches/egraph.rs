@@ -1,4 +1,4 @@
-use criterion::{BatchSize, Criterion, SamplingMode, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, SamplingMode};
 use lambda_microegg::*;
 use std::hint::black_box;
 use std::time::Duration;
@@ -46,6 +46,31 @@ fn ac_case(n: usize) -> (EGraph, Id, Id, [Rewrite; 2]) {
     (eg, input, goal, rules)
 }
 
+/// The AC workload with every leaf represented by a distinct free variable
+/// in one shared context, rather than by a context-independent atom.
+fn contextual_ac_case(n: usize) -> (EGraph, Id, Id, [Rewrite; 2]) {
+    let mut eg = EGraph::new();
+    let variables: Vec<_> = (0..n).map(|i| eg.var(n, i)).collect();
+    let mut input = variables[0];
+    for variable in &variables[1..] {
+        input = eg.apps("+", vec![input, *variable]);
+    }
+    let mut goal = variables[n - 1];
+    for variable in variables[..n - 1].iter().rev() {
+        goal = eg.apps("+", vec![goal, *variable]);
+    }
+    let var = Pattern::meta;
+    let plus = |a, b| Pattern::apps("+", vec![a, b]);
+    let rules = [
+        rewrite(
+            plus(plus(var("?a"), var("?b")), var("?c")),
+            plus(var("?a"), plus(var("?b"), var("?c"))),
+        ),
+        rewrite(plus(var("?a"), var("?b")), plus(var("?b"), var("?a"))),
+    ];
+    (eg, input, goal, rules)
+}
+
 fn bench_ac(c: &mut Criterion) {
     let mut group = c.benchmark_group("associative-commutative");
     // AC10 takes seconds per sample, so use Criterion's minimum sample count
@@ -76,6 +101,27 @@ fn bench_ac(c: &mut Criterion) {
             )
         });
     }
+    group.bench_function("AC10-free-variables", |b| {
+        const N: usize = 10;
+        b.iter_batched(
+            || contextual_ac_case(N),
+            |(mut eg, input, goal, rules)| {
+                let stats = eg.saturate(&rules);
+                assert!(eg.equivalent(&input, &goal));
+                // There is one expression class E_k for each dependency
+                // arity 1..=N, one partial-application class (+ E_k) for
+                // k=1..N-1, and the context-independent `+` class.
+                assert_eq!(eg.class_count(), 2 * N);
+                // `+`, Var, and the N-1 partial applications contribute N+1
+                // nodes. E_k has one node for every ordered nontrivial
+                // bipartition of its k variables, namely 2^k-2. Therefore:
+                // N+1 + sum(k=2..N, 2^k-2) = 2^(N+1)-N-1.
+                assert_eq!(eg.node_count(), (1 << (N + 1)) - N - 1);
+                black_box(stats)
+            },
+            BatchSize::PerIteration,
+        )
+    });
     group.finish();
 }
 
