@@ -318,7 +318,9 @@ enum Node {
     Atom(Symbol),
     /// One step of binary, curried application.
     App(Id, Id),
-    Binder(Symbol, Id),
+    Binder(Symbol, Id), // Why shouldn't this be Binder(Id, Id) ?
+    // Should App allow introducing 1 or more binders per every branch?
+    // App(u8, Id, u8, Id) ? App(n, e7, m, e8) introduces n variables in left and m variables in right?
 }
 
 /// Match results contain only fat IDs. A binding for an n-ary metavariable

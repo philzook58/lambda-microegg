@@ -78,3 +78,29 @@ on the right they instantiate the captured body. Beta reduction can be written
 # AI disclosure
 
 The code in this codebase was initially produced by giving Max's microegg, my thinning egraph implementations, blog posts and paper to an agent.
+
+# Citing
+
+```
+@software{lambdamicroegg2026,
+  author = {Philip Zucker},
+  title = {{Lambda MicroEgg}},
+  url = {https://github.com/philzook58/lambda-microegg},
+  month = {09},
+  year = {2026}
+}
+```
+
+and
+
+```
+@misc{zucker2026liftingegraphsfunctionisnt,
+      title={Lifting E-Graphs: A Function Isn't a Constant}, 
+      author={Philip Zucker},
+      year={2026},
+      eprint={2606.22734},
+      archivePrefix={arXiv},
+      primaryClass={cs.PL},
+      url={https://arxiv.org/abs/2606.22734}, 
+}
+```
